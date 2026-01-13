@@ -1,0 +1,24 @@
+# requirements.txt
+# SLO-Aware Task-Adaptive Compression: Baseline Evaluation Framework
+# Python 3.8+ required
+
+# Core dependencies
+torch
+transformers
+datasets
+numpy
+
+# Tokenization
+tiktoken
+
+# Quantization support
+bitsandbytes
+accelerate
+
+# Optional: For mixed precision training (if extending framework)
+apex
+
+# Development
+jupyter
+matplotlib
+pandas
