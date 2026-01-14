@@ -38,7 +38,14 @@ class SingleVariantServer:
         """
         self.model_name = model_name
         self.variant = variant
-        self.device = device
+
+        if torch.backends.mps.is_available():
+            self.device = "mps"      # Mac GPU
+        elif torch.cuda.is_available():
+            self.device = "cuda"     # NVIDIA
+        else:
+            self.device = "cpu"      # Fallback
+
         self.dtype = dtype
         
         logger.info(f"Initializing {variant.upper()} server")
