@@ -19,59 +19,67 @@ class EvaluationMetrics:
     """Evaluate model predictions against ground truth"""
     
     @staticmethod
+    def extract_answer(response: str, dataset_type: str) -> str:
+        """
+        Robustly extract answer from model response
+        """
+        response = response.strip()
+        
+        if dataset_type == "mmlu":
+            # Strategy 1: Look for "Answer: (X)" or "Answer: X"
+            match = re.search(r"Answer:\s*\(?([A-D])\)?", response, re.IGNORECASE)
+            if match:
+                return match.group(1).upper()
+                
+            # Strategy 2: Look for "(X)" at the very end
+            match = re.search(r"\(([A-D])\)\s*$", response, re.IGNORECASE)
+            if match:
+                return match.group(1).upper()
+            
+            # Strategy 3: Look for standalone X at the very end
+            match = re.search(r"\b([A-D])\s*$", response, re.IGNORECASE)
+            if match:
+                return match.group(1).upper()
+                
+            # Strategy 4: Look for last standalone X in text
+            matches = re.findall(r"\b([A-D])\b", response, re.IGNORECASE)
+            if matches:
+                return matches[-1].upper()
+                
+            return ""
+
+        elif dataset_type == "gsm8k":
+            # Strategy 1: Look for standard "####" separator
+            if "####" in response:
+                response = response.split("####")[-1]
+
+            # Strategy 2: Extract last number
+            # Regex captures integers and floats (including negative)
+            numbers = re.findall(r'-?\d+\.?\d*', response.replace(',', ''))
+            return numbers[-1] if numbers else ""
+            
+        return response
+
+    @staticmethod
     def exact_match_mmlu(prediction: str, ground_truth: str) -> bool:
-        """
-        MMLU: Check if predicted answer matches (A/B/C/D)
-        
-        Args:
-            prediction: Model's generated text
-            ground_truth: Correct answer (A, B, C, or D)
-        
-        Returns:
-            True if answer is correct
-        """
-        # Extract first letter from prediction
-        pred = prediction.strip().upper()
-        
-        # Get first valid answer letter
-        for char in pred:
-            if char in ['A', 'B', 'C', 'D']:
-                return char == ground_truth.upper()
-        
-        return False
+        """MMLU: Check if extracted answer matches ground truth"""
+        extracted = EvaluationMetrics.extract_answer(prediction, "mmlu")
+        return extracted == ground_truth.upper()
     
     @staticmethod
     def exact_match_gsm8k(prediction: str, ground_truth: str) -> bool:
-        """
-        GSM8K: Extract and compare final numeric answer
-        
-        Args:
-            prediction: Model's generated text
-            ground_truth: Correct answer as string (e.g., "42")
-        
-        Returns:
-            True if extracted number matches
-        """
-        # Extract all numbers from prediction
-        pred_numbers = re.findall(r"[-+]?\d*\.?\d+", prediction)
-        if not pred_numbers:
+        """GSM8K: Check if extracted number matches ground truth"""
+        extracted = EvaluationMetrics.extract_answer(prediction, "gsm8k")
+        if not extracted:
             return False
-        
-        # Get last number as final answer
+            
         try:
-            pred_num = float(pred_numbers[-1])
-        except ValueError:
-            return False
-        
-        # Extract from ground truth
-        try:
-            true_numbers = re.findall(r"[-+]?\d*\.?\d+", ground_truth)
+            pred_num = float(extracted)
+            true_numbers = re.findall(r'-?\d+\.?\d*', ground_truth.replace(',', ''))
             true_num = float(true_numbers[-1])
+            return abs(pred_num - true_num) < 1e-6
         except (ValueError, IndexError):
             return False
-        
-        # Compare with small tolerance for floating point
-        return abs(pred_num - true_num) < 1e-6
     
     @staticmethod
     def evaluate_batch(predictions: List[str],
@@ -204,8 +212,12 @@ if __name__ == "__main__":
     mmlu_examples = [
         ("The answer is B", "B", True),
         ("B is the correct answer", "B", True),
+        ("Answer: (C)", "C", True),      # New format: explicit
+        ("Option D is correct.", "D", True), # New format: standalone
         ("The answer is A", "B", False),
         ("", "A", False),
+        ("C", "C", True),
+        ("I think A is right", "A", True)
     ]
     
     logger.info("Testing MMLU exact match:")
@@ -217,8 +229,11 @@ if __name__ == "__main__":
     gsm8k_examples = [
         ("The answer is 42", "42", True),
         ("Therefore, the answer is 42 apples", "42", True),
+        ("Calculation... #### 42.0", "42", True),  # Standard format
+        ("The answer is -15.5", "-15.5", True),  # Negative float
         ("The answer is 43", "42", False),
         ("No number here", "42", False),
+        ("100", "100", True)
     ]
     
     logger.info("\nTesting GSM8K exact match:")
