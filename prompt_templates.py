@@ -9,83 +9,81 @@ from typing import Tuple, Dict, Any
 
 PROMPT_TEMPLATES = {
     "mmlu": {
-        "system": "You are a knowledgeable assistant. Answer the multiple choice question concisely.",
-        "format": """{question}
+        "system": """You are an expert assistant that solves multiple-choice questions using step-by-step reasoning.
+IMPORTANT: Always think step-by-step before answering. Format your final answer as exactly "ANSWER: [A/B/C/D]". Do NOT add extra text after the answer.""",
+        "user_template": """Question: {question}
 
+Options:
 A) {choice_a}
-B) {choice_b}
+B) {choice_b} 
 C) {choice_c}
 D) {choice_d}
 
-Answer: """,
-        "expected_format": "[A|B|C|D]",
-        "instructions": "Respond with only the letter (A, B, C, or D) of the correct answer."
+Instructions:
+1. Read the question carefully
+2. Analyze each option
+3. Think step-by-step about which is correct
+4. Give your final answer as exactly "ANSWER: [A/B/C/D]"
+
+Reasoning:""",
+        "expected_format": "ANSWER: [A|B|C|D]",
+        "parser": "extract_mmlu_letter",
+        "max_tokens": 128
     },
     
     "gsm8k": {
-        "system": "You are a math expert. Solve math problems step by step. Always show your work.",
-        "format": """{question}
+        "system": """You are a math expert who solves word problems step-by-step. 
+Show ALL your reasoning and calculations clearly. 
+At the end, box your final numerical answer as "FINAL_ANSWER: [number]".
 
-Let me solve this step by step:
-""",
-        "expected_format": "number",
-        "instructions": "Solve the problem step by step. End with the final answer."
-    },
-    
-    "sharegpt": {
-        "system": "You are a helpful, harmless, and honest assistant.",
-        "format": "{prompt}",
-        "expected_format": "free text",
-        "instructions": "Provide a helpful response."
+Format requirements:
+- Explain each step
+- Show all calculations  
+- End with exactly "FINAL_ANSWER: [number]"
+- No other text after the box.""",
+        "user_template": """Problem: {question}
+
+Solve this step-by-step and show your work.
+
+Step 1:""",
+        "expected_format": "FINAL_ANSWER: [number]",
+        "parser": "extract_gsm8k_number",
+        "max_tokens": 256
     }
 }
 
 
-def build_prompt(example: Dict[str, Any], dataset_type: str) -> Tuple[str, str, str]:
-    """
-    Build formatted prompt with system message and user query
-    
-    Args:
-        example: Example dict with 'prompt' and 'answer' keys
-        dataset_type: 'mmlu', 'gsm8k', or 'sharegpt'
-    
-    Returns:
-        (system_prompt, user_prompt, expected_answer)
-    """
-    if dataset_type not in PROMPT_TEMPLATES:
-        raise ValueError(f"Unknown dataset type: {dataset_type}")
-    
+
+def build_improved_prompt(example: Dict[str, Any], dataset_type: str) -> Tuple[str, str, str]:
+    """Build CoT-enabled prompt with structured output"""
     template = PROMPT_TEMPLATES[dataset_type]
     system_prompt = template["system"]
     
-    # Parse prompt based on dataset type
     if dataset_type == "mmlu":
-        # Split MMLU prompt into question and choices
+        # Parse MMLU format more robustly
         lines = example["prompt"].split('\n')
-        question = lines[0]
+        question = lines[0].strip()
         
-        # Extract choices (they are in format "A) ...", "B) ...", etc)
-        choices = [line[3:] if len(line) > 3 else "" for line in lines[1:5]]
-        while len(choices) < 4:
-            choices.append("")
+        # Extract choices more reliably
+        choices = {}
+        for i, line in enumerate(lines[1:], 1):
+            if line.strip() and len(line) > 2:
+                choices[chr(ord('A') + i-1)] = line[3:].strip() if len(line) > 3 else f"Option {i}"
         
-        user_prompt = template["format"].format(
+        user_prompt = template["user_template"].format(
             question=question,
-            choice_a=choices[0],
-            choice_b=choices[1],
-            choice_c=choices[2],
-            choice_d=choices[3]
+            choice_a=choices.get('A', ''),
+            choice_b=choices.get('B', ''),
+            choice_c=choices.get('C', ''),
+            choice_d=choices.get('D', '')
         )
     
     elif dataset_type == "gsm8k":
-        user_prompt = template["format"].format(question=example["prompt"])
+        user_prompt = template["user_template"].format(
+            question=example["prompt"]
+        )
     
-    else:  # sharegpt
-        user_prompt = template["format"].format(prompt=example["prompt"])
-    
-    expected_answer = example.get("answer", "")
-    
-    return system_prompt, user_prompt, expected_answer
+    return system_prompt, user_prompt, example.get("answer", "")
 
 
 def get_prompt_instructions(dataset_type: str) -> str:

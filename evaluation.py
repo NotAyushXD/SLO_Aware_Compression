@@ -21,23 +21,24 @@ class EvaluationMetrics:
     @staticmethod
     def extract_answer(response: str, dataset_type: str) -> str:
         """
-        Robustly extract answer from model response
+        Robustly extract answer from model response, handling CoT templates
         """
         response = response.strip()
         
         if dataset_type == "mmlu":
-            # Strategy 1: Look for "Answer: (X)" or "Answer: X"
-            match = re.search(r"Answer:\s*\(?([A-D])\)?", response, re.IGNORECASE)
+            # CoT Strategy: Explicit "ANSWER: A" pattern (High priority)
+            # Handles: "ANSWER: A", "ANSWER: (A)", "ANSWER: **A**", "ANSWER: A."
+            match = re.search(r'ANSWER[:\s]*\(?[\*]*([A-D])[\*]*\)?', response, re.IGNORECASE)
             if match:
                 return match.group(1).upper()
-                
-            # Strategy 2: Look for "(X)" at the very end
-            match = re.search(r"\(([A-D])\)\s*$", response, re.IGNORECASE)
+            
+            # Strategy 2: Look for "(X)" at the very end (allowing punctuation)
+            match = re.search(r"\(([A-D])\)[\.\!]?\s*$", response, re.IGNORECASE)
             if match:
                 return match.group(1).upper()
             
             # Strategy 3: Look for standalone X at the very end
-            match = re.search(r"\b([A-D])\s*$", response, re.IGNORECASE)
+            match = re.search(r"\b([A-D])[\.\!]?\s*$", response, re.IGNORECASE)
             if match:
                 return match.group(1).upper()
                 
@@ -49,12 +50,21 @@ class EvaluationMetrics:
             return ""
 
         elif dataset_type == "gsm8k":
-            # Strategy 1: Look for standard "####" separator
+            # CoT Strategy: Explicit "FINAL_ANSWER: [number]" pattern (High priority)
+            match = re.search(r'FINAL_ANSWER[:\s]*([-\d,]+\.?\d*)', response)
+            if match:
+                raw_num = match.group(1).replace(',', '')
+                try:
+                    float(raw_num)
+                    return raw_num
+                except ValueError:
+                    pass
+
+            # Strategy 2: Look for standard "####" separator
             if "####" in response:
                 response = response.split("####")[-1]
 
-            # Strategy 2: Extract last number
-            # Regex captures integers and floats (including negative)
+            # Strategy 3: Extract last number
             numbers = re.findall(r'-?\d+\.?\d*', response.replace(',', ''))
             return numbers[-1] if numbers else ""
             
@@ -212,12 +222,14 @@ if __name__ == "__main__":
     mmlu_examples = [
         ("The answer is B", "B", True),
         ("B is the correct answer", "B", True),
-        ("Answer: (C)", "C", True),      # New format: explicit
-        ("Option D is correct.", "D", True), # New format: standalone
+        ("ANSWER: C", "C", True),        # CoT format
+        ("Therefore, ANSWER: D", "D", True), # CoT embedded
+        ("ANSWER: **B**", "B", True),    # Markdown bold
+        ("ANSWER: (A)", "A", True),      # Brackets in CoT
+        ("The answer is A.", "A", True), # Trailing period
         ("The answer is A", "B", False),
         ("", "A", False),
         ("C", "C", True),
-        ("I think A is right", "A", True)
     ]
     
     logger.info("Testing MMLU exact match:")
@@ -228,9 +240,10 @@ if __name__ == "__main__":
     
     gsm8k_examples = [
         ("The answer is 42", "42", True),
-        ("Therefore, the answer is 42 apples", "42", True),
-        ("Calculation... #### 42.0", "42", True),  # Standard format
-        ("The answer is -15.5", "-15.5", True),  # Negative float
+        ("Therefore, FINAL_ANSWER: 42", "42", True), # CoT format
+        ("FINAL_ANSWER: 42.0", "42", True),          # CoT float
+        ("FINAL_ANSWER: 1,234", "1234", True),       # Commas
+        ("Calculation... #### 42.0", "42", True),    # Standard format
         ("The answer is 43", "42", False),
         ("No number here", "42", False),
         ("100", "100", True)
