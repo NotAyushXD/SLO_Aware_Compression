@@ -1,3 +1,5 @@
 data/*
 results/*
 __pycache__/*
+.DS_Store
+test_server_timing.py
