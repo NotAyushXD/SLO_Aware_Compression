@@ -22,3 +22,4 @@ apex
 jupyter
 matplotlib
 pandas
+openpyxl

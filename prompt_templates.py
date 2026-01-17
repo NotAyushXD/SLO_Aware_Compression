@@ -109,7 +109,7 @@ if __name__ == "__main__":
         "difficulty": "easy"
     }
     
-    system, user, answer = build_prompt(test_mmlu, "mmlu")
+    system, user, answer = build_improved_prompt(test_mmlu, "mmlu")
     print("MMLU Example:")
     print(f"System: {system}")
     print(f"User:\n{user}")
@@ -122,7 +122,7 @@ if __name__ == "__main__":
         "difficulty": "easy"
     }
     
-    system, user, answer = build_prompt(test_gsm8k, "gsm8k")
+    system, user, answer = build_improved_prompt(test_gsm8k, "gsm8k")
     print("GSM8K Example:")
     print(f"System: {system}")
     print(f"User:\n{user}")

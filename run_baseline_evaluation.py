@@ -170,7 +170,7 @@ def main(args):
             data_loader=test_data,
             batch_size=32
         )
-        eval_results = evaluator.evaluate()
+        eval_results, detailed_predictions = evaluator.evaluate()
         
         # Save eval results
         eval_file = os.path.join(args.output_dir, "eval_results.json")
@@ -182,6 +182,7 @@ def main(args):
     except Exception as e:
         logger.error(f"Evaluation failed: {e}")
         eval_results = {}
+        detailed_predictions = []
     
     # Step 6: Summary report
     logger.info("\n" + "="*80)
@@ -229,12 +230,48 @@ def main(args):
             }
         }, f, indent=2)
     
+    # Save Excel report
+    try:
+        import pandas as pd
+        excel_file = os.path.join(args.output_dir, "performance_summary.xlsx")
+        
+        # Prepare DataFrames
+        df_load = pd.DataFrame(all_metrics_summary)
+        
+        # Flatten eval results for Accuracy sheet
+        eval_rows = []
+        if eval_results:
+            for dataset_type, res in eval_results.items():
+                row = res.copy()
+                row['dataset'] = dataset_type
+                eval_rows.append(row)
+        df_eval = pd.DataFrame(eval_rows)
+        
+        # Detailed outputs
+        df_details = pd.DataFrame(detailed_predictions)
+        
+        with pd.ExcelWriter(excel_file) as writer:
+            df_load.to_excel(writer, sheet_name='Load Test Metrics', index=False)
+            if not df_eval.empty:
+                df_eval.to_excel(writer, sheet_name='Accuracy Metrics', index=False)
+            if not df_details.empty:
+                df_details.to_excel(writer, sheet_name='Model Outputs', index=False)
+                
+        logger.info(f"Saved Excel summary to {excel_file}")
+        
+    except ImportError:
+        logger.warning("pandas or openpyxl not installed, skipping Excel export")
+    except Exception as e:
+        logger.error(f"Failed to save Excel report: {e}")
+
+
     logger.info("\n" + "="*80)
     logger.info("BASELINE EVALUATION COMPLETE")
     logger.info(f"Results saved to: {args.output_dir}")
     logger.info("="*80)
     logger.info("\nFiles generated:")
     logger.info(f"  - summary.json (overall summary)")
+    logger.info(f"  - performance_summary.xlsx (Excel report)")
     logger.info(f"  - eval_results.json (accuracy metrics)")
     for concurrency in args.concurrencies:
         logger.info(f"  - metrics_concurrency_{concurrency}.json")
