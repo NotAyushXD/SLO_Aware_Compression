@@ -305,9 +305,12 @@ if __name__ == "__main__":
     # Load test configuration
     parser.add_argument("--num_requests", type=int, default=5000,
                        help="Number of requests per concurrency level")
-    parser.add_argument("--concurrencies", type=int, nargs="+",
-                       default=[1, 2, 4, 8, 16, 32],
-                       help="Concurrency levels to test")
+    parser.add_argument('--concurrencies', 
+                    nargs='+', 
+                    type=int,
+                    default=[1, 4, 8],
+                    help='List of concurrency levels')
+
     
     # Output configuration
     parser.add_argument("--output_dir", default="results/baseline_med",
