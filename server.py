@@ -128,7 +128,7 @@ class SingleVariantServer:
     """
     
     def __init__(self, 
-                 model_name: str = "meta-llama/Llama-2-7b-chat-hf",
+                 model_name: str = "meta-llama/Llama-3.1-8B",
                  variant: str = "med",
                  device: str = "auto",
                  dtype: str = "auto"):

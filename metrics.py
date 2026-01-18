@@ -33,10 +33,15 @@ class MetricsCalculator:
     """Calculate comprehensive metrics from request logs"""
     
     # Default SLO targets by difficulty level
+    # DEFAULT_SLOS = {
+    #     "easy": {"ttft_ms": 200, "tpot_ms": 20},
+    #     "medium": {"ttft_ms": 300, "tpot_ms": 25},
+    #     "hard": {"ttft_ms": 500, "tpot_ms": 40}
+    # }
     DEFAULT_SLOS = {
-        "easy": {"ttft_ms": 200, "tpot_ms": 20},
-        "medium": {"ttft_ms": 300, "tpot_ms": 25},
-        "hard": {"ttft_ms": 500, "tpot_ms": 40}
+        "easy": {"ttft_ms": 150, "tpot_ms": 20},
+        "medium": {"ttft_ms": 250, "tpot_ms": 30},
+        "hard": {"ttft_ms": 400, "tpot_ms": 50}
     }
     
     def __init__(self, request_metrics: List, slo_dict: Optional[Dict] = None):

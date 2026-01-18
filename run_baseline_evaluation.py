@@ -295,7 +295,7 @@ if __name__ == "__main__":
     
     # Model configuration
     parser.add_argument("--model_name", 
-                       default="meta-llama/Llama-2-7b-chat-hf",
+                       default="meta-llama/Llama-3.1-8B",
                        help="HuggingFace model name")
     parser.add_argument("--device", default="cuda",
                        help="Device: 'cuda' or 'cpu'")
