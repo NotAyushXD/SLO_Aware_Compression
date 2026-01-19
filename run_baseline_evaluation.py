@@ -90,7 +90,7 @@ def main(args):
     try:
         server = SingleVariantServer(
             model_name=args.model_name,
-            variant="med",
+            variant=args.variant,
             device=args.device,
             dtype=args.dtype
         )
@@ -204,14 +204,21 @@ def main(args):
     print("\nAccuracy Results:")
     if eval_results:
         for dataset_type in sorted(eval_results.keys()):
-            if dataset_type != "overall":
+            if dataset_type not in ["overall", "by_difficulty"]:
                 result = eval_results[dataset_type]
-                print(f"  {dataset_type.upper():<10s}: {result['em']*100:6.2f}% "
-                      f"({result['correct_count']}/{result['total_count']})")
+                if isinstance(result, dict):
+                    # Use 'accuracy' if available, otherwise 'em', default to 0
+                    acc = result.get('accuracy', result.get('em', 0))
+                    correct = result.get('correct_count', 0)
+                    total = result.get('total_count', 0)
+                    print(f"  {dataset_type.upper():<10s}: {acc*100:6.2f}% ({correct}/{total})")
         
         overall = eval_results.get("overall", {})
-        print(f"  {'OVERALL':<10s}: {overall.get('em', 0)*100:6.2f}% "
-              f"({overall.get('correct_count', 0)}/{overall.get('total_count', 0)})")
+        if isinstance(overall, dict):
+            acc = overall.get('accuracy', overall.get('em', 0))
+            correct = overall.get('correct_count', 0)
+            total = overall.get('total_count', 0)
+            print(f"  {'OVERALL':<10s}: {acc*100:6.2f}% ({correct}/{total})")
     else:
         print("  No evaluation results available")
     
@@ -301,6 +308,8 @@ if __name__ == "__main__":
                        help="Device: 'cuda' or 'cpu'")
     parser.add_argument("--dtype", default="auto",
                        help="Data type: 'auto', 'float16', 'bfloat16'")
+    parser.add_argument("--variant", default="med",
+                       help="Server variant: 'base', 'med', 'cheap'")
     
     # Load test configuration
     parser.add_argument("--num_requests", type=int, default=5000,

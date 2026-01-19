@@ -1,6 +1,6 @@
 data/*
 results/*
-__pycache__/*
+__pycache__/*.pyc
 .DS_Store
 test_server_timing.py
 results/.DS_Store
