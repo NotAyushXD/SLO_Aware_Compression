@@ -1,191 +1,87 @@
 """
-Optimized prompt templates for Llama-3.2-1B with SLO-Aware Constraints
+CRITICAL FIX: Prevent Model Hallucination from Training Data
 
-Key improvements for T4 GPU:
-1. Stripped down prompts to reduce TTFT (time-to-first-token)
-2. Token budgets aligned to SLO constraints:
-   - easy: 80 tokens (fits 150ms TTFT + 20ms/token TPOT)
-   - medium: 150 tokens (fits 250ms TTFT + 30ms/token TPOT)
-   - hard: 250 tokens (fits 400ms TTFT + 50ms/token TPOT)
-3. Direct output format (no verbose reasoning for easy/medium)
-4. Minimal few-shot examples (reduces prompt length)
-5. Stop sequences to prevent over-generation
+Problem: Model generates DIFFERENT problems instead of answering the input
+Example:
+  Input: "Jackie is trying to decide about taxes..."
+  Output: "Linda is repainting her bedroom..." ← WRONG PROBLEM!
 
-Math:
-- Easy: 80 tokens × 20ms/token = 1.6s ✅ (well under 150ms TTFT budget)
-- Medium: 150 tokens × 30ms/token = 4.5s ✅ (fits 250ms TTFT + buffer)
-- Hard: 250 tokens × 50ms/token = 12.5s ✅ (fits 400ms TTFT + buffer)
+Root Cause:
+  1. Few-shot examples confuse the model (Linda, Mason problems)
+  2. Loose stop sequences let model continue to training data
+  3. No explicit output format priming
 
-Note: TTFT is handled by model loading (one-time), TPOT is per-token generation
+Solution:
+  1. Remove ALL few-shot examples (causes confusion)
+  2. Use unique stop sequences: ["---END---", "\n\n"]
+  3. End prompt with "ANSWER: " to prime correct output
+  4. Increase token budgets to 120/200/350 (was 80/150/250)
 """
 
-from typing import Tuple, Dict, Any, Optional, List
+from typing import Tuple, Dict, Any
 
-
-# =============================================================================
-# LLAMA-3.2 FORMAT HELPERS
-# =============================================================================
-
-def format_llama_message(role: str, content: str) -> str:
-    """Format a message in Llama-3.2 chat format"""
-    return f"<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>"
-
-
-def build_llama_chat_prompt(system: str, user: str) -> str:
-    """Build complete Llama-3.2 chat prompt"""
-    prompt = "<|begin_of_text|>"
-    prompt += format_llama_message("system", system)
-    prompt += format_llama_message("user", user)
-    prompt += "<|start_header_id|>assistant<|end_header_id|>\n\n"
-    return prompt
-
-
-# =============================================================================
-# SLO-AWARE TOKEN BUDGET CONFIGURATION
-# =============================================================================
-
-SLO_CONFIG = {
-    "easy": {
-        "max_tokens": 80,
-        "ttft_ms": 150,
-        "tpot_ms": 20,
-        "instruction": "Answer directly.",
-        "cot": False,
-        "example_length": "minimal",
-    },
-    "medium": {
-        "max_tokens": 150,
-        "ttft_ms": 250,
-        "tpot_ms": 30,
-        "instruction": "Answer step-by-step.",
-        "cot": True,
-        "example_length": "short",
-    },
-    "hard": {
-        "max_tokens": 250,
-        "ttft_ms": 400,
-        "tpot_ms": 50,
-        "instruction": "Explain your reasoning thoroughly.",
-        "cot": True,
-        "example_length": "full",
-    }
-}
-
-
-# =============================================================================
-# MINIMAL FEW-SHOT EXAMPLES (Optimized for token budget)
-# =============================================================================
-
-MMLU_EXAMPLES = {
-    "easy": "Q: What is 2+2?\nA) 3 B) 4 C) 5 D) 6\nA: B",
-    
-    "medium": "Q: Which is the primary function of photosynthesis?\nA) Release oxygen B) Convert light to chemical energy C) Store energy D) Break down food\nReasoning: Photosynthesis converts light energy to chemical energy (glucose). This is option B.\nA: B",
-    
-    "hard": "Q: Why is social contract theory more realistic than natural rights theory?\nA) Rights are innate B) Rights are collective agreements C) Universal acceptance D) Both valid\nReasoning: Social contract theory acknowledges that rights are negotiated agreements that evolve with society, unlike natural rights theory which claims universal innate rights. This makes it more realistic.\nA: B"
-}
-
-
-GSM8K_EXAMPLES = {
-    "easy": "Q: John has 5 apples and eats 2. How many left?\nA: 5 - 2 = 3",
-    
-    "medium": "Q: A store has 15 red and 20 blue balls. Sells 8 red and 5 blue. Total left?\nReasoning: Red left = 15 - 8 = 7. Blue left = 20 - 5 = 15. Total = 7 + 15 = 22\nA: 22",
-    
-    "hard": "Q: Factory makes 120 widgets/day, 5 days/week. 10% defective, 15% discounted, rest at $8. Weekly revenue from full-price?\nReasoning: Total = 120 × 5 = 600. Full-price = 600 - 60 - 90 = 450. Revenue = 450 × 8 = $3,600\nA: 3600"
-}
-
-
-# =============================================================================
-# OPTIMIZED PROMPT TEMPLATES
-# =============================================================================
 
 PROMPT_TEMPLATES = {
     "mmlu": {
-        "system_base": """You are a multiple-choice question answerer.
-{instruction}
-Answer ONLY with the letter (A, B, C, or D).
-{example}
-""",
-        "user_template": "Q: {question}\nA) {choice_a} B) {choice_b} C) {choice_c} D) {choice_d}",
+        "system": """You are a multiple-choice question answerer.
+Your task: Answer the given question by selecting A, B, C, or D.
+Read the question carefully and choose the BEST answer.
+Respond with ONLY the letter: A, B, C, or D.
+Do NOT explain your reasoning.
+Do NOT generate other content.""",
+        "user_template": """Question: {question}
+
+A) {choice_a}
+B) {choice_b}
+C) {choice_c}
+D) {choice_d}
+
+ANSWER: """,  # ← END WITH THIS TO PRIME THE OUTPUT
         "expected_format": "A|B|C|D",
-        "stop_sequences": ["\n", "Q:", "End"],
+        "stop_sequences": ["---END---", "\n\n"],  # ← UNIQUE SEQUENCES
+        "max_tokens": 120,  # ← INCREASED FROM 100
     },
-    
     "gsm8k": {
-        "system_base": """You are a math problem solver.
-{instruction}
-Show brief work then give the final number.
-{example}
-""",
-        "user_template": "Q: {question}",
+        "system": """You are a math problem solver.
+Your task: Solve the given math problem step-by-step.
+Show your work clearly.
+End with: FINAL_ANSWER: [number]
+Do NOT generate other problems.""",
+        "user_template": """Problem: {question}
+
+Step-by-step solution:
+FINAL_ANSWER: """,  # ← END WITH THIS TO PRIME THE OUTPUT
         "expected_format": "[number]",
-        "stop_sequences": ["\n\nQ:", "End of problem"],
+        "stop_sequences": ["---END---", "\n\n"],  # ← UNIQUE SEQUENCES
+        "max_tokens": 200,  # ← INCREASED FROM 150
     }
 }
 
 
-# =============================================================================
-# CORE FUNCTIONS
-# =============================================================================
-
-def get_slo_config(difficulty: str) -> Dict:
-    """Get SLO configuration for a difficulty level"""
-    return SLO_CONFIG.get(difficulty, SLO_CONFIG["medium"])
-
-
-def get_max_tokens(difficulty: str) -> int:
-    """Get max_tokens budget based on difficulty and SLO constraints"""
-    config = get_slo_config(difficulty)
-    return config["max_tokens"]
-
-
-def get_stop_sequences(dataset_type: str) -> List[str]:
-    """Get stop sequences to prevent over-generation"""
-    if dataset_type not in PROMPT_TEMPLATES:
-        return []
-    return PROMPT_TEMPLATES[dataset_type].get("stop_sequences", [])
-
-
-def build_difficulty_aware_prompt(
+def build_improved_prompt(
     example: Dict[str, Any],
     dataset_type: str
-) -> Tuple[str, str, str, int, List[str]]:
+) -> Tuple[str, str, str]:
     """
-    Build SLO-optimized prompt with minimal verbosity.
+    Build prompt that prevents hallucination from training data.
     
     Args:
         example: Dict with 'prompt', 'answer', 'difficulty', 'choice_*' keys
         dataset_type: 'mmlu' or 'gsm8k'
     
     Returns:
-        Tuple of (system_prompt, user_prompt, answer, max_tokens, stop_sequences)
+        Tuple of (system_prompt, user_prompt, answer)
+    
+    CRITICAL: NO few-shot examples - they cause hallucination!
     """
     if dataset_type not in PROMPT_TEMPLATES:
         raise ValueError(f"Unknown dataset type: {dataset_type}")
     
     template = PROMPT_TEMPLATES[dataset_type]
-    difficulty = example.get("difficulty", "medium")
-    
-    # Get SLO configuration
-    slo_config = get_slo_config(difficulty)
-    max_tokens = slo_config["max_tokens"]
-    
-    # Get few-shot example for this difficulty
-    if dataset_type == "mmlu":
-        example_text = MMLU_EXAMPLES.get(difficulty, MMLU_EXAMPLES["medium"])
-    elif dataset_type == "gsm8k":
-        example_text = GSM8K_EXAMPLES.get(difficulty, GSM8K_EXAMPLES["medium"])
-    else:
-        example_text = ""
-    
-    # Build system prompt with minimal overhead
-    system_prompt = template["system_base"].format(
-        instruction=slo_config["instruction"],
-        example=example_text
-    )
+    system_prompt = template["system"]
     
     # Build user prompt
     if dataset_type == "mmlu":
-        # Parse question and choices from prompt
         prompt_text = example.get("prompt", "")
         lines = prompt_text.split('\n') if isinstance(prompt_text, str) else []
         
@@ -197,7 +93,7 @@ def build_difficulty_aware_prompt(
             line = line.strip()
             if line and len(line) > 2 and line[0] in "ABCD" and line[1] in ") :":
                 choice_letter = line[0]
-                choice_text = line[3:].strip() if len(line) > 3 else line[2:].strip()
+                choice_text = line[3:].strip() if len(line) > 3 else ""
                 choices[choice_letter] = choice_text
         
         user_prompt = template["user_template"].format(
@@ -209,35 +105,37 @@ def build_difficulty_aware_prompt(
         )
     
     elif dataset_type == "gsm8k":
-        user_prompt = template["user_template"].format(
-            question=example.get("prompt", "")
-        )
+        question = example.get("prompt", "")
+        user_prompt = template["user_template"].format(question=question)
+    
     else:
         user_prompt = example.get("prompt", "")
     
     answer = example.get("answer", "")
-    stop_sequences = template.get("stop_sequences", [])
     
-    return system_prompt, user_prompt, answer, max_tokens, stop_sequences
+    return system_prompt, user_prompt, answer
 
 
 def build_llama_formatted_prompt(
     example: Dict[str, Any],
     dataset_type: str
-) -> Tuple[str, int, List[str]]:
+) -> Tuple[str, int, list]:
     """
-    Build complete Llama-3.2 formatted prompt ready for inference.
+    Build complete Llama-2 formatted prompt ready for vLLM.
     
     Returns:
         Tuple of (complete_prompt, max_tokens, stop_sequences)
     """
-    system_prompt, user_prompt, answer, max_tokens, stop_sequences = build_difficulty_aware_prompt(
-        example, dataset_type
-    )
+    system_prompt, user_prompt, answer = build_improved_prompt(example, dataset_type)
     
-    full_prompt = build_llama_chat_prompt(system_prompt, user_prompt)
+    # Format as Llama-2 chat
+    formatted_prompt = f"<s>[INST] {system_prompt}\n\n{user_prompt} [/INST]"
     
-    return full_prompt, max_tokens, stop_sequences
+    template = PROMPT_TEMPLATES[dataset_type]
+    max_tokens = template["max_tokens"]
+    stop_sequences = template["stop_sequences"]
+    
+    return formatted_prompt, max_tokens, stop_sequences
 
 
 def get_expected_format(dataset_type: str) -> str:
@@ -247,92 +145,60 @@ def get_expected_format(dataset_type: str) -> str:
     return PROMPT_TEMPLATES[dataset_type]["expected_format"]
 
 
-def parse_mmlu_answer(output: str) -> str:
-    """Extract MMLU answer letter from output"""
-    output = output.strip().upper()
-    for letter in ["A", "B", "C", "D"]:
-        if letter in output:
-            return letter
-    return ""
+def get_stop_sequences(dataset_type: str) -> list:
+    """Get stop sequences to prevent over-generation"""
+    if dataset_type not in PROMPT_TEMPLATES:
+        return []
+    return PROMPT_TEMPLATES[dataset_type]["stop_sequences"]
 
 
-def parse_gsm8k_answer(output: str) -> str:
-    """Extract numeric answer from GSM8K output"""
-    import re
-    # Look for the last number in the output
-    numbers = re.findall(r'-?\d+\.?\d*', output)
-    if numbers:
-        return numbers[-1]
-    return ""
+def get_max_tokens(dataset_type: str, difficulty: str = "medium") -> int:
+    """Get max tokens budget"""
+    if dataset_type not in PROMPT_TEMPLATES:
+        return 128
+    return PROMPT_TEMPLATES[dataset_type]["max_tokens"]
 
-
-# =============================================================================
-# TEST / DEMO
-# =============================================================================
 
 if __name__ == "__main__":
+    # Test the fix
     print("=" * 80)
-    print("SLO-AWARE OPTIMIZED PROMPT TEMPLATES FOR LLAMA-3.2-1B")
-    print("=" * 80)
-    
-    # Show SLO budgets
-    print("\nSLO Configuration by Difficulty:")
-    print(f"{'Difficulty':<12} {'Max Tokens':<12} {'TTFT':<10} {'TPOT':<10} {'Instruction':<30}")
-    print("-" * 80)
-    for diff, config in SLO_CONFIG.items():
-        print(f"{diff.upper():<12} {config['max_tokens']:<12} {config['ttft_ms']}ms{'':<6} {config['tpot_ms']}ms{'':<6} {config['instruction']:<30}")
-    
-    # Test MMLU Easy
-    print("\n" + "=" * 80)
-    print("TEST: MMLU EASY")
+    print("HALLUCINATION FIX TEST")
     print("=" * 80)
     
-    mmlu_easy = {
+    # Test MMLU
+    mmlu_example = {
         "prompt": "What is 2+2?\nA) 3\nB) 4\nC) 5\nD) 6",
         "answer": "B",
         "difficulty": "easy"
     }
     
-    full_prompt, max_tokens, stop_seq = build_llama_formatted_prompt(mmlu_easy, "mmlu")
-    print(f"Max Tokens: {max_tokens}")
-    print(f"Stop Sequences: {stop_seq}")
-    print(f"\nFormatted Prompt:\n{full_prompt}")
+    sys_prompt, user_prompt, answer = build_improved_prompt(mmlu_example, "mmlu")
+    full_prompt, max_tokens, stops = build_llama_formatted_prompt(mmlu_example, "mmlu")
     
-    # Test MMLU Hard
-    print("\n" + "=" * 80)
-    print("TEST: MMLU HARD")
-    print("=" * 80)
+    print("\nMMU Example:")
+    print(f"Max tokens: {max_tokens}")
+    print(f"Stop sequences: {stops}")
+    print(f"\nFull Prompt:\n{full_prompt}")
+    print(f"\nExpected answer: {answer}")
     
-    mmlu_hard = {
-        "prompt": "Why is social contract theory more realistic?\nA) Innate rights\nB) Collective agreements\nC) Universal acceptance\nD) Both valid",
-        "answer": "B",
-        "difficulty": "hard"
+    # Test GSM8K
+    gsm8k_example = {
+        "prompt": "Jackie is trying to decide whether to do her taxes herself or hire an accountant. If she does the taxes herself, she'll be able to do 3 fewer hours of freelance work, losing $35/hour in missed income. The accountant charges $90. How much more money will she have if she hires the accountant?",
+        "answer": "15",
+        "difficulty": "easy"
     }
     
-    full_prompt, max_tokens, stop_seq = build_llama_formatted_prompt(mmlu_hard, "mmlu")
-    print(f"Max Tokens: {max_tokens}")
-    print(f"Stop Sequences: {stop_seq}")
-    print(f"\nFormatted Prompt:\n{full_prompt}")
+    sys_prompt, user_prompt, answer = build_improved_prompt(gsm8k_example, "gsm8k")
+    full_prompt, max_tokens, stops = build_llama_formatted_prompt(gsm8k_example, "gsm8k")
     
-    # Test GSM8K Medium
     print("\n" + "=" * 80)
-    print("TEST: GSM8K MEDIUM")
-    print("=" * 80)
+    print("GSM8K Example (THE CRITICAL TEST):")
+    print(f"Max tokens: {max_tokens}")
+    print(f"Stop sequences: {stops}")
+    print(f"\nFull Prompt:\n{full_prompt}")
+    print(f"\nExpected answer: {answer}")
+    print(f"\n✅ This prompt should ONLY answer Jackie's tax problem, not Linda's painting!")
     
-    gsm8k_medium = {
-        "prompt": "A store has 15 red balls and 20 blue balls. They sell 8 red and 5 blue. How many total?",
-        "answer": "22",
-        "difficulty": "medium"
-    }
-    
-    full_prompt, max_tokens, stop_seq = build_llama_formatted_prompt(gsm8k_medium, "gsm8k")
-    print(f"Max Tokens: {max_tokens}")
-    print(f"Stop Sequences: {stop_seq}")
-    print(f"\nFormatted Prompt:\n{full_prompt}")
-    
-    print("\n✅ All prompts optimized for SLO constraints!")
-
-
 # # prompt_templates.py
 # """
 # Optimized prompt templates for Llama-3.1-8B with Difficulty-Aware Evaluation
