@@ -236,15 +236,15 @@ class EvaluationMetrics:
 class HeldOutEvaluator:
     """Evaluate model on held-out test set"""
     
-    def __init__(self, model, dataloader: List[Dict], batch_size: int = 32):
+    def __init__(self, model, data_loader: List[Dict], batch_size: int = 32):
         """
         Args:
             model: Server object with generate method
-            dataloader: List of prompt, answer, dataset, ... dicts
+            data_loader: List of prompt, answer, dataset, ... dicts
             batch_size: Batch size for display logging
         """
         self.model = model
-        self.dataloader = dataloader
+        self.data_loader = data_loader
         self.batch_size = batch_size
     
     def evaluate(self) -> Tuple[Dict, List[Dict]]:
@@ -257,7 +257,7 @@ class HeldOutEvaluator:
             - List of detailed prediction dictionaries
         """
         logger.info("=" * 70)
-        logger.info(f"EVALUATING ON {len(self.dataloader)} EXAMPLES")
+        logger.info(f"EVALUATING ON {len(self.data_loader)} EXAMPLES")
         logger.info("=" * 70)
         
         all_predictions = []
@@ -267,7 +267,7 @@ class HeldOutEvaluator:
         all_hallucinations = []
         detailed_results = []
         
-        for i, example in enumerate(self.dataloader):
+        for i, example in enumerate(self.data_loader):
             try:
                 dataset_type = example.get("dataset", "mmlu")
                 system_prompt, user_prompt, _ = build_improved_prompt(example, dataset_type)
@@ -299,7 +299,7 @@ class HeldOutEvaluator:
                 all_hallucinations.append(False)
             
             if (i + 1) % self.batch_size == 0:
-                logger.info(f"Generated {i + 1}/{len(self.dataloader)} predictions")
+                logger.info(f"Generated {i + 1}/{len(self.data_loader)} predictions")
         
         # Evaluate by dataset type
         results = {}
