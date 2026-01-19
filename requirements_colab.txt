@@ -1,0 +1,41 @@
+# SLO-Aware Task-Adaptive Compression: Baseline Evaluation Framework
+# Python 3.8+ required
+# Optimized for T4 GPU on Google Colab and Kaggle
+
+# Core dependencies - PyTorch with CUDA 11.8 support (T4 compatible)
+# CRITICAL: Install with specific CUDA version to avoid "Torch not compiled with CUDA" error
+# pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu118
+torch>=2.0.0
+torchvision
+torchaudio
+transformers>=4.30.0
+datasets
+numpy>=1.21.0
+
+# Tokenization
+tiktoken
+
+# Quantization support (required for INT8 optimization phase)
+bitsandbytes>=0.41.0
+accelerate>=0.20.0
+
+# vLLM for optimized inference (adds prefix caching, batch processing)
+vllm>=0.3.0
+
+# Optional: For mixed precision training (if extending framework)
+# apex  # Uncomment if training on multi-GPU, may not work on T4
+
+# Development & Monitoring
+jupyter
+matplotlib
+pandas
+openpyxl
+
+# Optional: Better progress bars and logging
+tqdm
+rich
+wandb  # For experiment tracking (SLO metrics)
+
+# Optional: For benchmarking TPOT and latency
+psutil
+py-cpuinfo
