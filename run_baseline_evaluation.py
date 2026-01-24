@@ -177,7 +177,8 @@ def main(args):
         all_metrics_summary.append(summary_entry)
         
     # Calibrate SLOs if not already loaded
-    if not current_slos and all_raw_metrics:
+    # if not current_slos and all_raw_metrics:
+    if False:
         logger.info("\n[STEP 3.5] CALIBRATING SLOs")
         logger.info("-"*80)
         
