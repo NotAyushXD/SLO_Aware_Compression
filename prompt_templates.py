@@ -25,16 +25,16 @@ logger = logging.getLogger(__name__)
 
 # Difficulty-aware token budgets
 DIFFICULTY_TOKEN_BUDGETS = {
-    "easy": 120,      # Simple fact recall, no reasoning needed
-    "medium": 200,    # Some reasoning, moderate explanation
-    "hard": 350       # Complex reasoning, detailed explanation
+    "easy": 128,      # One-pass reasoning
+    "medium": 256,    # Light multi-step reasoning
+    "hard": 512       # Full reasoning without truncation
 }
 
 # MMLU TEMPLATES - UPDATED for better reasoning
 MMLU_TEMPLATES = {
     "easy": {
-        "system": "",
-        "user_template": """Answer the following question carefully.
+        "system": "You are a knowledgeable assistant. Answer accurately and concisely.",
+        "user_template": """Answer the following multiple-choice question.
 
 Question: {question}
 
@@ -43,13 +43,15 @@ B) {choice_b}
 C) {choice_c}
 D) {choice_d}
 
-The correct answer is:""",
-        "max_tokens": 100,
-        "stop_sequences": []
+Select the correct option.
+Answer with ONLY the letter (A, B, C, or D).""",
+        "max_tokens": 64,
+        "stop_sequences": ["\n"]
     },
+
     "medium": {
-        "system": "",
-        "user_template": """Answer the following multiple choice question by analyzing each option.
+        "system": "You are a knowledgeable assistant. Reason carefully but answer concisely.",
+        "user_template": """Answer the following multiple-choice question.
 
 Question: {question}
 
@@ -58,14 +60,15 @@ B) {choice_b}
 C) {choice_c}
 D) {choice_d}
 
-Think through: Which option is correct and why?
-The correct answer is:""",
-        "max_tokens": 150,
-        "stop_sequences": []
+Think through the question carefully and verify the correct choice.
+Answer with ONLY the letter (A, B, C, or D).""",
+        "max_tokens": 128,
+        "stop_sequences": ["\n"]
     },
+
     "hard": {
-        "system": "",
-        "user_template": """Answer this complex question carefully by analyzing each option.
+        "system": "You are a domain expert. Apply careful reasoning and double-check your conclusion.",
+        "user_template": """Answer the following challenging multiple-choice question.
 
 Question: {question}
 
@@ -74,64 +77,60 @@ B) {choice_b}
 C) {choice_c}
 D) {choice_d}
 
-Analyze each option and choose the best answer.
-The correct answer is:""",
-        "max_tokens": 200,
-        "stop_sequences": []
+Carefully reason about the question and validate your final choice.
+Answer with ONLY the letter (A, B, C, or D).""",
+        "max_tokens": 192,
+        "stop_sequences": ["\n"]
     }
 }
 
 # GSM8K TEMPLATES - UPDATED for step-by-step reasoning
 GSM8K_TEMPLATES = {
     "easy": {
-        "system": "",
-        "user_template": """Given the following math problem, solve it carefully step-by-step.
+        "system": "You are a careful math problem solver.",
+        "user_template": """Solve the following math problem step by step.
 
 Problem: {question}
 
-Solution:
-Step 1: Identify what we need to find.
-Step 2: List the given information.
-Step 3: Calculate the answer.
+Work through the reasoning carefully.
+Then provide the final numeric answer.
 
-FINAL_ANSWER: [provide the number only]""",
-        "max_tokens": 250,  # INCREASED from 150
+FINAL_ANSWER: [number only]""",
+        "max_tokens": 256,
         "stop_sequences": []
     },
+
     "medium": {
-        "system": "",
-        "user_template": """Given the following math problem, solve it step-by-step.
+        "system": "You are a careful math problem solver. Avoid arithmetic mistakes.",
+        "user_template": """Solve the following math problem step by step.
 
 Problem: {question}
 
-Solution:
-Step 1: Identify what we need to find.
-Step 2: List the given information.
-Step 3: Set up the calculation.
-Step 4: Solve it.
+Show your calculations clearly and logically.
+Double-check intermediate steps.
 
-FINAL_ANSWER: [provide the number only]""",
-        "max_tokens": 350,  # INCREASED from 200
+FINAL_ANSWER: [number only]""",
+        "max_tokens": 384,
         "stop_sequences": []
     },
+
     "hard": {
-        "system": "",
-        "user_template": """Given the following complex math problem, solve it very carefully step-by-step.
+        "system": "You are an expert math problem solver. Reason carefully and verify your answer.",
+        "user_template": """Solve the following multi-step math problem.
 
 Problem: {question}
 
-Solution:
-Step 1: What are we solving for?
-Step 2: What information do we have?
-Step 3: What formula or method should we use?
-Step 4: Calculate step-by-step.
-Step 5: Double-check your answer.
+Reason step by step:
+- Identify variables
+- Perform calculations carefully
+- Verify the result
 
-FINAL_ANSWER: [provide the number only]""",
-        "max_tokens": 500,  # INCREASED from 250
+FINAL_ANSWER: [number only]""",
+        "max_tokens": 512,
         "stop_sequences": []
     }
 }
+
 
 
 # ============================================================================

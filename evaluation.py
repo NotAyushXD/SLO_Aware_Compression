@@ -28,167 +28,120 @@ class EvaluationMetrics:
     
     @staticmethod
     def extract_answer(response: str, dataset_type: str) -> str:
-        """
-        Extract answer from model response based on prompt template format.
-        
-        MMLU: Expects single letter A, B, C, or D
-        GSM8K: Expects single number
-        
-        Args:
-            response: Model-generated text
-            dataset_type: 'mmlu' or 'gsm8k'
-        
-        Returns:
-            Extracted answer as string or empty string if not found
-        """
         response = response.strip()
-        
+
         if dataset_type == "mmlu":
             return EvaluationMetrics.extract_mmlu_answer(response)
         elif dataset_type == "gsm8k":
             return EvaluationMetrics.extract_gsm8k_answer(response)
-        
-        return response
-    
-    @staticmethod
-    def extract_mmlu_answer(response: str) -> str:
-        """
-        Extract MMLU answer from response.
-        
-        Expected format: "ANSWER: A" or just "A"
-        
-        Detection strategy (in order):
-        1. Look for "ANSWER:" prefix
-        2. Look for just the letter at start of line
-        3. Return empty if no valid format found
-        """
-        response_lower = response.lower()
-        
-        # Strategy 1: "ANSWER: A" or similar
-        match = re.search(r'answer\s*[:=\s]*([a-d])', response_lower, re.IGNORECASE)
-        if match:
-            return match.group(1).upper()
-        
-        # Strategy 2: First letter on first line
-        first_line = response.split('\n')[0].strip().upper()
-        if len(first_line) > 0 and first_line[0] in "ABCD":
-            return first_line[0]
-        
-        # Strategy 3: Any single letter A-D in response
-        matches = re.findall(r'[A-D]', response_upper := response.upper())
-        if matches:
-            return matches[0]  # Return first match
-        
-        # No valid answer found
+
         return ""
-    
+
     @staticmethod
     def extract_mmlu_answer(response: str) -> str:
         """
-        Extract MMLU answer from response.
-        
-        Handles formats with punctuation:
-        - "A", "B.", "C)", "D "
-        - "ANSWER: A"
-        - "The correct answer is B"
+        Extract a single valid MMLU answer: A, B, C, or D.
+
+        Accepted formats:
+        - "A"
+        - "ANSWER: B"
+        - "The correct answer is C"
+        - "D."
         """
-        response_upper = response.upper()
-        
-        # Strategy 1: Look for explicit "answer" keyword followed by letter
-        # Matches: "ANSWER: A", "The answer is B", "correct answer: C"
+
+        if not response:
+            return ""
+
+        text = response.strip().upper()
+
+        # Strategy 1: Explicit answer markers
         match = re.search(
-            r'(?:ANSWER|answer|correct\s+answer)\s*[:=\s]*([A-D])',
+            r'(?:FINAL\s+ANSWER|ANSWER|CORRECT\s+ANSWER)\s*[:=\s]*([A-D])\b',
+            text
+        )
+
+        if match:
+            return match.group(1)
+
+        # Strategy 2: Single-letter response (possibly with punctuation)
+        match = re.fullmatch(r'\s*([A-D])[\.\)]?\s*', text)
+        if match:
+            return match.group(1)
+
+        # Strategy 3: First non-empty line is a single letter
+        first_line = text.splitlines()[0].strip()
+        match = re.fullmatch(r'([A-D])[\.\)]?', first_line)
+        if match:
+            return match.group(1)
+
+        # Anything else is INVALID
+        return ""
+
+    @staticmethod
+    def extract_gsm8k_answer(response: str) -> str:
+        """
+        Extract GSM8K numeric answer.
+
+        Expected format:
+        FINAL_ANSWER: <number>
+
+        Rejects:
+        - Numbers embedded in text
+        - Multiple numbers
+        - No explicit final answer
+        """
+
+        if not response:
+            return ""
+
+        # Strict FINAL_ANSWER extraction
+        match = re.search(
+            r'FINAL_ANSWER\s*[:=\s]*([-+]?\d+(?:\.\d+)?)',
             response,
             re.IGNORECASE
         )
-        if match:
-            return match.group(1).upper()
-        
-        # Strategy 2: Find first letter A-D (ignore punctuation)
-        # Matches: "A.", "B)", "C ", "D" etc.
-        match = re.search(r'([A-D])[\)\.\\s]?', response_upper)
+
         if match:
             return match.group(1)
-        
-        # Strategy 3: Any A-D letter in response
-        for char in response_upper:
-            if char in 'ABCD':
-                return char
-        
-        # No answer found
+
         return ""
 
-    
     @staticmethod
     def detect_hallucination(response: str, dataset_type: str) -> bool:
-        """
-        Detect if model hallucinated (generated wrong problem/context).
-        
-        Hallucination signatures:
-        - For MMLU: Response contains problem intro words (e.g., "Linda", "Mason")
-        - For GSM8K: Response contains unrelated proper nouns
-        """
-        hallucination_keywords = {
-            "mmlu": ["linda", "mason", "john", "sarah", "mary"],
-            "gsm8k": ["linda", "mason", "painting", "attic", "bedroom"]
-        }
-        
+        if not response:
+            return False
+
         response_lower = response.lower()
-        keywords = hallucination_keywords.get(dataset_type, [])
-        
-        # Check if response contains suspicious keywords
-        for keyword in keywords:
-            if keyword in response_lower and len(response) > 100:
+
+        hallucination_keywords = {
+            "mmlu": ["linda", "mason", "john", "mary", "sarah"],
+            "gsm8k": ["linda", "painting", "bedroom", "attic"]
+        }
+
+        for kw in hallucination_keywords.get(dataset_type, []):
+            if kw in response_lower:
                 return True
-        
+
         return False
-    
+
     @staticmethod
     def exact_match_mmlu(prediction: str, ground_truth: str) -> bool:
-        """
-        Check if MMLU prediction matches ground truth.
-        
-        Args:
-            prediction: Model-generated response
-            ground_truth: Correct answer (ABCD)
-        
-        Returns:
-            True if extracted answer matches ground truth
-        """
-        extracted = EvaluationMetrics.extract_answer(prediction, "mmlu")
-        
+        extracted = EvaluationMetrics.extract_mmlu_answer(prediction)
         if not extracted:
             return False
-        
-        return extracted.upper() == ground_truth.upper()
+        return extracted == ground_truth.strip().upper()
     
     @staticmethod
     def exact_match_gsm8k(prediction: str, ground_truth: str) -> bool:
-        """
-        Check if GSM8K prediction matches ground truth.
-        
-        Handles numeric comparison with floating-point tolerance.
-        
-        Args:
-            prediction: Model-generated response with number
-            ground_truth: Correct answer (number or text)
-        
-        Returns:
-            True if extracted number matches ground truth within tolerance
-        """
-        extracted = EvaluationMetrics.extract_answer(prediction, "gsm8k")
-        
+        extracted = EvaluationMetrics.extract_gsm8k_answer(prediction)
         if not extracted:
             return False
-        
+
         try:
-            pred_num = float(extracted)
-            true_num = float(ground_truth)
-            
-            # Allow 1% tolerance for floating point
-            return abs(pred_num - true_num) < 1e-6 or abs(pred_num - true_num) / abs(true_num) < 0.01
-        
-        except (ValueError, ZeroDivisionError):
+            pred = float(extracted)
+            truth = float(ground_truth)
+            return abs(pred - truth) < 1e-6
+        except ValueError:
             return False
     
     @staticmethod
@@ -215,15 +168,17 @@ class EvaluationMetrics:
         
         for pred, truth in zip(predictions, ground_truths):
             # Check for hallucination first
-            if EvaluationMetrics.detect_hallucination(pred, dataset_type):
+            is_hall = EvaluationMetrics.detect_hallucination(pred, dataset_type)
+            if is_hall:
                 hallucination_count += 1
-                continue  # Mark as wrong
             
             # Check if answer matches
             if dataset_type == "mmlu":
-                is_correct = EvaluationMetrics.exact_match_mmlu(pred, truth)
+                extracted = EvaluationMetrics.extract_mmlu_answer(pred)
+                is_correct = extracted != "" and extracted == truth.strip().upper()
             elif dataset_type == "gsm8k":
-                is_correct = EvaluationMetrics.exact_match_gsm8k(pred, truth)
+                extracted = EvaluationMetrics.extract_gsm8k_answer(pred)
+                is_correct = extracted != "" and EvaluationMetrics.exact_match_gsm8k(pred, truth)
             else:
                 is_correct = False
             
@@ -350,8 +305,8 @@ class HeldOutEvaluator:
                     "extracted_answer": extracted,
                     "is_correct": is_correct,
                     "is_hallucination": is_hall,
-                    "max_tokens_used": len(extracted),
-                    "token_efficiency": 1.0 if is_correct else 0.0
+                    "extracted_answer_length": len(extracted),
+                    "binary_score": 1.0 if is_correct else 0.0
                 })
         
         # Overall results
