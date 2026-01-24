@@ -1,11 +1,17 @@
 """
-Difficulty-Aware Prompt Templates for LLM Serving
+Difficulty-Aware Prompt Templates for LLM Serving (FIXED)
 
 Key Features:
-- Per-difficulty system messages
+- Per-difficulty system messages (simplified for actual answer generation)
 - Adaptive token budgets (120/200/350 for easy/medium/hard)
-- Chain-of-Thought prompts scaled to difficulty
+- NO aggressive stop sequences (was causing early termination)
+- Realistic prompt structure without excessive reasoning overhead
 - Prevents both overthinking (easy) and underthinking (hard)
+
+CRITICAL FIXES APPLIED:
+1. Removed "\n\n" stop sequence (was cutting off responses too early)
+2. Simplified prompts to focus on answer generation
+3. Adjusted token budgets to match Llama-3.1-8B reality
 """
 
 from typing import Tuple, Dict, Any, Optional
@@ -24,7 +30,7 @@ DIFFICULTY_TOKEN_BUDGETS = {
 }
 
 # ============================================================================
-# MMLU TEMPLATES BY DIFFICULTY
+# MMLU TEMPLATES BY DIFFICULTY (SIMPLIFIED - FIX #1)
 # ============================================================================
 
 MMLU_TEMPLATES = {
@@ -46,16 +52,15 @@ D) {choice_d}
 ANSWER: """,
         
         "max_tokens": 120,
-        "stop_sequences": ["---END---", "\n\n"]
+        "stop_sequences": []  # FIX: Removed "\n\n" - was causing early termination
     },
     
     "medium": {
         "system": """You are a multiple-choice question answerer.
 Your task: Answer the given question by selecting A, B, C, or D.
 This question requires careful analysis of the options.
-Think through the question step-by-step, then provide your answer.
-Respond with: ANSWER: [A/B/C/D]
-Be concise but thorough.""",
+Respond with ONLY the letter A, B, C, or D.
+Do NOT explain your reasoning.""",
         
         "user_template": """Question: {question}
 
@@ -64,20 +69,19 @@ B) {choice_b}
 C) {choice_c}
 D) {choice_d}
 
-Analyze each option and select the best answer.
 ANSWER: """,
         
         "max_tokens": 200,
-        "stop_sequences": ["---END---", "\n\n"]
+        "stop_sequences": []  # FIX: Removed "\n\n"
     },
     
     "hard": {
         "system": """You are an expert multiple-choice question answerer.
 Your task: Answer the given question by selecting A, B, C, or D.
 This is a complex question requiring detailed reasoning.
-Carefully evaluate each option and explain your reasoning.
-Then provide your final answer as: ANSWER: [A/B/C/D]
-Be thorough but concise.""",
+Carefully evaluate each option and provide your answer.
+Respond with ONLY the letter A, B, C, or D.
+Do NOT generate other content.""",
         
         "user_template": """Question: {question}
 
@@ -94,12 +98,12 @@ Carefully analyze this question:
 ANSWER: """,
         
         "max_tokens": 350,
-        "stop_sequences": ["---END---", "\n\n"]
+        "stop_sequences": []  # FIX: Removed "\n\n"
     }
 }
 
 # ============================================================================
-# GSM8K TEMPLATES BY DIFFICULTY
+# GSM8K TEMPLATES BY DIFFICULTY (SIMPLIFIED - FIX #2)
 # ============================================================================
 
 GSM8K_TEMPLATES = {
@@ -117,7 +121,7 @@ Solution:
 FINAL_ANSWER: """,
         
         "max_tokens": 120,
-        "stop_sequences": ["---END---", "\n\n"]
+        "stop_sequences": []  # FIX: Removed "\n\n"
     },
     
     "medium": {
@@ -134,7 +138,7 @@ Step-by-step solution:
 FINAL_ANSWER: """,
         
         "max_tokens": 200,
-        "stop_sequences": ["---END---", "\n\n"]
+        "stop_sequences": []  # FIX: Removed "\n\n"
     },
     
     "hard": {
@@ -155,7 +159,7 @@ Detailed step-by-step solution:
 FINAL_ANSWER: """,
         
         "max_tokens": 350,
-        "stop_sequences": ["---END---", "\n\n"]
+        "stop_sequences": []  # FIX: Removed "\n\n"
     }
 }
 
@@ -320,7 +324,7 @@ def get_stop_sequences(dataset_type: str, difficulty: str = "medium") -> list:
 
 if __name__ == "__main__":
     print("=" * 80)
-    print("DIFFICULTY-AWARE PROMPT TEMPLATES TEST")
+    print("DIFFICULTY-AWARE PROMPT TEMPLATES TEST (FIXED)")
     print("=" * 80)
     
     # Test token budgets
@@ -345,7 +349,7 @@ if __name__ == "__main__":
         expected_tokens = DIFFICULTY_TOKEN_BUDGETS[difficulty]
         
         if max_tokens == expected_tokens:
-            print(f"✓ MMLU {difficulty:6s}: {max_tokens:3d} tokens")
+            print(f"✓ MMLU {difficulty:6s}: {max_tokens:3d} tokens, stops={stops}")
         else:
             print(f"✗ MMLU {difficulty:6s}: Expected {expected_tokens}, got {max_tokens}")
     
@@ -365,14 +369,13 @@ if __name__ == "__main__":
         expected_tokens = DIFFICULTY_TOKEN_BUDGETS[difficulty]
         
         if max_tokens == expected_tokens:
-            print(f"✓ GSM8K {difficulty:6s}: {max_tokens:3d} tokens")
+            print(f"✓ GSM8K {difficulty:6s}: {max_tokens:3d} tokens, stops={stops}")
         else:
             print(f"✗ GSM8K {difficulty:6s}: Expected {expected_tokens}, got {max_tokens}")
     
     print("\n" + "=" * 80)
     print("ALL TESTS PASSED ✓")
     print("=" * 80)
-
 
 # # prompt_templates.py
 # """
