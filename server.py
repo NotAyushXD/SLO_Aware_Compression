@@ -17,6 +17,7 @@ from typing import Dict, Tuple, Optional
 import logging
 import gc
 import os
+from prompt_templates import get_max_tokens
 
 logging.basicConfig(
     level=logging.INFO,
@@ -351,9 +352,10 @@ class SingleVariantServer:
     
     def generate(self,
                  prompt: str,
-                 max_tokens: int = 128,
+                 max_tokens: int = None,
                  temperature: float = 0.7,
-                 top_p: float = 0.9) -> Tuple[str, Dict]:
+                 top_p: float = 0.9,
+                 difficulty: str = "medium") -> Tuple[str, Dict]:
         """
         Generate response and collect detailed latency metrics.
         
@@ -367,10 +369,18 @@ class SingleVariantServer:
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Nucleus sampling parameter
+            difficulty: Difficulty level for token generation (e.g., "easy", "medium", "hard")
         
         Returns:
             (generated_text, metrics_dict)
         """
+        if max_tokens is None:
+            # We need to import this here to avoid circular imports if possible, or assume it's imported at top
+            # However, prompt_templates.py was imported in the user snippet.
+            # Let's ensure prompt_templates is imported.
+            from prompt_templates import get_max_tokens
+            max_tokens = get_max_tokens(difficulty)
+
         metrics = {}
         
         try:
