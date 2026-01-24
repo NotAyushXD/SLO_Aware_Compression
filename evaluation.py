@@ -21,7 +21,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from prompt_templates import build_improved_prompt
+from prompt_templates import build_llama_formatted_prompt
 
 class EvaluationMetrics:
     """Evaluate model predictions against ground truth"""
@@ -270,16 +270,20 @@ class HeldOutEvaluator:
         for i, example in enumerate(self.data_loader):
             try:
                 dataset_type = example.get("dataset", "mmlu")
-                system_prompt, user_prompt, _ = build_improved_prompt(example, dataset_type)
-                
-                # Format as Llama-2 chat
-                formatted_prompt = f"<s>[INST] {system_prompt}\n\n{user_prompt} [/INST]"
+                formatted_prompt, max_tokens, stops = build_llama_formatted_prompt(
+                        example, dataset_type
+                    )
                 
                 # Generate
                 generated_text, metrics = self.model.generate(
-                    prompt=formatted_prompt,
-                    max_tokens=512
-                )
+                                            prompt=formatted_prompt,
+                                            max_tokens=max_tokens,                           # ← CHANGE: 512 → max_tokens
+                                            difficulty=example.get("difficulty", "medium")   # ← ADD THIS LINE
+                                        )
+
+                print(formatted_prompt)
+                print(generated_text)
+                print("_______________________")
                 
                 all_predictions.append(generated_text)
                 all_ground_truths.append(example.get("answer", ""))

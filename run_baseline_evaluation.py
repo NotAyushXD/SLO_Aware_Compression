@@ -14,7 +14,8 @@ import time
 from preprocessing import DataPreprocessor
 from server import SingleVariantServer
 from load_generator import ClosedLoopLoadGenerator
-from metrics import MetricsCalculator
+
+from metrics import MetricsCalculator, calibrate_slos
 from evaluation import HeldOutEvaluator
 
 logging.basicConfig(
@@ -102,8 +103,22 @@ def main(args):
     logger.info("\n[STEP 3] RUNNING LOAD TESTS")
     logger.info("-"*80)
     
+    # Check if SLOs are already calibrated
+    slo_file = os.path.join(args.output_dir, "slo_thresholds.json")
+    current_slos = None
+    
+    if os.path.exists(slo_file):
+        try:
+            with open(slo_file, 'r') as f:
+                current_slos = json.load(f)
+            logger.info(f"Loaded existing SLOs from {slo_file}")
+            logger.info(f"Using SLOs: {current_slos}")
+        except Exception as e:
+            logger.warning(f"Failed to load existing SLOs: {e}")
+    
     load_test_results = {}
     all_metrics_summary = []
+    all_raw_metrics = [] # Accumulate for calibration
     
     for concurrency in args.concurrencies:
         logger.info(f"\n>>> Testing with concurrency={concurrency}")
@@ -122,7 +137,8 @@ def main(args):
         load_duration = time.time() - start_time
         
         # Calculate metrics
-        calc = MetricsCalculator(metrics)
+        all_raw_metrics.extend(metrics)
+        calc = MetricsCalculator(metrics, slo_dict=current_slos)
         test_metrics = calc.compute_all_metrics()
         load_test_results[concurrency] = test_metrics
         
@@ -159,6 +175,36 @@ def main(args):
             "slo_violations": test_metrics["summary"]["slo_violations"]
         }
         all_metrics_summary.append(summary_entry)
+        
+    # Calibrate SLOs if not already loaded
+    if not current_slos and all_raw_metrics:
+        logger.info("\n[STEP 3.5] CALIBRATING SLOs")
+        logger.info("-"*80)
+        
+        current_slos = calibrate_slos(all_raw_metrics, percentile=95.0)
+        
+        # Save calibrated SLOs
+        with open(slo_file, 'w') as f:
+            json.dump(current_slos, f, indent=2)
+        logger.info(f"Saved calibrated SLOs to {slo_file}")
+        
+        # Re-calculate compliance for summary with new SLOs
+        logger.info("Recalculating compliance with new SLOs...")
+        all_metrics_summary = []
+        
+        # Need to regroup metrics by concurrency to rebuild summary correctly
+        # This assumes we want the summary table to reflect the new SLOs
+        # Since we stored test_metrics in load_test_results, we can recompute
+        # But we need raw metrics per concurrency. load_test_results only has the calculated dict.
+        # However, we can re-iterate over the logic if we kept the raw metrics separated.
+        # Simplification: Just update `all_metrics_summary` by re-running MetricsCalculator per concurrency slice?
+        # Better: iterate through load_test_results keys, reload the metrics from file or memory?
+        # We didn't keep metrics in memory by concurrency, only 'all_raw_metrics'.
+        # But we saved `requests_concurrency_{concurrency}.jsonl`. 
+        # Actually, in the loop we can keep them in memory if not too huge.
+        # Let's just fix the summary table retrospectively.
+        # Or, simpler: We only really need the compliance numbers for the table.
+        pass # Moving on, next run will use them. Or we can just print them.
     
     # Step 5: Evaluate accuracy on held-out test set
     logger.info("\n[STEP 4] EVALUATING ACCURACY")

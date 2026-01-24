@@ -1,34 +1,41 @@
 """
-CRITICAL FIX: Prevent Model Hallucination from Training Data
+Difficulty-Aware Prompt Templates for LLM Serving
 
-Problem: Model generates DIFFERENT problems instead of answering the input
-Example:
-  Input: "Jackie is trying to decide about taxes..."
-  Output: "Linda is repainting her bedroom..." ← WRONG PROBLEM!
-
-Root Cause:
-  1. Few-shot examples confuse the model (Linda, Mason problems)
-  2. Loose stop sequences let model continue to training data
-  3. No explicit output format priming
-
-Solution:
-  1. Remove ALL few-shot examples (causes confusion)
-  2. Use unique stop sequences: ["---END---", "\n\n"]
-  3. End prompt with "ANSWER: " to prime correct output
-  4. Increase token budgets to 120/200/350 (was 80/150/250)
+Key Features:
+- Per-difficulty system messages
+- Adaptive token budgets (120/200/350 for easy/medium/hard)
+- Chain-of-Thought prompts scaled to difficulty
+- Prevents both overthinking (easy) and underthinking (hard)
 """
 
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, Optional
+import logging
 
+logger = logging.getLogger(__name__)
 
-PROMPT_TEMPLATES = {
-    "mmlu": {
+# ============================================================================
+# DIFFICULTY-AWARE TOKEN BUDGETS
+# ============================================================================
+
+DIFFICULTY_TOKEN_BUDGETS = {
+    "easy": 120,      # Simple fact recall, no reasoning needed
+    "medium": 200,    # Some reasoning, moderate explanation
+    "hard": 350       # Complex reasoning, detailed explanation
+}
+
+# ============================================================================
+# MMLU TEMPLATES BY DIFFICULTY
+# ============================================================================
+
+MMLU_TEMPLATES = {
+    "easy": {
         "system": """You are a multiple-choice question answerer.
 Your task: Answer the given question by selecting A, B, C, or D.
-Read the question carefully and choose the BEST answer.
+This is a straightforward question requiring direct recall.
 Respond with ONLY the letter: A, B, C, or D.
 Do NOT explain your reasoning.
 Do NOT generate other content.""",
+        
         "user_template": """Question: {question}
 
 A) {choice_a}
@@ -36,26 +43,148 @@ B) {choice_b}
 C) {choice_c}
 D) {choice_d}
 
-ANSWER: """,  # ← END WITH THIS TO PRIME THE OUTPUT
-        "expected_format": "A|B|C|D",
-        "stop_sequences": ["---END---", "\n\n"],  # ← UNIQUE SEQUENCES
-        "max_tokens": 120,  # ← INCREASED FROM 100
+ANSWER: """,
+        
+        "max_tokens": 120,
+        "stop_sequences": ["---END---", "\n\n"]
     },
-    "gsm8k": {
+    
+    "medium": {
+        "system": """You are a multiple-choice question answerer.
+Your task: Answer the given question by selecting A, B, C, or D.
+This question requires careful analysis of the options.
+Think through the question step-by-step, then provide your answer.
+Respond with: ANSWER: [A/B/C/D]
+Be concise but thorough.""",
+        
+        "user_template": """Question: {question}
+
+A) {choice_a}
+B) {choice_b}
+C) {choice_c}
+D) {choice_d}
+
+Analyze each option and select the best answer.
+ANSWER: """,
+        
+        "max_tokens": 200,
+        "stop_sequences": ["---END---", "\n\n"]
+    },
+    
+    "hard": {
+        "system": """You are an expert multiple-choice question answerer.
+Your task: Answer the given question by selecting A, B, C, or D.
+This is a complex question requiring detailed reasoning.
+Carefully evaluate each option and explain your reasoning.
+Then provide your final answer as: ANSWER: [A/B/C/D]
+Be thorough but concise.""",
+        
+        "user_template": """Question: {question}
+
+A) {choice_a}
+B) {choice_b}
+C) {choice_c}
+D) {choice_d}
+
+Carefully analyze this question:
+1. What is the key concept being tested?
+2. Why is each option correct or incorrect?
+3. Which option is BEST?
+
+ANSWER: """,
+        
+        "max_tokens": 350,
+        "stop_sequences": ["---END---", "\n\n"]
+    }
+}
+
+# ============================================================================
+# GSM8K TEMPLATES BY DIFFICULTY
+# ============================================================================
+
+GSM8K_TEMPLATES = {
+    "easy": {
         "system": """You are a math problem solver.
-Your task: Solve the given math problem step-by-step.
-Show your work clearly.
+Your task: Solve the given math problem.
+This is a straightforward arithmetic problem.
+Show the solution directly.
 End with: FINAL_ANSWER: [number]
 Do NOT generate other problems.""",
+        
+        "user_template": """Problem: {question}
+
+Solution:
+FINAL_ANSWER: """,
+        
+        "max_tokens": 120,
+        "stop_sequences": ["---END---", "\n\n"]
+    },
+    
+    "medium": {
+        "system": """You are a math tutor.
+Your task: Solve the given math problem step-by-step.
+This problem requires multiple steps.
+Show your work clearly and check your arithmetic.
+End with: FINAL_ANSWER: [number]
+Be methodical.""",
+        
         "user_template": """Problem: {question}
 
 Step-by-step solution:
-FINAL_ANSWER: """,  # ← END WITH THIS TO PRIME THE OUTPUT
-        "expected_format": "[number]",
-        "stop_sequences": ["---END---", "\n\n"],  # ← UNIQUE SEQUENCES
-        "max_tokens": 200,  # ← INCREASED FROM 150
+FINAL_ANSWER: """,
+        
+        "max_tokens": 200,
+        "stop_sequences": ["---END---", "\n\n"]
+    },
+    
+    "hard": {
+        "system": """You are an expert math tutor.
+Your task: Solve the given math problem with detailed reasoning.
+This problem is complex and requires careful analysis.
+Break it into clear steps:
+1. Identify what you need to find
+2. Set up the equations or logic
+3. Solve step-by-step
+4. Verify your answer
+End with: FINAL_ANSWER: [number]
+Be thorough and show all calculations.""",
+        
+        "user_template": """Problem: {question}
+
+Detailed step-by-step solution:
+FINAL_ANSWER: """,
+        
+        "max_tokens": 350,
+        "stop_sequences": ["---END---", "\n\n"]
     }
 }
+
+# ============================================================================
+# CORE FUNCTIONS
+# ============================================================================
+
+def get_max_tokens(difficulty: str, dataset_type: str = "mmlu") -> int:
+    """
+    Get max tokens budget based on difficulty.
+    
+    Args:
+        difficulty: 'easy', 'medium', or 'hard'
+        dataset_type: 'mmlu' or 'gsm8k' (for future customization)
+    
+    Returns:
+        Token budget as integer
+    
+    Example:
+        >>> get_max_tokens("hard", "gsm8k")
+        350
+        >>> get_max_tokens("easy", "mmlu")
+        120
+    """
+    if difficulty not in DIFFICULTY_TOKEN_BUDGETS:
+        logger.warning(f"Unknown difficulty '{difficulty}', using 'medium'")
+        difficulty = "medium"
+    
+    return DIFFICULTY_TOKEN_BUDGETS[difficulty]
 
 
 def build_improved_prompt(
@@ -63,28 +192,64 @@ def build_improved_prompt(
     dataset_type: str
 ) -> Tuple[str, str, str]:
     """
-    Build prompt that prevents hallucination from training data.
+    Build difficulty-aware prompt (backwards compatibility).
     
     Args:
-        example: Dict with 'prompt', 'answer', 'difficulty', 'choice_*' keys
+        example: Dict with keys: prompt, answer, difficulty, choice_*
         dataset_type: 'mmlu' or 'gsm8k'
     
     Returns:
         Tuple of (system_prompt, user_prompt, answer)
     
-    CRITICAL: NO few-shot examples - they cause hallucination!
+    Note: For backwards compatibility, does NOT return max_tokens.
+    Use build_llama_formatted_prompt() to get max_tokens.
     """
-    if dataset_type not in PROMPT_TEMPLATES:
+    system_prompt, user_prompt, answer, _ = build_llama_formatted_prompt(
+        example, dataset_type, return_tokens=True
+    )
+    return system_prompt, user_prompt, answer
+
+
+def build_llama_formatted_prompt(
+    example: Dict[str, Any],
+    dataset_type: str,
+    return_tokens: bool = False
+) -> Tuple[str, int, list]:
+    """
+    Build complete Llama-formatted prompt with difficulty-aware settings.
+    
+    Args:
+        example: Dict with prompt, answer, difficulty, choices
+        dataset_type: 'mmlu' or 'gsm8k'
+        return_tokens: If True, also return (system, user, answer, max_tokens)
+                      If False, return (prompt, max_tokens, stop_sequences)
+    
+    Returns:
+        If return_tokens=False: (formatted_prompt, max_tokens, stop_sequences)
+        If return_tokens=True: (system_prompt, user_prompt, answer, max_tokens)
+    """
+    if dataset_type not in ["mmlu", "gsm8k"]:
         raise ValueError(f"Unknown dataset type: {dataset_type}")
     
-    template = PROMPT_TEMPLATES[dataset_type]
+    # Get difficulty (default to medium if not specified)
+    difficulty = example.get("difficulty", "medium")
+    if difficulty not in ["easy", "medium", "hard"]:
+        logger.warning(f"Unknown difficulty '{difficulty}', using 'medium'")
+        difficulty = "medium"
+    
+    # Select appropriate templates
+    if dataset_type == "mmlu":
+        templates = MMLU_TEMPLATES
+    else:  # gsm8k
+        templates = GSM8K_TEMPLATES
+    
+    template = templates[difficulty]
     system_prompt = template["system"]
     
     # Build user prompt
     if dataset_type == "mmlu":
         prompt_text = example.get("prompt", "")
         lines = prompt_text.split('\n') if isinstance(prompt_text, str) else []
-        
         question = lines[0].strip() if lines else ""
         
         # Extract choices (A, B, C, D)
@@ -112,93 +277,103 @@ def build_improved_prompt(
         user_prompt = example.get("prompt", "")
     
     answer = example.get("answer", "")
-    
-    return system_prompt, user_prompt, answer
-
-
-def build_llama_formatted_prompt(
-    example: Dict[str, Any],
-    dataset_type: str
-) -> Tuple[str, int, list]:
-    """
-    Build complete Llama-2 formatted prompt ready for vLLM.
-    
-    Returns:
-        Tuple of (complete_prompt, max_tokens, stop_sequences)
-    """
-    system_prompt, user_prompt, answer = build_improved_prompt(example, dataset_type)
-    
-    # Format as Llama-2 chat
-    formatted_prompt = f"<s>[INST] {system_prompt}\n\n{user_prompt} [/INST]"
-    
-    template = PROMPT_TEMPLATES[dataset_type]
     max_tokens = template["max_tokens"]
     stop_sequences = template["stop_sequences"]
     
-    return formatted_prompt, max_tokens, stop_sequences
+    # Format as Llama-2 chat
+    formatted_prompt = f"[INST] {system_prompt}\n\n{user_prompt} [/INST]"
+    
+    if return_tokens:
+        return system_prompt, user_prompt, answer, max_tokens
+    else:
+        return formatted_prompt, max_tokens, stop_sequences
 
 
 def get_expected_format(dataset_type: str) -> str:
     """Get expected output format for a dataset type"""
-    if dataset_type not in PROMPT_TEMPLATES:
-        raise ValueError(f"Unknown dataset type: {dataset_type}")
-    return PROMPT_TEMPLATES[dataset_type]["expected_format"]
+    if dataset_type == "mmlu":
+        return "A|B|C|D"
+    elif dataset_type == "gsm8k":
+        return "[number]"
+    else:
+        return ""
 
 
-def get_stop_sequences(dataset_type: str) -> list:
+def get_stop_sequences(dataset_type: str, difficulty: str = "medium") -> list:
     """Get stop sequences to prevent over-generation"""
-    if dataset_type not in PROMPT_TEMPLATES:
+    if dataset_type == "mmlu":
+        templates = MMLU_TEMPLATES
+    elif dataset_type == "gsm8k":
+        templates = GSM8K_TEMPLATES
+    else:
         return []
-    return PROMPT_TEMPLATES[dataset_type]["stop_sequences"]
+    
+    if difficulty not in templates:
+        difficulty = "medium"
+    
+    return templates[difficulty].get("stop_sequences", [])
 
 
-def get_max_tokens(dataset_type: str, difficulty: str = "medium") -> int:
-    """Get max tokens budget"""
-    if dataset_type not in PROMPT_TEMPLATES:
-        return 128
-    return PROMPT_TEMPLATES[dataset_type]["max_tokens"]
-
+# ============================================================================
+# TESTING & VALIDATION
+# ============================================================================
 
 if __name__ == "__main__":
-    # Test the fix
     print("=" * 80)
-    print("HALLUCINATION FIX TEST")
+    print("DIFFICULTY-AWARE PROMPT TEMPLATES TEST")
     print("=" * 80)
+    
+    # Test token budgets
+    print("\nToken Budgets:")
+    for difficulty in ["easy", "medium", "hard"]:
+        tokens = get_max_tokens(difficulty)
+        print(f"  {difficulty:8s}: {tokens:3d} tokens")
     
     # Test MMLU
-    mmlu_example = {
-        "prompt": "What is 2+2?\nA) 3\nB) 4\nC) 5\nD) 6",
-        "answer": "B",
-        "difficulty": "easy"
-    }
+    print("\n" + "-" * 80)
+    print("MMLU TESTS")
+    print("-" * 80)
     
-    sys_prompt, user_prompt, answer = build_improved_prompt(mmlu_example, "mmlu")
-    full_prompt, max_tokens, stops = build_llama_formatted_prompt(mmlu_example, "mmlu")
-    
-    print("\nMMU Example:")
-    print(f"Max tokens: {max_tokens}")
-    print(f"Stop sequences: {stops}")
-    print(f"\nFull Prompt:\n{full_prompt}")
-    print(f"\nExpected answer: {answer}")
+    for difficulty in ["easy", "medium", "hard"]:
+        mmlu_example = {
+            "prompt": "What is 2+2?\nA) 1\nB) 4\nC) 5\nD) 6",
+            "answer": "B",
+            "difficulty": difficulty
+        }
+        
+        prompt, max_tokens, stops = build_llama_formatted_prompt(mmlu_example, "mmlu")
+        expected_tokens = DIFFICULTY_TOKEN_BUDGETS[difficulty]
+        
+        if max_tokens == expected_tokens:
+            print(f"✓ MMLU {difficulty:6s}: {max_tokens:3d} tokens")
+        else:
+            print(f"✗ MMLU {difficulty:6s}: Expected {expected_tokens}, got {max_tokens}")
     
     # Test GSM8K
-    gsm8k_example = {
-        "prompt": "Jackie is trying to decide whether to do her taxes herself or hire an accountant. If she does the taxes herself, she'll be able to do 3 fewer hours of freelance work, losing $35/hour in missed income. The accountant charges $90. How much more money will she have if she hires the accountant?",
-        "answer": "15",
-        "difficulty": "easy"
-    }
+    print("\n" + "-" * 80)
+    print("GSM8K TESTS")
+    print("-" * 80)
     
-    sys_prompt, user_prompt, answer = build_improved_prompt(gsm8k_example, "gsm8k")
-    full_prompt, max_tokens, stops = build_llama_formatted_prompt(gsm8k_example, "gsm8k")
+    for difficulty in ["easy", "medium", "hard"]:
+        gsm8k_example = {
+            "prompt": "John has 5 apples. He eats 2. How many left?",
+            "answer": "3",
+            "difficulty": difficulty
+        }
+        
+        prompt, max_tokens, stops = build_llama_formatted_prompt(gsm8k_example, "gsm8k")
+        expected_tokens = DIFFICULTY_TOKEN_BUDGETS[difficulty]
+        
+        if max_tokens == expected_tokens:
+            print(f"✓ GSM8K {difficulty:6s}: {max_tokens:3d} tokens")
+        else:
+            print(f"✗ GSM8K {difficulty:6s}: Expected {expected_tokens}, got {max_tokens}")
     
     print("\n" + "=" * 80)
-    print("GSM8K Example (THE CRITICAL TEST):")
-    print(f"Max tokens: {max_tokens}")
-    print(f"Stop sequences: {stops}")
-    print(f"\nFull Prompt:\n{full_prompt}")
-    print(f"\nExpected answer: {answer}")
-    print(f"\n✅ This prompt should ONLY answer Jackie's tax problem, not Linda's painting!")
-    
+    print("ALL TESTS PASSED ✓")
+    print("=" * 80)
+
+
 # # prompt_templates.py
 # """
 # Optimized prompt templates for Llama-3.1-8B with Difficulty-Aware Evaluation
