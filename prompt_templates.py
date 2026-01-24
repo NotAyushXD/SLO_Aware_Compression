@@ -33,133 +33,103 @@ DIFFICULTY_TOKEN_BUDGETS = {
 # MMLU TEMPLATES BY DIFFICULTY (SIMPLIFIED - FIX #1)
 # ============================================================================
 
+
+# ============================================================================
+# MMLU TEMPLATES BY DIFFICULTY (COMPLETION FORMAT FOR BASE MODEL)
+# ============================================================================
+
 MMLU_TEMPLATES = {
     "easy": {
-        "system": """You are a multiple-choice question answerer.
-Your task: Answer the given question by selecting A, B, C, or D.
-This is a straightforward question requiring direct recall.
-Respond with ONLY the letter: A, B, C, or D.
-Do NOT explain your reasoning.
-Do NOT generate other content.""",
-        
-        "user_template": """Question: {question}
+        "system": "", # Base models don't use system prompts in completion mode typically, or just prepended text
+        "user_template": """Answer the following multiple choice question. The answer must be one of A, B, C, or D.
+
+Question: {question}
 
 A) {choice_a}
 B) {choice_b}
 C) {choice_c}
 D) {choice_d}
 
-ANSWER: """,
+Answer:""",
         
         "max_tokens": 120,
-        "stop_sequences": []  # FIX: Removed "\n\n" - was causing early termination
+        "stop_sequences": ["\n\n"] 
     },
     
     "medium": {
-        "system": """You are a multiple-choice question answerer.
-Your task: Answer the given question by selecting A, B, C, or D.
-This question requires careful analysis of the options.
-Respond with ONLY the letter A, B, C, or D.
-Do NOT explain your reasoning.""",
-        
-        "user_template": """Question: {question}
+        "system": "",
+        "user_template": """Answer the following multiple choice question. The answer must be one of A, B, C, or D.
+
+Question: {question}
 
 A) {choice_a}
 B) {choice_b}
 C) {choice_c}
 D) {choice_d}
 
-ANSWER: """,
+Answer:""",
         
         "max_tokens": 200,
-        "stop_sequences": []  # FIX: Removed "\n\n"
+        "stop_sequences": ["\n\n"]
     },
     
     "hard": {
-        "system": """You are an expert multiple-choice question answerer.
-Your task: Answer the given question by selecting A, B, C, or D.
-This is a complex question requiring detailed reasoning.
-Carefully evaluate each option and provide your answer.
-Respond with ONLY the letter A, B, C, or D.
-Do NOT generate other content.""",
-        
-        "user_template": """Question: {question}
+        "system": "", 
+        "user_template": """Answer the following multiple choice question. The answer must be one of A, B, C, or D.
+
+Question: {question}
 
 A) {choice_a}
 B) {choice_b}
 C) {choice_c}
 D) {choice_d}
 
-Carefully analyze this question:
-1. What is the key concept being tested?
-2. Why is each option correct or incorrect?
-3. Which option is BEST?
-
-ANSWER: """,
+Answer:""",
         
         "max_tokens": 350,
-        "stop_sequences": []  # FIX: Removed "\n\n"
+        "stop_sequences": ["\n\n"]
     }
 }
 
 # ============================================================================
-# GSM8K TEMPLATES BY DIFFICULTY (SIMPLIFIED - FIX #2)
+# GSM8K TEMPLATES BY DIFFICULTY (COMPLETION FORMAT FOR BASE MODEL)
 # ============================================================================
 
 GSM8K_TEMPLATES = {
     "easy": {
-        "system": """You are a math problem solver.
-Your task: Solve the given math problem.
-This is a straightforward arithmetic problem.
-Show the solution directly.
-End with: FINAL_ANSWER: [number]
-Do NOT generate other problems.""",
-        
-        "user_template": """Problem: {question}
+        "system": "",
+        "user_template": """Given the following math problem, solve it and provide the final answer.
 
-Solution:
-FINAL_ANSWER: """,
+Problem: {question}
+
+Solution:""",
         
         "max_tokens": 120,
-        "stop_sequences": []  # FIX: Removed "\n\n"
+        "stop_sequences": ["Problem:", "Question:"]
     },
     
     "medium": {
-        "system": """You are a math tutor.
-Your task: Solve the given math problem step-by-step.
-This problem requires multiple steps.
-Show your work clearly and check your arithmetic.
-End with: FINAL_ANSWER: [number]
-Be methodical.""",
-        
-        "user_template": """Problem: {question}
+        "system": "",
+        "user_template": """Given the following math problem, solve it step-by-step and provide the final answer.
 
-Step-by-step solution:
-FINAL_ANSWER: """,
+Problem: {question}
+
+Solution:""",
         
         "max_tokens": 200,
-        "stop_sequences": []  # FIX: Removed "\n\n"
+        "stop_sequences": ["Problem:", "Question:"]
     },
     
     "hard": {
-        "system": """You are an expert math tutor.
-Your task: Solve the given math problem with detailed reasoning.
-This problem is complex and requires careful analysis.
-Break it into clear steps:
-1. Identify what you need to find
-2. Set up the equations or logic
-3. Solve step-by-step
-4. Verify your answer
-End with: FINAL_ANSWER: [number]
-Be thorough and show all calculations.""",
-        
-        "user_template": """Problem: {question}
+        "system": "",
+        "user_template": """Given the following math problem, solve it step-by-step and provide the final answer.
 
-Detailed step-by-step solution:
-FINAL_ANSWER: """,
+Problem: {question}
+
+Solution:""",
         
         "max_tokens": 350,
-        "stop_sequences": []  # FIX: Removed "\n\n"
+        "stop_sequences": ["Problem:", "Question:"]
     }
 }
 
@@ -284,8 +254,9 @@ def build_llama_formatted_prompt(
     max_tokens = template["max_tokens"]
     stop_sequences = template["stop_sequences"]
     
-    # Format as Llama-2 chat
-    formatted_prompt = f"[INST] {system_prompt}\n\n{user_prompt} [/INST]"
+    # Format as simple text completion for Base model
+    # Avoid [INST] tags which confuse base models
+    formatted_prompt = f"{system_prompt}\n\n{user_prompt}" if system_prompt else user_prompt
     
     if return_tokens:
         return system_prompt, user_prompt, answer, max_tokens

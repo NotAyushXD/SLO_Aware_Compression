@@ -276,11 +276,10 @@ class HeldOutEvaluator:
                 
                 # Generate
                 generated_text, metrics = self.model.generate(
-                                            prompt=formatted_prompt,
-                                            max_tokens=max_tokens,                           # ← CHANGE: 512 → max_tokens
-                                            difficulty=example.get("difficulty", "medium")   # ← ADD THIS LINE
+                                            prompt=formatted_prompt, 
+                                            max_tokens=max_tokens,
+                                            difficulty=example.get("difficulty", "medium")
                                         )
-
                 print(formatted_prompt)
                 print(generated_text)
                 print("_______________________")
