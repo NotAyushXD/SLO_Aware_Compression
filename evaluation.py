@@ -82,82 +82,82 @@ class EvaluationMetrics:
         # No valid answer found
         return ""
     
-@staticmethod
-def extract_gsm8k_answer(response: str) -> str:
-    """Extract GSM8K answer from response.
-    
-    Handles multiple formats:
-    1. FINAL_ANSWER: 3
-    2. FINAL_ANSWER:\n 3
-    3. FINAL_ANSWER: 3 gallons
-    4. FINAL_ANSWER: $45
-    5. answer is 3
-    6. answer: 3
-    """
-    response_lower = response.lower()
-    
-    # Strategy 1: Look for FINAL_ANSWER: [number] (same line)
-    # Matches: "FINAL_ANSWER: 3" or "FINAL_ANSWER: 3.5"
-    match = re.search(r'final_?answer\s*[\:=]?\s*([-]?\d+\.?\d*)', response_lower, re.IGNORECASE)
-    if match:
-        answer = match.group(1).strip()
-        if answer and answer != '.':
-            return answer
-    
-    # Strategy 2: Look for FINAL_ANSWER: followed by number (possibly multi-line)
-    # Matches: "FINAL_ANSWER:\n 3" or "FINAL_ANSWER: \n 3 gallons"
-    # Uses character class to match number with optional units
-    match = re.search(
-        r'final_?answer\s*[\:=]?\s*\n?\s*([-]?\$?\d+\.?\d*)',
-        response,
-        re.IGNORECASE | re.DOTALL
-    )
-    if match:
-        answer = match.group(1).strip().replace('$', '')
-        if answer and answer != '.':
-            return answer
-    
-    # Strategy 3: Look for "answer is [number]" or "answer: [number]"
-    # Matches: "The answer is 3" or "Answer: 42"
-    match = re.search(
-        r'(?:the\s+)?answer\s+(?:is|:)\s*([-]?\d+\.?\d*)',
-        response_lower,
-        re.IGNORECASE
-    )
-    if match:
-        answer = match.group(1).strip()
-        if answer and answer != '.':
-            return answer
-    
-    # Strategy 4: For short responses, extract numbers and clean them
-    # This handles cases where the model just outputs the number with units
-    if len(response) < 500:
-        # Find all numbers (with optional currency symbol)
-        # Pattern: optional minus, optional $, digits, optional decimal, more digits
-        numbers = re.findall(r'([-]?\$?\d+\.?\d*)', response)
+    @staticmethod
+    def extract_gsm8k_answer(response: str) -> str:
+        """Extract GSM8K answer from response.
         
-        if numbers:
-            # Get the LAST number (typically the answer)
-            last_num = numbers[-1]
+        Handles multiple formats:
+        1. FINAL_ANSWER: 3
+        2. FINAL_ANSWER:\n 3
+        3. FINAL_ANSWER: 3 gallons
+        4. FINAL_ANSWER: $45
+        5. answer is 3
+        6. answer: 3
+        """
+        response_lower = response.lower()
+        
+        # Strategy 1: Look for FINAL_ANSWER: [number] (same line)
+        # Matches: "FINAL_ANSWER: 3" or "FINAL_ANSWER: 3.5"
+        match = re.search(r'final_?answer\s*[\:=]?\s*([-]?\d+\.?\d*)', response_lower, re.IGNORECASE)
+        if match:
+            answer = match.group(1).strip()
+            if answer and answer != '.':
+                return answer
+        
+        # Strategy 2: Look for FINAL_ANSWER: followed by number (possibly multi-line)
+        # Matches: "FINAL_ANSWER:\n 3" or "FINAL_ANSWER: \n 3 gallons"
+        # Uses character class to match number with optional units
+        match = re.search(
+            r'final_?answer\s*[\:=]?\s*\n?\s*([-]?\$?\d+\.?\d*)',
+            response,
+            re.IGNORECASE | re.DOTALL
+        )
+        if match:
+            answer = match.group(1).strip().replace('$', '')
+            if answer and answer != '.':
+                return answer
+        
+        # Strategy 3: Look for "answer is [number]" or "answer: [number]"
+        # Matches: "The answer is 3" or "Answer: 42"
+        match = re.search(
+            r'(?:the\s+)?answer\s+(?:is|:)\s*([-]?\d+\.?\d*)',
+            response_lower,
+            re.IGNORECASE
+        )
+        if match:
+            answer = match.group(1).strip()
+            if answer and answer != '.':
+                return answer
+        
+        # Strategy 4: For short responses, extract numbers and clean them
+        # This handles cases where the model just outputs the number with units
+        if len(response) < 500:
+            # Find all numbers (with optional currency symbol)
+            # Pattern: optional minus, optional $, digits, optional decimal, more digits
+            numbers = re.findall(r'([-]?\$?\d+\.?\d*)', response)
             
-            # Clean: remove currency symbol
-            clean_num = last_num.replace('$', '').strip()
-            
-            # Validation: prefer numbers that appear after "answer" keyword
-            if 'answer' in response_lower:
-                last_answer_pos = response_lower.rfind('answer')
-                answer_section = response[last_answer_pos:]
+            if numbers:
+                # Get the LAST number (typically the answer)
+                last_num = numbers[-1]
                 
-                # Check if this number appears in the answer section
-                if clean_num in answer_section:
+                # Clean: remove currency symbol
+                clean_num = last_num.replace('$', '').strip()
+                
+                # Validation: prefer numbers that appear after "answer" keyword
+                if 'answer' in response_lower:
+                    last_answer_pos = response_lower.rfind('answer')
+                    answer_section = response[last_answer_pos:]
+                    
+                    # Check if this number appears in the answer section
+                    if clean_num in answer_section:
+                        return clean_num
+                
+                # For very short responses, the last number is likely the answer
+                elif len(response.strip()) < 150:
                     return clean_num
-            
-            # For very short responses, the last number is likely the answer
-            elif len(response.strip()) < 150:
-                return clean_num
-    
-    # No answer found
-    return ""
+        
+        # No answer found
+        return ""
 
     
     @staticmethod
