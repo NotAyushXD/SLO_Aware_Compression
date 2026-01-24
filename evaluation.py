@@ -84,29 +84,48 @@ class EvaluationMetrics:
     
     @staticmethod
     def extract_gsm8k_answer(response: str) -> str:
-        """
-        Extract GSM8K answer from response.
-        
-        Expected format: "FINAL_ANSWER: 15" or just "15"
+        """Extract GSM8K answer from response.
+        Expected format: FINAL_ANSWER: 15 or Answer: 15 or just 15
         
         Detection strategy (in order):
-        1. Look for "FINAL_ANSWER:" prefix
-        2. Look for last number in response
-        3. Return empty if no number found
+        1. Look for FINAL_ANSWER prefix (most explicit)
+        2. Look for "answer is [number]" or "answer: [number]"
+        3. For short responses, use last number
+        4. Return empty if no number found
         """
         response_lower = response.lower()
         
-        # Strategy 1: "FINAL_ANSWER: 15" or "FINALANSWER: 15"
-        match = re.search(r'final\s*_?\s*answer\s*[:=\s]*(-?\d+\.?\d*)', response_lower, re.IGNORECASE)
+        # Strategy 1: FINAL_ANSWER: 15 (most explicit format) - HIGHEST PRIORITY
+        match = re.search(r'final_?answer\s*[\:=]?\s*([-]?\d+\.?\d*)', response_lower, re.IGNORECASE)
         if match:
-            return match.group(1)
+            answer = match.group(1)
+            if answer and answer.strip():
+                return answer.strip()
         
-        # Strategy 2: Look for numbers in response
-        numbers = re.findall(r'-?\d+\.?\d*', response)
-        if numbers:
-            return numbers[-1]  # Return LAST number (most likely answer)
+        # Strategy 2: "answer is 15" or "answer: 15" (explicit format)
+        match = re.search(r'(?:the\s+)?answer\s+(?:is|:)\s*([-]?\d+\.?\d*)', response_lower, re.IGNORECASE)
+        if match:
+            answer = match.group(1)
+            if answer and answer.strip():
+                return answer.strip()
         
-        # No valid number found
+        # Strategy 3: For short responses, use last number (low hallucination risk)
+        # But avoid this for long responses where explanation numbers might mislead
+        if len(response) < 500:
+            numbers = re.findall(r'[-]?\d+\.?\d*', response)
+            if numbers:
+                last_num = numbers[-1]
+                # Extra safety: check if this number appears near "answer" in text
+                if 'answer' in response_lower:
+                    # Find position of last "answer" mention
+                    last_answer_pos = response_lower.rfind('answer')
+                    # Check if number appears after "answer" (likely the answer)
+                    if response.find(last_num) > last_answer_pos:
+                        return last_num
+                # If no "answer" mention but response is short, likely just the number
+                elif len(response.strip()) < 200:
+                    return last_num
+        
         return ""
     
     @staticmethod

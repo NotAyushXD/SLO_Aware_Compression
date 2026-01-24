@@ -98,38 +98,21 @@ Answer:""",
 GSM8K_TEMPLATES = {
     "easy": {
         "system": "",
-        "user_template": """Given the following math problem, solve it and provide the final answer.
-
-Problem: {question}
-
-Solution:""",
-        
+        "user_template": "Given the following math problem, solve it and provide the final answer.\n\nProblem: {question}\n\nSolution:\nFINAL_ANSWER:",
         "max_tokens": 120,
-        "stop_sequences": ["Problem:", "Question:"]
+        "stop_sequences": []
     },
-    
     "medium": {
         "system": "",
-        "user_template": """Given the following math problem, solve it step-by-step and provide the final answer.
-
-Problem: {question}
-
-Solution:""",
-        
+        "user_template": "Given the following math problem, solve it step-by-step and provide the final answer.\n\nProblem: {question}\n\nSolution:\nFINAL_ANSWER:",
         "max_tokens": 200,
-        "stop_sequences": ["Problem:", "Question:"]
+        "stop_sequences": []
     },
-    
     "hard": {
         "system": "",
-        "user_template": """Given the following math problem, solve it step-by-step and provide the final answer.
-
-Problem: {question}
-
-Solution:""",
-        
+        "user_template": "Given the following math problem, solve it step-by-step and provide the final answer.\n\nProblem: {question}\n\nSolution:\nFINAL_ANSWER:",
         "max_tokens": 350,
-        "stop_sequences": ["Problem:", "Question:"]
+        "stop_sequences": []
     }
 }
 
