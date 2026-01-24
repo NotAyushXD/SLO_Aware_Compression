@@ -17,55 +17,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def calibrate_slos(metrics: List, percentile: float = 95.0) -> Dict:
-    """
-    Calibrate SLOs based on percentile of observed metrics, grouped by difficulty.
-    
-    Args:
-        metrics: List of RequestMetrics objects
-        percentile: Percentile to use for calibration (default 95.0)
-        
-    Returns:
-        Dictionary of SLO thresholds by difficulty
-    """
-    if not metrics:
-        return MetricsCalculator.DEFAULT_SLOS.copy()
-        
-    # Group by difficulty
-    by_difficulty = {}
-    for m in metrics:
-        if not m.success:
-            continue
-        
-        diff = m.difficulty
-        if diff not in by_difficulty:
-            by_difficulty[diff] = {"ttft": [], "tpot": []}
-        
-        by_difficulty[diff]["ttft"].append(m.ttft_ms)
-        by_difficulty[diff]["tpot"].append(m.tpot_ms)
-    
-    calibrated = {}
-    
-    # Calculate percentiles for each difficulty
-    for diff, values in by_difficulty.items():
-        ttft_p = np.percentile(values["ttft"], percentile) if values["ttft"] else 0
-        tpot_p = np.percentile(values["tpot"], percentile) if values["tpot"] else 0
-        
-        # Round up to nearest unit for cleaner numbers (optional, but good for SLOs)
-        calibrated[diff] = {
-            "ttft_ms": float(np.ceil(ttft_p)),
-            "tpot_ms": float(np.ceil(tpot_p))
-        }
-    
-    # Fill in missing difficulties with defaults or estimates
-    for diff in MetricsCalculator.DEFAULT_SLOS:
-        if diff not in calibrated:
-            calibrated[diff] = MetricsCalculator.DEFAULT_SLOS[diff].copy()
-            
-    logger.info(f"Calibrated SLOs at p{percentile}: {calibrated}")
-    return calibrated
-
-
 @dataclass
 class PercentileMetrics:
     """Container for percentile-based metrics"""
@@ -88,9 +39,9 @@ class MetricsCalculator:
     #     "hard": {"ttft_ms": 500, "tpot_ms": 40}
     # }
     DEFAULT_SLOS = {
-        "easy": {"ttft_ms": 150, "tpot_ms": 20},
-        "medium": {"ttft_ms": 250, "tpot_ms": 30},
-        "hard": {"ttft_ms": 400, "tpot_ms": 50}
+        "easy": {"ttft_ms": 150, "tpot_ms": 1000},
+        "medium": {"ttft_ms": 250, "tpot_ms": 1000},
+        "hard": {"ttft_ms": 400, "tpot_ms": 1500}
     }
     
     def __init__(self, request_metrics: List, slo_dict: Optional[Dict] = None):

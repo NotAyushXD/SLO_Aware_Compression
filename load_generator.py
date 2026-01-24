@@ -126,7 +126,8 @@ class ClosedLoopLoadGenerator:
             # Call inference function
             generated_text, inference_metrics = self.inference_func(
                 prompt=example["prompt"],
-                max_tokens=512
+                max_tokens=None,
+                difficulty=example.get("difficulty", "medium")
             )
             
             # Store inference metrics
