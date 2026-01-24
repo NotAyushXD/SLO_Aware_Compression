@@ -85,17 +85,17 @@ The correct answer is:""",
 GSM8K_TEMPLATES = {
     "easy": {
         "system": "",
-        "user_template": """Given the following math problem, solve it carefully.
+        "user_template": """Given the following math problem, solve it carefully step-by-step.
 
 Problem: {question}
 
 Solution:
 Step 1: Identify what we need to find.
-Step 2: Set up the calculation.
-Step 3: Show your work.
+Step 2: List the given information.
+Step 3: Calculate the answer.
 
-FINAL_ANSWER:""",
-        "max_tokens": 150,
+FINAL_ANSWER: [provide the number only]""",
+        "max_tokens": 250,  # INCREASED from 150
         "stop_sequences": []
     },
     "medium": {
@@ -106,18 +106,17 @@ Problem: {question}
 
 Solution:
 Step 1: Identify what we need to find.
-Step 2: Break down the problem.
-Step 3: Set up calculations.
-Step 4: Show your work.
-Step 5: Verify the answer makes sense.
+Step 2: List the given information.
+Step 3: Set up the calculation.
+Step 4: Solve it.
 
-FINAL_ANSWER:""",
-        "max_tokens": 200,
+FINAL_ANSWER: [provide the number only]""",
+        "max_tokens": 350,  # INCREASED from 200
         "stop_sequences": []
     },
     "hard": {
         "system": "",
-        "user_template": """Given the following complex math problem, solve it very carefully.
+        "user_template": """Given the following complex math problem, solve it very carefully step-by-step.
 
 Problem: {question}
 
@@ -125,14 +124,15 @@ Solution:
 Step 1: What are we solving for?
 Step 2: What information do we have?
 Step 3: What formula or method should we use?
-Step 4: Show all calculations.
-Step 5: Check: Does the answer make sense?
+Step 4: Calculate step-by-step.
+Step 5: Double-check your answer.
 
-FINAL_ANSWER:""",
-        "max_tokens": 250,
+FINAL_ANSWER: [provide the number only]""",
+        "max_tokens": 500,  # INCREASED from 250
         "stop_sequences": []
     }
 }
+
 
 # ============================================================================
 # CORE FUNCTIONS
