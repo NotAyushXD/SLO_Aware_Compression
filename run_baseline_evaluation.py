@@ -127,6 +127,7 @@ def maybe_calibrate_slos(
         max_concurrency=calibration_concurrency,
         num_requests=n,
         data_loader=calib_data,
+        prompt_mode=args.prompt_mode,
     )
     raw_metrics = load_gen.run()
 
@@ -258,6 +259,7 @@ def main(args):
             batch_size=32,
             verbose=args.verbose_eval,
             max_verbose=args.max_verbose_eval,
+            prompt_mode=args.prompt_mode,
         )
         eval_results, detailed_predictions = evaluator.evaluate()
 
@@ -387,6 +389,7 @@ if __name__ == "__main__":
 
     # SLO calibration configuration
     parser.add_argument("--disable_slo_calibration", action="store_true", help="Disable SLO calibration")
+    parser.add_argument("--prompt_mode", choices=["accuracy","slo"], default="accuracy", help="Prompt mode: accuracy=better correctness (brief reasoning for GSM8K), slo=short answer-only outputs")
     parser.add_argument("--calibration_requests", type=int, default=200, help="#requests for calibration run")
     parser.add_argument("--calibration_concurrency", type=int, default=1, help="concurrency for calibration run")
     parser.add_argument("--slo_percentile", type=float, default=95.0, help="percentile for calibration (e.g., 95)")

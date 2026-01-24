@@ -88,6 +88,7 @@ class ClosedLoopLoadGenerator:
         num_requests: int,
         data_loader: List[Dict[str, Any]],
         seed: int = 0,
+        prompt_mode: str = "accuracy",
     ):
         """
         Args:
@@ -138,7 +139,7 @@ class ClosedLoopLoadGenerator:
             difficulty = example.get("difficulty", "medium")
 
             # IMPORTANT: ensure load testing uses the same formatted prompts as evaluation
-            formatted_prompt, max_tokens, _stops = build_llama_formatted_prompt(example, dataset_type)
+            formatted_prompt, max_tokens, _stops = build_llama_formatted_prompt(example, dataset_type, prompt_mode=self.prompt_mode)
 
             try:
                 generated_text, inference_metrics = self.inference_func(

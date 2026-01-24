@@ -1,14 +1,15 @@
 """
 Evaluation utilities for baseline accuracy (MMLU + GSM8K).
 
-Key fixes vs previous version:
-1) Robust extraction that matches our *serving* prompt formats:
-   - MMLU: accept 'B', 'B)', 'B.' even if extra text follows (models sometimes violate format).
-   - GSM8K: prefer explicit FINAL_ANSWER marker, but fall back to common patterns (####) and
-     finally to a single-number / last-number heuristic (to avoid 0% due to formatting only).
-2) No unconditional printing of prompts/outputs (printing slows evaluation dramatically).
-   Use verbose=True to print a few examples for debugging.
+This version focuses on *stable, correct scoring* (especially GSM8K) by fixing:
+- Robust numeric extraction (handles commas like "40,000" and decimals).
+- Ground-truth normalization (commas, whitespace).
+- Prompt-mode support (accuracy vs SLO) via prompt_templates.build_llama_formatted_prompt(..., prompt_mode=...).
+
+We intentionally keep evaluation simple (exact match / numeric match) and fast.
 """
+
+from __future__ import annotations
 
 import re
 import json
@@ -23,161 +24,170 @@ logger = logging.getLogger(__name__)
 
 from prompt_templates import build_llama_formatted_prompt
 
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+_NUM_WITH_COMMAS = r"[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?"
+_NUM_SIMPLE = r"[-+]?\d+(?:\.\d+)?"
+NUM_REGEX = rf"(?:{_NUM_WITH_COMMAS}|{_NUM_SIMPLE})"
+
+def _clean_number_str(s: str) -> str:
+    s = (s or "").strip()
+    # Strip trailing punctuation
+    s = re.sub(r"[\s\]\)\}\.]+$", "", s)
+    # Remove commas inside numbers (45,000 -> 45000)
+    s = s.replace(",", "")
+    return s.strip()
+
+def _to_float(s: str) -> Optional[float]:
+    s = _clean_number_str(s)
+    if not s:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+# -----------------------------------------------------------------------------
+# EvaluationMetrics
+# -----------------------------------------------------------------------------
 
 class EvaluationMetrics:
     @staticmethod
     def extract_answer(response: str, dataset_type: str) -> str:
         response = (response or "").strip()
-        if dataset_type == "mmlu":
+        dt = (dataset_type or "").lower().strip()
+        if dt == "mmlu":
             return EvaluationMetrics.extract_mmlu_answer(response)
-        if dataset_type == "gsm8k":
+        if dt == "gsm8k":
             return EvaluationMetrics.extract_gsm8k_answer(response)
         return ""
 
     @staticmethod
     def extract_mmlu_answer(response: str) -> str:
-        """Extract A/B/C/D from model output (lenient to common format violations)."""
+        # Accept "B", "B)", "B.", "Answer: B", etc.
         if not response:
             return ""
-        text = response.strip().upper()
-
-        # 1) Explicit answer markers
-        m = re.search(r'(?:FINAL\s+ANSWER|ANSWER|CORRECT\s+ANSWER)\s*[:=\s]*([A-D])\b', text)
-        if m:
-            return m.group(1)
-
-        # 2) If the first non-empty line starts with 'B)' or 'C.' etc
-        first_line = ""
-        for line in text.splitlines():
-            if line.strip():
-                first_line = line.strip()
-                break
-
-        if first_line:
-            m = re.match(r'^\s*([A-D])\s*[\)\.:\-]?\s*$', first_line)
-            if m:
-                return m.group(1)
-            m = re.match(r'^\s*([A-D])\s*[\)\.:\-]\s+.*$', first_line)
-            if m:
-                return m.group(1)
-
-        # 3) Entire output is just a single letter with punctuation
-        m = re.fullmatch(r'\s*([A-D])[\)\.]?\s*', text)
-        if m:
-            return m.group(1)
-
-        return ""
+        m = re.search(r"\b([ABCD])\b", response.strip(), flags=re.IGNORECASE)
+        if not m:
+            m = re.search(r"^\s*([ABCD])[\)\.:\s]*", response.strip(), flags=re.IGNORECASE)
+        return (m.group(1).upper() if m else "")
 
     @staticmethod
     def extract_gsm8k_answer(response: str) -> str:
-        """Extract numeric answer for GSM8K.
+        """
+        GSM8K numeric extraction (robust).
 
         Priority:
-        1) FINAL_ANSWER / FINAL ANSWER markers (our intended format)
-        2) GSM8K '####' marker
-        3) If output is just a number
-        4) Otherwise, take the last number in the output (lenient fallback)
+        1) FINAL_ANSWER marker (our intended format) — take the *last* match.
+        2) GSM8K '####' marker (common in many GSM8K solutions)
+        3) If the first non-empty line is just a number, use it (base models often do this).
+        4) Otherwise, fall back to the last number in the output.
 
-        This prevents artificial 0% accuracy due to formatting drift.
+        Supports commas: "40,000" -> "40000"
         """
         if not response:
             return ""
 
-        # 1) Explicit FINAL_ANSWER marker (underscore or space)
-        # 1) Explicit FINAL_ANSWER marker (underscore or space) — take the *last* match
-        matches = re.findall(r'FINAL[_\s]*ANSWER\s*[:=\s]*([-+]?\d+(?:\.\d+)?)', response, flags=re.IGNORECASE)
-        if matches:
-            return matches[-1]
+        # 1) Explicit FINAL_ANSWER marker
+        fa_matches = re.findall(
+            rf"FINAL[_\s]*ANSWER\s*[:=\s]*({NUM_REGEX})",
+            response,
+            flags=re.IGNORECASE,
+        )
+        if fa_matches:
+            return _clean_number_str(fa_matches[-1])
 
         # 2) GSM8K delimiter
-        m = re.search(r'####\s*([-+]?\d+(?:\.\d+)?)', response)
+        m = re.search(rf"####\s*({NUM_REGEX})", response)
         if m:
-            return m.group(1)
+            return _clean_number_str(m.group(1))
 
-        # 3) Output is a single number
-        stripped = response.strip()
-        m = re.fullmatch(r'[-+]?\d+(?:\.\d+)?', stripped)
-        if m:
-            return m.group(0)
+        # 3) First-line number (common for base LMs that ignore tags)
+        lines = [ln.strip() for ln in response.splitlines() if ln.strip()]
+        if lines:
+            if re.fullmatch(NUM_REGEX, lines[0]):
+                return _clean_number_str(lines[0])
 
-        # 4) Last number fallback
-        nums = re.findall(r'[-+]?\d+(?:\.\d+)?', response)
+        # 4) Last number fallback (handles commas)
+        nums = re.findall(NUM_REGEX, response)
         if nums:
-            return nums[-1]
+            return _clean_number_str(nums[-1])
 
         return ""
 
     @staticmethod
-    def detect_hallucination(response: str, dataset_type: str) -> bool:
-        # Lightweight heuristic (optional)
-        if not response:
-            return False
-        response_lower = response.lower()
-        hallucination_keywords = {
-            "mmlu": ["linda", "mason", "attic", "bedroom"],
-            "gsm8k": ["linda", "attic", "teosinte"],
-        }
-        for kw in hallucination_keywords.get(dataset_type, []):
-            if kw in response_lower:
-                return True
-        return False
-
-    @staticmethod
     def exact_match_mmlu(prediction: str, ground_truth: str) -> bool:
-        extracted = EvaluationMetrics.extract_mmlu_answer(prediction)
-        return extracted != "" and extracted == (ground_truth or "").strip().upper()
+        pred = EvaluationMetrics.extract_mmlu_answer(prediction)
+        truth = (ground_truth or "").strip().upper()
+        return bool(pred) and pred == truth
 
     @staticmethod
     def exact_match_gsm8k(prediction: str, ground_truth: str) -> bool:
-        extracted = EvaluationMetrics.extract_gsm8k_answer(prediction)
-        if not extracted:
+        pred_str = EvaluationMetrics.extract_gsm8k_answer(prediction)
+        if not pred_str:
             return False
-        try:
-            pred = float(extracted)
-            truth = float(ground_truth)
-            return abs(pred - truth) < 1e-6
-        except Exception:
+
+        pred = _to_float(pred_str)
+        truth = _to_float(ground_truth)
+        if pred is None or truth is None:
             return False
+        return abs(pred - truth) < 1e-6
 
     @staticmethod
     def evaluate_batch(predictions: List[str], ground_truths: List[str], dataset_type: str) -> Dict:
-        assert len(predictions) == len(ground_truths)
+        dt = (dataset_type or "").lower().strip()
+        total = len(predictions)
         correct = 0
-        halluc = 0
+        hallucinations = 0
 
         for pred, truth in zip(predictions, ground_truths):
-            if EvaluationMetrics.detect_hallucination(pred, dataset_type):
-                halluc += 1
-
-            if dataset_type == "mmlu":
+            if dt == "mmlu":
                 ok = EvaluationMetrics.exact_match_mmlu(pred, truth)
-            elif dataset_type == "gsm8k":
+            elif dt == "gsm8k":
                 ok = EvaluationMetrics.exact_match_gsm8k(pred, truth)
             else:
                 ok = False
 
-            if ok:
-                correct += 1
+            correct += int(ok)
 
-        total = len(predictions)
-        acc = correct / max(total, 1)
+            # Optional hallucination heuristic (kept very light)
+            if not ok and dt == "gsm8k":
+                if any(k in (pred or "").lower() for k in ["attic", "bedroom", "linda", "mason"]):
+                    hallucinations += 1
+
+        acc = correct / total if total else 0.0
+        hall_rate = hallucinations / total if total else 0.0
         return {
             "accuracy": acc,
             "em": acc,
             "correct_count": correct,
             "total_count": total,
-            "hallucination_count": halluc,
-            "hallucination_rate": halluc / max(total, 1),
+            "hallucination_count": hallucinations,
+            "hallucination_rate": hall_rate,
         }
 
+# -----------------------------------------------------------------------------
+# Evaluator
+# -----------------------------------------------------------------------------
 
 class HeldOutEvaluator:
-    def __init__(self, model, data_loader: List[Dict], batch_size: int = 32, verbose: bool = False, max_verbose: int = 5):
+    def __init__(
+        self,
+        model,
+        data_loader: List[Dict],
+        batch_size: int = 32,
+        verbose: bool = False,
+        max_verbose: int = 5,
+        prompt_mode: str = "accuracy",
+    ):
         self.model = model
         self.data_loader = data_loader
         self.batch_size = batch_size
         self.verbose = verbose
         self.max_verbose = max_verbose
+        self.prompt_mode = prompt_mode
 
     def evaluate(self) -> Tuple[Dict, List[Dict]]:
         logger.info("=" * 70)
@@ -192,101 +202,117 @@ class HeldOutEvaluator:
         detailed_results: List[Dict] = []
 
         for i, example in enumerate(self.data_loader):
-            dataset_type = example.get("dataset", "mmlu")
+            dataset_type = (example.get("dataset") or "mmlu").lower()
             difficulty = example.get("difficulty", "medium")
 
+            formatted_prompt, max_tokens, _ = build_llama_formatted_prompt(
+                example,
+                dataset_type,
+                prompt_mode=self.prompt_mode,
+            )
+
             try:
-                formatted_prompt, max_tokens, _ = build_llama_formatted_prompt(example, dataset_type)
+                generated_text, _metrics = self.model.generate(
+                    prompt=formatted_prompt,
+                    max_tokens=max_tokens,
+                    difficulty=difficulty,
+                    dataset_type=dataset_type,
+                )
+            except TypeError:
+                # Backwards compatibility: older server.generate() without dataset_type
+                generated_text, _metrics = self.model.generate(
+                    prompt=formatted_prompt,
+                    max_tokens=max_tokens,
+                    difficulty=difficulty,
+                )
 
-                try:
-                    generated_text, _metrics = self.model.generate(
-                        prompt=formatted_prompt,
-                        max_tokens=max_tokens,
-                        difficulty=difficulty,
-                        dataset_type=dataset_type,
-                    )
-                except TypeError:
-                    # Backwards compatibility: older server.generate() without dataset_type
-                    generated_text, _metrics = self.model.generate(
-                        prompt=formatted_prompt,
-                        max_tokens=max_tokens,
-                        difficulty=difficulty,
-                    )
+            predtext = (generated_text or "").strip()
+            ttext = str(example.get("answer", "")).strip()
+            dt = dataset_type
+            ptext = formatted_prompt
 
-                if self.verbose and i < self.max_verbose:
-                    print("\n--- PROMPT ---\n", formatted_prompt)
-                    print("\n--- OUTPUT ---\n", generated_text)
-                    print("\n--- GT ---\n", example.get("answer", ""))
+            extracted = EvaluationMetrics.extract_answer(predtext, dt)
+            if dt == "mmlu":
+                is_correct = EvaluationMetrics.exact_match_mmlu(predtext, ttext)
+            elif dt == "gsm8k":
+                is_correct = EvaluationMetrics.exact_match_gsm8k(predtext, ttext)
+            else:
+                is_correct = False
 
-                all_predictions.append(generated_text)
-                all_ground_truths.append(example.get("answer", ""))
-                all_dataset_types.append(dataset_type)
-                all_prompts.append(formatted_prompt)
-                all_hall.append(EvaluationMetrics.detect_hallucination(generated_text, dataset_type))
+            # Simple hallucination flag (not used for scoring)
+            halluc = False
+            if not is_correct and dt == "gsm8k":
+                halluc = any(k in predtext.lower() for k in ["attic", "bedroom", "linda", "mason"])
 
-            except Exception as e:
-                logger.error(f"Failed to generate for example {i}: {e}")
-                all_predictions.append("")
-                all_ground_truths.append(example.get("answer", ""))
-                all_dataset_types.append(dataset_type)
-                all_prompts.append("")
-                all_hall.append(False)
+            if self.verbose and i < self.max_verbose:
+                print("\n--- PROMPT ---\n", ptext)
+                print("\n--- OUTPUT ---\n", predtext)
+                print("\n--- EXTRACTED ---\n", extracted)
+                print("\n--- GT ---\n", ttext)
 
-            if (i + 1) % self.batch_size == 0:
-                logger.info(f"Generated {i + 1}/{len(self.data_loader)} predictions")
+            detailed_results.append({
+                "dataset": dt,
+                "prompt": ptext,
+                "ground_truth": ttext,
+                "prediction": predtext,
+                "extracted_answer": extracted,
+                "is_correct": bool(is_correct),
+                "is_hallucination": bool(halluc),
+                "binary_score": int(bool(is_correct)),
+            })
 
-        results: Dict[str, Dict] = {}
-        for dt in sorted(set(all_dataset_types)):
-            idx = [j for j, x in enumerate(all_dataset_types) if x == dt]
-            preds = [all_predictions[j] for j in idx]
-            truths = [all_ground_truths[j] for j in idx]
-            prompts = [all_prompts[j] for j in idx]
-            halls = [all_hall[j] for j in idx]
+            all_predictions.append(predtext)
+            all_ground_truths.append(ttext)
+            all_dataset_types.append(dt)
+            all_prompts.append(ptext)
+            all_hall.append(halluc)
 
-            r = EvaluationMetrics.evaluate_batch(preds, truths, dt)
-            results[dt] = r
+        # Aggregate
+        gsm_preds = [p for p, dt in zip(all_predictions, all_dataset_types) if dt == "gsm8k"]
+        gsm_truth = [t for t, dt in zip(all_ground_truths, all_dataset_types) if dt == "gsm8k"]
+        mmlu_preds = [p for p, dt in zip(all_predictions, all_dataset_types) if dt == "mmlu"]
+        mmlu_truth = [t for t, dt in zip(all_ground_truths, all_dataset_types) if dt == "mmlu"]
 
-            logger.info(f"\n{dt.upper()} Results")
-            logger.info(f"  Accuracy: {r['accuracy']*100:.2f}%")
-            logger.info(f"  Correct: {r['correct_count']}/{r['total_count']}")
-            logger.info(f"  ⚠️ Hallucination Rate: {r['hallucination_rate']*100:.2f}%")
+        gsm_res = EvaluationMetrics.evaluate_batch(gsm_preds, gsm_truth, "gsm8k")
+        mmlu_res = EvaluationMetrics.evaluate_batch(mmlu_preds, mmlu_truth, "mmlu")
 
-            for ptext, ttext, predtext, is_hall in zip(prompts, truths, preds, halls):
-                extracted = EvaluationMetrics.extract_answer(predtext, dt)
-                if dt == "mmlu":
-                    is_correct = EvaluationMetrics.exact_match_mmlu(predtext, ttext)
-                elif dt == "gsm8k":
-                    is_correct = EvaluationMetrics.exact_match_gsm8k(predtext, ttext)
-                else:
-                    is_correct = False
+        overall_correct = gsm_res["correct_count"] + mmlu_res["correct_count"]
+        overall_total = gsm_res["total_count"] + mmlu_res["total_count"]
+        overall_hall = gsm_res["hallucination_count"] + mmlu_res["hallucination_count"]
 
-                detailed_results.append({
-                    "dataset": dt,
-                    "prompt": ptext,
-                    "ground_truth": ttext,
-                    "prediction": predtext,
-                    "extracted_answer": extracted,
-                    "is_correct": is_correct,
-                    "is_hallucination": is_hall,
-                    "binary_score": 1.0 if is_correct else 0.0,
-                })
-
-        overall_correct = sum(r["correct_count"] for r in results.values())
-        overall_total = sum(r["total_count"] for r in results.values())
-        results["overall"] = {
-            "accuracy": overall_correct / max(overall_total, 1),
-            "em": overall_correct / max(overall_total, 1),
+        overall = {
+            "accuracy": overall_correct / overall_total if overall_total else 0.0,
+            "em": overall_correct / overall_total if overall_total else 0.0,
             "correct_count": overall_correct,
             "total_count": overall_total,
-            "hallucination_count": sum(r.get("hallucination_count", 0) for r in results.values()),
-            "hallucination_rate": sum(1 for h in all_hall if h) / max(len(all_hall), 1),
+            "hallucination_count": overall_hall,
+            "hallucination_rate": overall_hall / overall_total if overall_total else 0.0,
         }
+
+        results = {
+            "gsm8k": gsm_res,
+            "mmlu": mmlu_res,
+            "overall": overall,
+        }
+
+        logger.info("\nGSM8K Results")
+        logger.info(f"  Accuracy: {gsm_res['accuracy']*100:.2f}%")
+        logger.info(f"  Correct: {gsm_res['correct_count']}/{gsm_res['total_count']}")
+        if gsm_res["hallucination_rate"] > 0:
+            logger.info(f"  ⚠️ Hallucination Rate: {gsm_res['hallucination_rate']*100:.2f}%")
+
+        logger.info("\nMMLU Results")
+        logger.info(f"  Accuracy: {mmlu_res['accuracy']*100:.2f}%")
+        logger.info(f"  Correct: {mmlu_res['correct_count']}/{mmlu_res['total_count']}")
+        if mmlu_res["hallucination_rate"] > 0:
+            logger.info(f"  ⚠️ Hallucination Rate: {mmlu_res['hallucination_rate']*100:.2f}%")
 
         logger.info("\n" + "=" * 70)
         logger.info("OVERALL RESULTS")
-        logger.info(f"Accuracy: {results['overall']['accuracy']*100:.2f}%")
-        logger.info(f"Correct: {results['overall']['correct_count']}/{results['overall']['total_count']}")
-        logger.info(f"⚠️ HALLUCINATION RATE: {results['overall']['hallucination_rate']*100:.2f}%")
+        logger.info(f"Accuracy: {overall['accuracy']*100:.2f}%")
+        logger.info(f"Correct: {overall['correct_count']}/{overall['total_count']}")
+        if overall["hallucination_rate"] > 0:
+            logger.info(f"⚠️ HALLUCINATION RATE: {overall['hallucination_rate']*100:.2f}%")
         logger.info("=" * 70)
 
         return results, detailed_results
