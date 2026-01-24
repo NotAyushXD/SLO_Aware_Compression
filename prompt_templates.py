@@ -23,25 +23,18 @@ logger = logging.getLogger(__name__)
 # DIFFICULTY-AWARE TOKEN BUDGETS
 # ============================================================================
 
+# Difficulty-aware token budgets
 DIFFICULTY_TOKEN_BUDGETS = {
     "easy": 120,      # Simple fact recall, no reasoning needed
     "medium": 200,    # Some reasoning, moderate explanation
     "hard": 350       # Complex reasoning, detailed explanation
 }
 
-# ============================================================================
-# MMLU TEMPLATES BY DIFFICULTY (SIMPLIFIED - FIX #1)
-# ============================================================================
-
-
-# ============================================================================
-# MMLU TEMPLATES BY DIFFICULTY (COMPLETION FORMAT FOR BASE MODEL)
-# ============================================================================
-
+# MMLU TEMPLATES - UPDATED for better reasoning
 MMLU_TEMPLATES = {
     "easy": {
-        "system": "", # Base models don't use system prompts in completion mode typically, or just prepended text
-        "user_template": """Answer the following multiple choice question. The answer must be one of A, B, C, or D.
+        "system": "",
+        "user_template": """Answer the following question carefully.
 
 Question: {question}
 
@@ -50,15 +43,13 @@ B) {choice_b}
 C) {choice_c}
 D) {choice_d}
 
-Answer:""",
-        
-        "max_tokens": 120,
-        "stop_sequences": ["\n\n"] 
+The correct answer is:""",
+        "max_tokens": 100,
+        "stop_sequences": []
     },
-    
     "medium": {
         "system": "",
-        "user_template": """Answer the following multiple choice question. The answer must be one of A, B, C, or D.
+        "user_template": """Answer the following multiple choice question by analyzing each option.
 
 Question: {question}
 
@@ -67,15 +58,14 @@ B) {choice_b}
 C) {choice_c}
 D) {choice_d}
 
-Answer:""",
-        
-        "max_tokens": 200,
-        "stop_sequences": ["\n\n"]
+Think through: Which option is correct and why?
+The correct answer is:""",
+        "max_tokens": 150,
+        "stop_sequences": []
     },
-    
     "hard": {
-        "system": "", 
-        "user_template": """Answer the following multiple choice question. The answer must be one of A, B, C, or D.
+        "system": "",
+        "user_template": """Answer this complex question carefully by analyzing each option.
 
 Question: {question}
 
@@ -84,34 +74,62 @@ B) {choice_b}
 C) {choice_c}
 D) {choice_d}
 
-Answer:""",
-        
-        "max_tokens": 350,
-        "stop_sequences": ["\n\n"]
+Analyze each option and choose the best answer.
+The correct answer is:""",
+        "max_tokens": 200,
+        "stop_sequences": []
     }
 }
 
-# ============================================================================
-# GSM8K TEMPLATES BY DIFFICULTY (COMPLETION FORMAT FOR BASE MODEL)
-# ============================================================================
-
+# GSM8K TEMPLATES - UPDATED for step-by-step reasoning
 GSM8K_TEMPLATES = {
     "easy": {
         "system": "",
-        "user_template": "Given the following math problem, solve it and provide the final answer.\n\nProblem: {question}\n\nSolution:\nFINAL_ANSWER:",
-        "max_tokens": 120,
+        "user_template": """Given the following math problem, solve it carefully.
+
+Problem: {question}
+
+Solution:
+Step 1: Identify what we need to find.
+Step 2: Set up the calculation.
+Step 3: Show your work.
+
+FINAL_ANSWER:""",
+        "max_tokens": 150,
         "stop_sequences": []
     },
     "medium": {
         "system": "",
-        "user_template": "Given the following math problem, solve it step-by-step and provide the final answer.\n\nProblem: {question}\n\nSolution:\nFINAL_ANSWER:",
+        "user_template": """Given the following math problem, solve it step-by-step.
+
+Problem: {question}
+
+Solution:
+Step 1: Identify what we need to find.
+Step 2: Break down the problem.
+Step 3: Set up calculations.
+Step 4: Show your work.
+Step 5: Verify the answer makes sense.
+
+FINAL_ANSWER:""",
         "max_tokens": 200,
         "stop_sequences": []
     },
     "hard": {
         "system": "",
-        "user_template": "Given the following math problem, solve it step-by-step and provide the final answer.\n\nProblem: {question}\n\nSolution:\nFINAL_ANSWER:",
-        "max_tokens": 350,
+        "user_template": """Given the following complex math problem, solve it very carefully.
+
+Problem: {question}
+
+Solution:
+Step 1: What are we solving for?
+Step 2: What information do we have?
+Step 3: What formula or method should we use?
+Step 4: Show all calculations.
+Step 5: Check: Does the answer make sense?
+
+FINAL_ANSWER:""",
+        "max_tokens": 250,
         "stop_sequences": []
     }
 }
