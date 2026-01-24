@@ -84,9 +84,10 @@ class EvaluationMetrics:
             return ""
 
         # 1) Explicit FINAL_ANSWER marker (underscore or space)
-        m = re.search(r'FINAL[_\s]*ANSWER\s*[:=\s]*([-+]?\d+(?:\.\d+)?)', response, flags=re.IGNORECASE)
-        if m:
-            return m.group(1)
+        # 1) Explicit FINAL_ANSWER marker (underscore or space) — take the *last* match
+        matches = re.findall(r'FINAL[_\s]*ANSWER\s*[:=\s]*([-+]?\d+(?:\.\d+)?)', response, flags=re.IGNORECASE)
+        if matches:
+            return matches[-1]
 
         # 2) GSM8K delimiter
         m = re.search(r'####\s*([-+]?\d+(?:\.\d+)?)', response)

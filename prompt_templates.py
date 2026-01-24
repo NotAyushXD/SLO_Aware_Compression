@@ -5,7 +5,7 @@ Design goals (for baseline correctness + paper alignment):
 - **Deterministic, short outputs** whenever possible (important for latency + easy parsing).
 - Use dataset-specific formats:
   - MMLU: output ONLY A/B/C/D
-  - GSM8K: output ONLY `FINAL_ANSWER: <number>`
+  - GSM8K: output ONLY `FINAL_ANSWER:`
 - Difficulty influences token budget mainly for GSM8K (harder problems get a bit more budget),
   but we avoid huge budgets that destroy latency.
 
@@ -104,10 +104,11 @@ GSM8K_TEMPLATES = {
 Problem: {question}
 
 Think step by step internally, but DO NOT show your steps.
-Return only the final answer in the exact format:
+Return ONLY the final numeric answer (no words, no units).
+Write it on a single line as:
 
-FINAL_ANSWER: <number>""",
-        "max_tokens": 48,
+FINAL_ANSWER:""",
+        "max_tokens": 24,
         "stop_sequences": ["\n"],
     },
     "medium": {
@@ -117,10 +118,11 @@ FINAL_ANSWER: <number>""",
 Problem: {question}
 
 Think step by step internally, but DO NOT show your steps.
-Return only the final answer in the exact format:
+Return ONLY the final numeric answer (no words, no units).
+Write it on a single line as:
 
-FINAL_ANSWER: <number>""",
-        "max_tokens": 64,
+FINAL_ANSWER:""",
+        "max_tokens": 32,
         "stop_sequences": ["\n"],
     },
     "hard": {
@@ -130,10 +132,11 @@ FINAL_ANSWER: <number>""",
 Problem: {question}
 
 Think step by step internally, but DO NOT show your steps.
-Return only the final answer in the exact format:
+Return ONLY the final numeric answer (no words, no units).
+Write it on a single line as:
 
-FINAL_ANSWER: <number>""",
-        "max_tokens": 80,
+FINAL_ANSWER:""",
+        "max_tokens": 48,
         "stop_sequences": ["\n"],
     },
 }
@@ -205,5 +208,5 @@ def get_expected_format(dataset_type: str) -> str:
     if dataset_type == "mmlu":
         return "A|B|C|D"
     if dataset_type == "gsm8k":
-        return "FINAL_ANSWER: <number>"
+        return "FINAL_ANSWER:"
     return ""

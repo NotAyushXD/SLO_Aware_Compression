@@ -57,9 +57,14 @@ class TimingStreamer(BaseStreamer):
         except Exception:
             seq_len = 1
 
-        # Ignore the initial prompt push (seq_len > 1) exactly once.
-        if not self._ignored_prompt and seq_len > 1 and self.generated_token_count == 0:
+        # Ignore prompt pushes before generation begins.
+        # We ignore the first push unconditionally (almost always prompt-related),
+        # and also ignore any subsequent seq_len>1 pushes until we start timing.
+        if not self._ignored_prompt:
             self._ignored_prompt = True
+            return
+
+        if self.first_token_time is None and seq_len > 1 and self.generated_token_count == 0:
             return
 
         if self.first_token_time is None:
