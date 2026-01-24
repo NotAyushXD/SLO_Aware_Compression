@@ -140,11 +140,20 @@ class ClosedLoopLoadGenerator:
             # IMPORTANT: ensure load testing uses the same formatted prompts as evaluation
             formatted_prompt, max_tokens, _stops = build_llama_formatted_prompt(example, dataset_type)
 
-            generated_text, inference_metrics = self.inference_func(
-                prompt=formatted_prompt,
-                max_tokens=max_tokens,
-                difficulty=difficulty,
-            )
+            try:
+                generated_text, inference_metrics = self.inference_func(
+                    prompt=formatted_prompt,
+                    max_tokens=max_tokens,
+                    difficulty=difficulty,
+                    dataset_type=dataset_type,
+                )
+            except TypeError:
+                # Backwards compatibility: older server.generate() without dataset_type
+                generated_text, inference_metrics = self.inference_func(
+                    prompt=formatted_prompt,
+                    max_tokens=max_tokens,
+                    difficulty=difficulty,
+                )
 
             metrics.inference_metrics = dict(inference_metrics or {})
             # If server provides more accurate wall times (e.g., after acquiring GPU lock),

@@ -34,7 +34,8 @@ DIFFICULTY_TOKEN_BUDGETS = {
 # ============================================================================
 
 MMLU_TEMPLATES = {
-    # For MMLU we always want a single-letter output; do not waste tokens.
+    # For MMLU we always want a single-letter output; keep outputs ultra-short.
+    # IMPORTANT: We end with an explicit "Answer:" cue to avoid empty/whitespace outputs.
     "easy": {
         "system": "You are a knowledgeable assistant.",
         "user_template": """Answer the following multiple-choice question.
@@ -47,8 +48,11 @@ C) {choice_c}
 D) {choice_d}
 
 Select the correct option.
-Answer with ONLY the letter (A, B, C, or D).""",
-        "max_tokens": 4,
+Answer with ONLY the letter (A, B, C, or D).
+
+Answer:""",
+        # Allow a few tokens so the model can emit optional whitespace + the letter.
+        "max_tokens": 8,
         "stop_sequences": ["\n"],
     },
     "medium": {
@@ -63,8 +67,10 @@ C) {choice_c}
 D) {choice_d}
 
 Select the correct option.
-Answer with ONLY the letter (A, B, C, or D).""",
-        "max_tokens": 4,
+Answer with ONLY the letter (A, B, C, or D).
+
+Answer:""",
+        "max_tokens": 8,
         "stop_sequences": ["\n"],
     },
     "hard": {
@@ -79,14 +85,18 @@ C) {choice_c}
 D) {choice_d}
 
 Select the correct option.
-Answer with ONLY the letter (A, B, C, or D).""",
-        "max_tokens": 4,
+Answer with ONLY the letter (A, B, C, or D).
+
+Answer:""",
+        "max_tokens": 8,
         "stop_sequences": ["\n"],
     },
 }
 
+
 GSM8K_TEMPLATES = {
-    # For GSM8K we allow a little budget for reasoning, but we require the final line format.
+    # For GSM8K we want correct arithmetic, but we DO NOT want chain-of-thought printed.
+    # We require a machine-parsable final line.
     "easy": {
         "system": "You are a careful math problem solver. Avoid arithmetic mistakes.",
         "user_template": """Solve the following math problem.
@@ -97,8 +107,8 @@ Think step by step internally, but DO NOT show your steps.
 Return only the final answer in the exact format:
 
 FINAL_ANSWER: <number>""",
-        "max_tokens": 64,
-        "stop_sequences": [],
+        "max_tokens": 48,
+        "stop_sequences": ["\n"],
     },
     "medium": {
         "system": "You are a careful math problem solver. Double-check calculations.",
@@ -110,8 +120,8 @@ Think step by step internally, but DO NOT show your steps.
 Return only the final answer in the exact format:
 
 FINAL_ANSWER: <number>""",
-        "max_tokens": 96,
-        "stop_sequences": [],
+        "max_tokens": 64,
+        "stop_sequences": ["\n"],
     },
     "hard": {
         "system": "You are an expert math problem solver. Verify your result.",
@@ -123,14 +133,11 @@ Think step by step internally, but DO NOT show your steps.
 Return only the final answer in the exact format:
 
 FINAL_ANSWER: <number>""",
-        "max_tokens": 128,
-        "stop_sequences": [],
+        "max_tokens": 80,
+        "stop_sequences": ["\n"],
     },
 }
 
-# ============================================================================
-# CORE FUNCTIONS
-# ============================================================================
 
 def get_max_tokens(difficulty: str, dataset_type: str = "generic") -> int:
     if difficulty not in DIFFICULTY_TOKEN_BUDGETS:

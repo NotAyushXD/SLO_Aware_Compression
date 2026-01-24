@@ -25,6 +25,7 @@ from typing import Dict, Tuple, Optional
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from transformers.generation.streamers import BaseStreamer
+from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
 
 import logging
 
@@ -72,6 +73,34 @@ class TimingStreamer(BaseStreamer):
     def end(self):
         pass
 
+
+class FirstTokenAllowedTokens(LogitsProcessor):
+    """Restrict the first generated token to a small allowed set.
+
+    Used for MMLU-style multiple choice so the model emits exactly one of A/B/C/D.
+    """
+
+    def __init__(self, prompt_length: int, allowed_token_ids):
+        super().__init__()
+        self.prompt_length = int(prompt_length)
+        self.allowed_token_ids = list(allowed_token_ids) if allowed_token_ids else []
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        if not self.allowed_token_ids:
+            return scores
+
+        # At the first decoding step, input_ids length == prompt_length.
+        try:
+            cur_len = int(input_ids.shape[1])
+        except Exception:
+            cur_len = -1
+
+        if cur_len == self.prompt_length:
+            masked = scores.new_full(scores.shape, -float("inf"))
+            masked[:, self.allowed_token_ids] = scores[:, self.allowed_token_ids]
+            return masked
+
+        return scores
 
 class GPUMonitor:
     @staticmethod
@@ -183,11 +212,27 @@ class SingleVariantServer:
 
         return selected
 
+    def _compute_mmlu_allowed_token_ids(self):
+        """Token IDs for 'A'/'B'/'C'/'D' (and space-prefixed variants) that are single tokens."""
+        candidates = ["A", "B", "C", "D", " A", " B", " C", " D"]
+        ids = set()
+        for s in candidates:
+            try:
+                enc = self.tokenizer.encode(s, add_special_tokens=False)
+                if isinstance(enc, (list, tuple)) and len(enc) == 1:
+                    ids.add(int(enc[0]))
+            except Exception:
+                continue
+        return sorted(ids)
+
     def _load_tokenizer(self):
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         logger.info(f"Tokenizer loaded: {self.tokenizer.__class__.__name__}")
+        # Precompute allowed token ids for MMLU (A/B/C/D) to avoid empty outputs
+        self._mmlu_allowed_token_ids = self._compute_mmlu_allowed_token_ids()
+        logger.info(f"MMLU allowed token ids: {len(self._mmlu_allowed_token_ids)}")
 
     def _load_model(self):
         try:
@@ -296,6 +341,7 @@ class SingleVariantServer:
         do_sample: bool = False,
         temperature: float = 0.0,
         top_p: float = 1.0,
+        dataset_type: Optional[str] = None,
     ) -> Tuple[str, Dict]:
         """Generate response + timing metrics.
 
@@ -339,19 +385,34 @@ class SingleVariantServer:
 
             # Streamer for TTFT
             streamer = TimingStreamer(self._synchronize_device)
+            # Optional: task-aware decoding constraints (kept lightweight for speed)
+            logits_processor = None
+            effective_max_new_tokens = int(max_tokens)
+            if (dataset_type or '').lower() == 'mmlu':
+                # Force exactly one of {A,B,C,D} as the first token.
+                allowed = getattr(self, '_mmlu_allowed_token_ids', [])
+                if allowed:
+                    logits_processor = LogitsProcessorList([FirstTokenAllowedTokens(input_length, allowed)])
+                # MMLU should be a single token output
+                effective_max_new_tokens = 1
+                # Always deterministic for classification-style tasks
+                do_sample = False
+
 
             # Build generation kwargs
             gen_kwargs = dict(
                 **inputs,
-                max_new_tokens=int(max_tokens),
+                max_new_tokens=int(effective_max_new_tokens),
                 do_sample=bool(do_sample),
                 return_dict_in_generate=True,
                 output_scores=False,
                 pad_token_id=self.tokenizer.eos_token_id,
                 streamer=streamer,
                 use_cache=True,
+                min_new_tokens=1,
+                logits_processor=logits_processor,
             )
-            if do_sample:
+            if do_sample and (dataset_type or '').lower() != 'mmlu':
                 gen_kwargs.update(dict(temperature=float(temperature), top_p=float(top_p)))
 
             try:

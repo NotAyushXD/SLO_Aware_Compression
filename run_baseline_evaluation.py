@@ -17,6 +17,7 @@ import os
 import logging
 import time
 import math
+import random
 from typing import Dict, Any, List
 
 from preprocessing import DataPreprocessor
@@ -97,7 +98,29 @@ def maybe_calibrate_slos(
     logger.info("-" * 80)
     logger.info(f"Calibration run: {n} requests @ concurrency={calibration_concurrency}")
 
-    calib_data = val_data[:n]
+    # Stratified sampling by difficulty improves calibration stability
+    by_diff = {'easy': [], 'medium': [], 'hard': []}
+    for ex in val_data:
+        d = (ex.get('difficulty') or 'medium').lower()
+        if d not in by_diff:
+            d = 'medium'
+        by_diff[d].append(ex)
+
+    calib_data: List[Dict[str, Any]] = []
+    per = max(n // 3, 1)
+    for d in ['easy', 'medium', 'hard']:
+        take = min(per, len(by_diff[d]))
+        if take > 0:
+            calib_data.extend(random.sample(by_diff[d], take))
+
+    # Fill remainder (if any) from the overall pool
+    if len(calib_data) < n:
+        need = n - len(calib_data)
+        remaining = [ex for ex in val_data if ex not in calib_data]
+        if remaining:
+            calib_data.extend(random.sample(remaining, min(need, len(remaining))))
+
+    calib_data = calib_data[:n]
 
     load_gen = ClosedLoopLoadGenerator(
         inference_func=server.generate,
@@ -135,15 +158,18 @@ def main(args):
     # Step 1: load data
     logger.info("\n[STEP 1] LOADING DATA")
     logger.info("-" * 80)
-    train_data, val_data, test_data = load_data(args.processed_dir)
+    train_data, val_data_full, test_data_full = load_data(args.processed_dir)
 
-    if not val_data or not test_data:
+    val_data = val_data_full
+    test_data = test_data_full
+
+    if not val_data_full or not test_data_full:
         logger.error("No validation or test data found!")
         return
 
     if args.data_subset > 0:
-        val_data = val_data[:args.data_subset]
-        test_data = test_data[:args.data_subset]
+        val_data = val_data_full[:args.data_subset]
+        test_data = test_data_full[:args.data_subset]
         logger.info(f"Using subset: val={len(val_data)}, test={len(test_data)}")
 
     # Step 2: initialize server
@@ -163,7 +189,7 @@ def main(args):
     # Step 3.5: calibrate slos (optional)
     current_slos = maybe_calibrate_slos(
         server=server,
-        val_data=val_data,
+        val_data=val_data_full,
         output_dir=args.output_dir,
         disable=args.disable_slo_calibration,
         calibration_requests=args.calibration_requests,

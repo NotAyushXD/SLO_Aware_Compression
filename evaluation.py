@@ -197,11 +197,20 @@ class HeldOutEvaluator:
             try:
                 formatted_prompt, max_tokens, _ = build_llama_formatted_prompt(example, dataset_type)
 
-                generated_text, _metrics = self.model.generate(
-                    prompt=formatted_prompt,
-                    max_tokens=max_tokens,
-                    difficulty=difficulty,
-                )
+                try:
+                    generated_text, _metrics = self.model.generate(
+                        prompt=formatted_prompt,
+                        max_tokens=max_tokens,
+                        difficulty=difficulty,
+                        dataset_type=dataset_type,
+                    )
+                except TypeError:
+                    # Backwards compatibility: older server.generate() without dataset_type
+                    generated_text, _metrics = self.model.generate(
+                        prompt=formatted_prompt,
+                        max_tokens=max_tokens,
+                        difficulty=difficulty,
+                    )
 
                 if self.verbose and i < self.max_verbose:
                     print("\n--- PROMPT ---\n", formatted_prompt)
