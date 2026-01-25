@@ -71,6 +71,12 @@ def main(args: argparse.Namespace) -> None:
     logger.info(f"  Output dir: {args.output_dir}")
     logger.info(f"  SLO calibration disabled: {args.disable_slo_calibration}")
     logger.info(f"  Skip load test: {args.skip_load_test}")
+    logger.info(
+        f"  Batching enabled: {False if getattr(args, 'disable_batching', False) else True if getattr(args, 'enable_batching', False) else (args.prompt_mode == 'slo') }"
+    )
+    logger.info(f"  Max batch size: {args.max_batch_size}")
+    logger.info(f"  Batch wait (ms): {args.batch_wait_ms}")
+    logger.info(f"  Skip accuracy eval: {args.skip_accuracy_eval}")
     logger.info("=" * 80)
 
     # Step 0: Preprocess (optional)
@@ -112,6 +118,13 @@ def main(args: argparse.Namespace) -> None:
         variant=args.variant,
         device=args.device,
         dtype=args.dtype,
+        enable_batching=(
+            False if getattr(args, "disable_batching", False) else
+            True if getattr(args, "enable_batching", False) else
+            (args.prompt_mode == "slo")
+        ),
+        max_batch_size=args.max_batch_size,
+        batch_wait_ms=args.batch_wait_ms,
     )
 
     # Load/Calibrate SLOs (optional)
@@ -199,12 +212,21 @@ def main(args: argparse.Namespace) -> None:
             except Exception as e:
                 logger.warning(f"Failed to write {slo_file}: {e}")
 
-    # Step 4: Evaluate accuracy
-    logger.info("\n[STEP 4] EVALUATING ACCURACY")
-    logger.info("-" * 80)
+    # Step 4: Evaluate accuracy (optionally skipped)
+    eval_results, detailed_predictions = {}, []
+    if args.skip_accuracy_eval:
+        logger.info("\n[STEP 4] EVALUATING ACCURACY")
+        logger.info("-" * 80)
+        logger.info("Skipping accuracy evaluation (--skip_accuracy_eval).")
+    else:
+        logger.info("\n[STEP 4] EVALUATING ACCURACY")
+        logger.info("-" * 80)
 
-    evaluator = HeldOutEvaluator(server, test_data, batch_size=32)
-    eval_results, detailed_predictions = evaluator.evaluate(prompt_mode=args.prompt_mode, verbose=args.verbose_eval)
+        evaluator = HeldOutEvaluator(server, test_data, batch_size=32)
+        eval_results, detailed_predictions = evaluator.evaluate(
+            prompt_mode=args.prompt_mode,
+            verbose=args.verbose_eval,
+        )
 
     # Step 5: Save results
     logger.info("\n[STEP 5] SAVING OUTPUTS")
@@ -231,6 +253,14 @@ def main(args: argparse.Namespace) -> None:
                 "data_subset": args.data_subset,
                 "disable_slo_calibration": args.disable_slo_calibration,
                 "skip_load_test": args.skip_load_test,
+                "skip_accuracy_eval": args.skip_accuracy_eval,
+                "enable_batching": (
+                    False if getattr(args, "disable_batching", False) else
+                    True if getattr(args, "enable_batching", False) else
+                    (args.prompt_mode == "slo")
+                ),
+                "max_batch_size": args.max_batch_size,
+                "batch_wait_ms": args.batch_wait_ms,
             },
             "slo_thresholds": current_slos,
             "load_test_results": load_test_results,
@@ -298,6 +328,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Disable SLO calibration and ignore slo_thresholds.json.")
     p.add_argument("--skip_load_test", action="store_true",
                    help="Skip load tests and only run accuracy evaluation.")
+    p.add_argument("--skip_accuracy_eval", action="store_true",
+                   help="Skip held-out accuracy evaluation (run only load tests/SLO calibration).")
+    p.add_argument("--enable_batching", action="store_true",
+                   help="Enable dynamic request batching (recommended for prompt_mode=slo).")
+    p.add_argument("--disable_batching", action="store_true",
+                   help="Force-disable dynamic batching (debugging / apples-to-apples).")
+    p.add_argument("--max_batch_size", type=int, default=8,
+                   help="Maximum batch size for the dynamic batcher.")
+    p.add_argument("--batch_wait_ms", type=int, default=8,
+                   help="How long to wait (ms) to form a batch before running it.")
     p.add_argument("--verbose_eval", action="store_true",
                    help="Print a few example prompts/outputs during evaluation.")
 

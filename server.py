@@ -1,338 +1,567 @@
-# server.py
-"""
-Single-variant LLM server.
-
-This version (v7) is focused on **accuracy debugging** while keeping the hooks
-needed for later SLO work:
-- Supports prompt_mode ("accuracy" vs "slo") via kwargs.
-- Uses chat templates automatically for Instruct models (when available).
-- Enforces MMLU output to be a single letter (A/B/C/D) via token restriction.
-- Adds an optional stopping criterion for GSM8K to stop once FINAL_ANSWER is produced.
-
-NOTE: BitsAndBytes quantization (8-bit / 4-bit) requires CUDA.
-"""
-
-from __future__ import annotations
-
-import time
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from transformers.generation.streamers import BaseStreamer
-from transformers.generation.stopping_criteria import StoppingCriteria, StoppingCriteriaList
-from typing import Dict, Tuple, Optional, List
-import logging
 import gc
-import os
+import logging
 import re
+import threading
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
-from prompt_templates import get_max_tokens, split_system_user
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+import torch
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BaseStreamer,
+    BitsAndBytesConfig,
+    StoppingCriteria,
+    StoppingCriteriaList,
 )
-logger = logging.getLogger(__name__)
+
+from prompt_templates import get_max_tokens
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("server")
 
 
-class TimingStreamer(BaseStreamer):
-    """
-    Streamer capturing first-token time for TTFT measurement.
-    """
-    def __init__(self, sync_fn):
-        self.sync_fn = sync_fn
-        self.first_token_time = None
-        self.token_count = 0
+# -------------------------------
+# Utilities
+# -------------------------------
 
-    def put(self, value):
-        if self.first_token_time is None:
-            self.sync_fn()
-            self.first_token_time = time.perf_counter()
-        self.token_count += 1
-
-    def end(self):
-        pass
-
-
-class StopOnFinalAnswer(StoppingCriteria):
-    """
-    Stop generation once we observe a FINAL_ANSWER line with a number.
-    """
-    def __init__(self, tokenizer, prompt_len: int):
-        super().__init__()
-        self.tokenizer = tokenizer
-        self.prompt_len = prompt_len
-        self._pat = re.compile(r"FINAL_ANSWER\s*[:=\s]*[-+]?\d+(?:\.\d+)?", re.IGNORECASE)
-
-    def __call__(self, input_ids, scores, **kwargs) -> bool:
-        # input_ids can be [batch, seq] or [seq] depending on transformers version
-        if getattr(input_ids, 'ndim', 2) == 1:
-            gen_ids = input_ids[self.prompt_len:]
-        else:
-            gen_ids = input_ids[0, self.prompt_len:]
-        if gen_ids.numel() == 0:
-            return False
-        text = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
-        return bool(self._pat.search(text))
+def split_system_user(prompt: str) -> Tuple[str, str]:
+    """Split the legacy 'SYSTEM\n\nUSER' prompt format into (system, user)."""
+    parts = prompt.split("\n\n", 1)
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+    # Fallback: treat whole prompt as user content
+    return "", prompt.strip()
 
 
 class GPUMonitor:
-    """Monitor and log GPU utilization metrics"""
     @staticmethod
-    def is_cuda_available() -> bool:
+    def get_gpu_info() -> Dict[str, float]:
         if not torch.cuda.is_available():
-            return False
-        try:
-            t = torch.zeros(1, device="cuda")
-            del t
-            return True
-        except Exception:
-            return False
+            return {"available": 0, "total": 0, "allocated": 0, "free": 0}
+        total = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        allocated = torch.cuda.memory_allocated(0) / (1024**3)
+        free = total - allocated
+        return {"available": 1, "total": total, "allocated": allocated, "free": free}
 
     @staticmethod
-    def get_gpu_info() -> Dict:
-        info = {"cuda_available": False}
-        if not torch.cuda.is_available():
-            return info
-        try:
-            info["cuda_available"] = True
-            info["device_count"] = torch.cuda.device_count()
-            info["current_device"] = torch.cuda.current_device()
-            info["device_name"] = torch.cuda.get_device_name(0)
-
-            memory_allocated = torch.cuda.memory_allocated(0) / 1e9
-            memory_reserved = torch.cuda.memory_reserved(0) / 1e9
-            memory_total = torch.cuda.get_device_properties(0).total_memory / 1e9
-
-            info["memory_allocated_gb"] = memory_allocated
-            info["memory_reserved_gb"] = memory_reserved
-            info["memory_total_gb"] = memory_total
-            info["memory_free_gb"] = memory_total - memory_reserved
-        except Exception as e:
-            info["error"] = str(e)
-        return info
-
-    @staticmethod
-    def log_gpu_status(prefix: str = ""):
+    def log_gpu_status(prefix: str = "") -> None:
         info = GPUMonitor.get_gpu_info()
-        if not info.get("cuda_available"):
-            logger.info(prefix + "GPU: Not available")
+        if not info.get("available"):
+            logger.info(f"{prefix}No CUDA GPU available")
             return
-        logger.info(prefix + f"GPU: {info.get('device_name')}")
-        logger.info(prefix + f"  Memory: {info.get('memory_allocated_gb', 0):.2f}GB allocated, "
-                    f"{info.get('memory_free_gb', 0):.2f}GB free / {info.get('memory_total_gb', 0):.2f}GB total")
+        name = torch.cuda.get_device_name(0)
+        logger.info(f"{prefix}GPU: {name}")
+        logger.info(
+            f"{prefix}  Memory: {info['allocated']:.2f}GB allocated, "
+            f"{info['free']:.2f}GB free / {info['total']:.2f}GB total"
+        )
+
+
+# -------------------------------
+# Timing + stopping criteria
+# -------------------------------
+
+
+class TimingStreamer(BaseStreamer):
+    """Records a reasonable TTFT by ignoring the initial prompt push."""
+
+    def __init__(self, sync_fn):
+        self._sync_fn = sync_fn
+        self.first_token_time: Optional[float] = None
+        self._saw_prompt = False
+
+    def put(self, value):
+        # HF generate pushes the *prompt* once (shape [B, prompt_len]) before decoding.
+        if not self._saw_prompt:
+            self._saw_prompt = True
+            return
+
+        # First generated token for the batch.
+        if self.first_token_time is None:
+            self._sync_fn()
+            self.first_token_time = time.perf_counter()
+
+    def end(self):
+        return
+
+
+class StopOnFinalAnswer(StoppingCriteria):
+    """Stop once FINAL_ANSWER is present.
+
+    For batch generation, you can set require_all=True to stop only after *all* rows
+    contain a FINAL_ANSWER, which makes it safe for batched GSM8K.
+    """
+
+    _PATTERN = re.compile(r"FINAL_ANSWER\s*[:=\s]*[-+]?\d+(?:\.\d+)?")
+
+    def __init__(self, tokenizer, prompt_len: int, require_all: bool = False):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.prompt_len = int(prompt_len)
+        self.require_all = bool(require_all)
+        self._done: Optional[List[bool]] = None
+
+    def __call__(self, input_ids, scores, **kwargs) -> bool:
+        # input_ids: [batch, seq] or [seq]
+        if input_ids.ndim == 1:
+            text = self.tokenizer.decode(input_ids[self.prompt_len :], skip_special_tokens=True)
+            return bool(self._PATTERN.search(text))
+
+        bsz = int(input_ids.shape[0])
+        if self._done is None or len(self._done) != bsz:
+            self._done = [False] * bsz
+
+        for i in range(bsz):
+            if self._done[i]:
+                continue
+            text = self.tokenizer.decode(input_ids[i, self.prompt_len :], skip_special_tokens=True)
+            if self._PATTERN.search(text):
+                self._done[i] = True
+
+        return all(self._done) if self.require_all else any(self._done)
+
+
+# -------------------------------
+# Request batching
+# -------------------------------
+
+
+@dataclass
+class _PendingRequest:
+    prompt: str
+    dataset_type: str
+    difficulty: str
+    max_tokens: int
+    prompt_mode: str
+    temperature: float
+    top_p: float
+    enqueue_time: float
+    event: threading.Event
+    result_text: Optional[str] = None
+    result_metrics: Optional[Dict] = None
+    error: Optional[str] = None
+
+    def batch_key(self) -> Tuple[str, str, int, bool]:
+        # In SLO mode we always use greedy decoding, so sampling params are irrelevant.
+        do_sample = bool(self.prompt_mode != "slo" and self.temperature and self.temperature > 0.0)
+        return (self.dataset_type, self.prompt_mode, int(self.max_tokens), do_sample)
+
+
+class _BatchingScheduler:
+    def __init__(self, server: "SingleVariantServer", max_batch_size: int = 4, batch_wait_ms: int = 8):
+        self.server = server
+        self.max_batch_size = int(max(1, max_batch_size))
+        self.batch_wait_s = max(0.0, float(batch_wait_ms) / 1000.0)
+
+        self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
+        self._pending: List[_PendingRequest] = []
+        self._stop = False
+
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def submit(self, req: _PendingRequest) -> None:
+        with self._cv:
+            self._pending.append(req)
+            self._cv.notify()
+
+    def shutdown(self) -> None:
+        with self._cv:
+            self._stop = True
+            self._cv.notify_all()
+        self._thread.join(timeout=1.0)
+
+    def _loop(self) -> None:
+        while True:
+            with self._cv:
+                while not self._pending and not self._stop:
+                    self._cv.wait()
+                if self._stop and not self._pending:
+                    return
+
+                # Start a new batch with the oldest request.
+                first = self._pending.pop(0)
+                key = first.batch_key()
+                batch: List[_PendingRequest] = [first]
+
+                deadline = time.perf_counter() + self.batch_wait_s
+                while len(batch) < self.max_batch_size:
+                    # Find another request with the same key.
+                    idx = next((i for i, r in enumerate(self._pending) if r.batch_key() == key), None)
+                    if idx is not None:
+                        batch.append(self._pending.pop(idx))
+                        continue
+
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0:
+                        break
+                    self._cv.wait(timeout=remaining)
+
+            # Process outside the lock.
+            self._process_batch(batch)
+
+    def _process_batch(self, batch: List[_PendingRequest]) -> None:
+        dequeue_t = time.perf_counter()
+
+        try:
+            prompts = [r.prompt for r in batch]
+            dataset_type = batch[0].dataset_type
+            prompt_mode = batch[0].prompt_mode
+            max_tokens = batch[0].max_tokens
+            temperature = batch[0].temperature
+            top_p = batch[0].top_p
+
+            texts, metrics_list, lock_wait_ms = self.server._generate_hf_batch(
+                prompts=prompts,
+                dataset_type=dataset_type,
+                max_tokens=max_tokens,
+                prompt_mode=prompt_mode,
+                temperature=temperature,
+                top_p=top_p,
+                require_all_final_answers=(dataset_type == "gsm8k"),
+            )
+
+            for r, text, m in zip(batch, texts, metrics_list):
+                queue_wait_ms = (dequeue_t - r.enqueue_time) * 1000.0 + float(lock_wait_ms)
+                m["queue_wait_ms"] = float(max(0.0, queue_wait_ms))
+                r.result_text = text
+                r.result_metrics = m
+                r.event.set()
+
+        except Exception as e:
+            for r in batch:
+                r.error = str(e)
+                r.result_text = ""
+                r.result_metrics = {
+                    "success": False,
+                    "error": str(e),
+                    "ttft_ms": 0.0,
+                    "tpot_ms": 0.0,
+                    "output_length": 0,
+                    "throughput_tokens_per_sec": 0.0,
+                    "total_latency_ms": 0.0,
+                    "queue_wait_ms": (dequeue_t - r.enqueue_time) * 1000.0,
+                    "variant": self.server.variant,
+                    "model": self.server.model_name,
+                    "device": self.server.device,
+                }
+                r.event.set()
+
+
+# -------------------------------
+# Main server
+# -------------------------------
 
 
 class SingleVariantServer:
+    """A single-process, single-GPU server with optional micro-batching.
+
+    The micro-batcher is deliberately simple:
+    - It groups requests with the same (dataset_type, prompt_mode, max_tokens, do_sample)
+      arriving within a small window.
+    - It runs exactly one HF `generate()` at a time, preventing the concurrency=4 TPOT
+      collapse seen with parallel independent generation.
+    """
+
+    MMLU_ALLOWED_CHARS = [" A", " B", " C", " D", "A", "B", "C", "D"]
+
     def __init__(
         self,
-        model_name: str = "meta-llama/Llama-3.1-8B",
+        model_name: str,
         variant: str = "med",
         device: str = "auto",
         dtype: str = "auto",
+        enable_batching: bool = False,
+        max_batch_size: int = 4,
+        batch_wait_ms: int = 8,
     ):
         self.model_name = model_name
         self.variant = variant
+        self.device = "cuda" if (device == "auto" and torch.cuda.is_available()) else device
         self.dtype = dtype
 
-        self.device = self._detect_device(device, variant)
-
-        self._cleanup_per_request = False
-        self._request_count = 0
-        self._cleanup_interval = 50
-
-        logger.info("=" * 70)
+        logger.info("=" * 69)
         logger.info(f"Initializing {variant.upper()} server")
-        logger.info("=" * 70)
+        logger.info("=" * 69)
         logger.info(f"  Model: {model_name}")
         logger.info(f"  Variant: {variant}")
         logger.info(f"  Device: {self.device}")
         logger.info(f"  Dtype: {dtype}")
+        if self.device == "cuda":
+            GPUMonitor.log_gpu_status(prefix="  ")
 
-        GPUMonitor.log_gpu_status("  ")
+        self._generation_lock = threading.Lock()
 
-        self._load_tokenizer()
-        self._load_model()
+        # Tokenizer first (cheap)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        # Make batching-friendly for decoder-only models
+        self.tokenizer.padding_side = "left"
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        logger.info("Post-load GPU status:")
-        GPUMonitor.log_gpu_status("  ")
+        # Precompute MMLU allowed ids
+        self.mmlu_allowed_token_ids = self._compute_mmlu_allowed_token_ids()
+        logger.info(f"MMLU allowed token ids: {len(self.mmlu_allowed_token_ids)}")
+        logger.info(
+            f"Tokenizer loaded: {type(self.tokenizer).__name__} (chat_template={bool(getattr(self.tokenizer, 'chat_template', None))})"
+        )
 
+        # Load model
+        quant_config = BitsAndBytesConfig(load_in_8bit=True)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="auto" if self.device == "cuda" else None,
+            torch_dtype=(
+                torch.float16
+                if dtype == "float16"
+                else torch.bfloat16
+                if dtype == "bfloat16"
+                else "auto"
+            ),
+            quantization_config=quant_config,
+        )
+        self.model.eval()
+
+        logger.info("Model loaded successfully")
+        try:
+            num_params = sum(p.numel() for p in self.model.parameters())
+            logger.info(f"Model size: {num_params/1e9:.2f}B parameters")
+        except Exception:
+            pass
+
+        if self.device == "cuda":
+            logger.info("Post-load GPU status:")
+            GPUMonitor.log_gpu_status(prefix="  ")
+
+        # Optional micro-batching scheduler
+        self._scheduler: Optional[_BatchingScheduler] = None
+        if enable_batching:
+            logger.info(
+                f"Batching enabled: max_batch_size={max_batch_size}, batch_wait_ms={batch_wait_ms}"
+            )
+            self._scheduler = _BatchingScheduler(
+                server=self, max_batch_size=max_batch_size, batch_wait_ms=batch_wait_ms
+            )
+
+        # Warmup (deterministic) to reduce cold-start variance
         self._warmup()
 
-    # ---------------------------------------------------------------------
-    # Device / loading
-    # ---------------------------------------------------------------------
-
-    def _detect_device(self, requested_device: str, variant: str) -> str:
-        req = (requested_device or "auto").lower().strip()
-        cuda_ok = GPUMonitor.is_cuda_available()
-        mps_ok = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-
-        # Quantized variants require CUDA (bitsandbytes)
-        if variant in ("med", "cheap") and not cuda_ok:
-            logger.warning(f"Variant '{variant}' needs CUDA for bitsandbytes; falling back to CPU/base behavior may fail.")
-            # We'll still return 'cpu' so the error is explicit at load time.
-            return "cpu"
-
-        if req == "cuda":
-            return "cuda" if cuda_ok else "cpu"
-        if req == "mps":
-            return "mps" if mps_ok else "cpu"
-        if req == "cpu":
-            return "cpu"
-
-        # auto
-        if cuda_ok:
-            return "cuda"
-        if mps_ok:
-            return "mps"
-        return "cpu"
-
-    def _load_tokenizer(self):
-        try:
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-
-            # Chat template support (best for Instruct models)
-            self._supports_chat = bool(getattr(self.tokenizer, "chat_template", None)) and hasattr(self.tokenizer, "apply_chat_template")
-
-            # Precompute allowed token ids for MMLU (single-token letters)
-            self._mmlu_allowed_token_ids = self._compute_mmlu_allowed_token_ids()
-            if self._mmlu_allowed_token_ids:
-                logger.info(f"MMLU allowed token ids: {len(self._mmlu_allowed_token_ids)}")
-            else:
-                logger.warning("Could not compute single-token A/B/C/D ids; MMLU restriction will be disabled.")
-
-            logger.info(f"Tokenizer loaded: {self.tokenizer.__class__.__name__} (chat_template={self._supports_chat})")
-
-        except Exception as e:
-            logger.error(f"Failed to load tokenizer: {e}")
-            raise
-
     def _compute_mmlu_allowed_token_ids(self) -> List[int]:
-        allowed = set()
-        candidates = ["A", "B", "C", "D", " A", " B", " C", " D", "\nA", "\nB", "\nC", "\nD"]
-        for s in candidates:
-            ids = self.tokenizer.encode(s, add_special_tokens=False)
-            if len(ids) == 1:
-                allowed.add(ids[0])
-        return sorted(allowed)
+        ids: List[int] = []
+        for s in self.MMLU_ALLOWED_CHARS:
+            t = self.tokenizer.encode(s, add_special_tokens=False)
+            if t:
+                ids.append(int(t[0]))
+        # Deduplicate while preserving order
+        seen = set()
+        out = []
+        for i in ids:
+            if i not in seen:
+                seen.add(i)
+                out.append(i)
+        return out
 
-    def _load_model(self):
-        try:
-            if self.variant == "med":
-                logger.info("Loading model with 8-bit quantization...")
-                quantization_config = BitsAndBytesConfig(
-                    load_in_8bit=True,
-                    llm_int8_threshold=6.0,
-                    llm_int8_has_fp16_weight=False,
-                )
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    self.model_name,
-                    quantization_config=quantization_config,
-                    device_map="auto",
-                    torch_dtype=torch.float16,
-                )
-
-            elif self.variant == "cheap":
-                logger.info("Loading model with 4-bit quantization...")
-                quantization_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=torch.float16,
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_quant_type="nf4",
-                )
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    self.model_name,
-                    quantization_config=quantization_config,
-                    device_map="auto",
-                    torch_dtype=torch.float16,
-                )
-
-            else:
-                logger.info("Loading model in full precision...")
-                torch_dtype = {
-                    "float16": torch.float16,
-                    "bfloat16": torch.bfloat16,
-                    "auto": torch.bfloat16 if (self.device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16,
-                }.get(self.dtype, torch.float16)
-
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    self.model_name,
-                    torch_dtype=torch_dtype,
-                    device_map="auto" if self.device == "cuda" else None,
-                )
-                if self.device != "cuda":
-                    self.model = self.model.to(self.device)
-
-            self.model.eval()
-            logger.info("Model loaded successfully")
-
-            # Parameters count (approx)
-            try:
-                n_params = sum(p.numel() for p in self.model.parameters())
-                logger.info(f"Model size: {n_params/1e9:.2f}B parameters")
-            except Exception:
-                pass
-
-        except Exception as e:
-            logger.error(f"Failed to load model: {e}")
-            raise
-
-    def _synchronize_device(self):
+    def _synchronize_device(self) -> None:
         if self.device == "cuda":
             torch.cuda.synchronize()
-        elif self.device == "mps":
-            torch.mps.synchronize()
-
-    def _maybe_cleanup_memory(self, force: bool = False):
-        self._request_count += 1
-        if not force and not self._cleanup_per_request:
-            if self._request_count % self._cleanup_interval != 0:
-                return
-        if self.device == "cuda":
-            torch.cuda.empty_cache()
-        gc.collect()
-
-    def _warmup(self, iterations: int = 3):
-        logger.info(f"Warming up server ({iterations} iterations, deterministic)...")
-        try:
-            # A short deterministic warmup to populate caches
-            for _ in range(iterations):
-                _ = self.generate("Warmup", max_tokens=4, temperature=0.0, top_p=1.0, dataset_type="warmup", prompt_mode="slo")
-            logger.info("Warmup complete")
-        except Exception as e:
-            logger.warning(f"Warmup failed: {e}")
-
-    # ---------------------------------------------------------------------
-    # Inference
-    # ---------------------------------------------------------------------
 
     def _build_input_text(self, prompt: str) -> str:
-        """
-        If chat_template is available (Instruct models), wrap as:
-          system: <system>
-          user: <user>
-        Otherwise, return prompt verbatim.
-        """
-        if not self._supports_chat:
-            return prompt
-
         system, user = split_system_user(prompt)
-        if not user:
-            user = prompt
-            system = ""
-
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": user})
 
-        try:
-            return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        except Exception:
-            # Fallback to raw prompt if chat template fails
-            return prompt
+        # If the tokenizer has a chat template, use it; otherwise fall back.
+        if getattr(self.tokenizer, "chat_template", None):
+            return self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+        # Very simple fallback format
+        if system:
+            return f"SYSTEM: {system}\nUSER: {user}\nASSISTANT:"
+        return f"USER: {user}\nASSISTANT:"
+
+    def _warmup(self) -> None:
+        logger.info("Warming up server (3 iterations, deterministic)...")
+        warm_prompt = "You are a helpful assistant. Reply with a single letter: A."
+        for _ in range(3):
+            try:
+                # Use direct generation path to avoid involving the scheduler.
+                _ = self.generate(
+                    prompt=warm_prompt,
+                    dataset_type="mmlu",
+                    difficulty="easy",
+                    max_tokens=1,
+                    prompt_mode="slo",
+                )
+            except Exception as e:
+                logger.error(f"Warmup error: {e}")
+        logger.info("Warmup complete")
+
+    # -------------------------------
+    # Core HF generation (batch)
+    # -------------------------------
+
+    def _generate_hf_batch(
+        self,
+        prompts: List[str],
+        dataset_type: str,
+        max_tokens: int,
+        prompt_mode: str,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        require_all_final_answers: bool = False,
+    ) -> Tuple[List[str], List[Dict], float]:
+        """Run a single batched HF generate call.
+
+        Returns:
+          texts: list[str]
+          metrics_list: list[dict]  (one per sample, without queue_wait_ms)
+          lock_wait_ms: float       (time waiting on the GPU generation lock)
+        """
+
+        t0_total = time.perf_counter()
+
+        dataset_type = dataset_type.lower()
+        prompt_mode = prompt_mode.lower()
+        bsz = len(prompts)
+
+        # Build input texts
+        input_texts = [self._build_input_text(p) for p in prompts]
+
+        inputs = self.tokenizer(
+            input_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=4096,
+        )
+        if self.device == "cuda":
+            inputs = {k: v.to("cuda") for k, v in inputs.items()}
+
+        prompt_len = int(inputs["input_ids"].shape[1])
+
+        # Decoding strategy
+        do_sample = bool(prompt_mode != "slo" and temperature and float(temperature) > 0.0)
+
+        # Stopping criteria
+        stopping_criteria = None
+        if dataset_type == "gsm8k":
+            stopper = StopOnFinalAnswer(
+                tokenizer=self.tokenizer,
+                prompt_len=prompt_len,
+                require_all=bool(require_all_final_answers and bsz > 1),
+            )
+            stopping_criteria = StoppingCriteriaList([stopper])
+
+        # MMLU restriction
+        prefix_allowed_tokens_fn = None
+        if dataset_type == "mmlu":
+            # MMLU should output exactly one token: A/B/C/D.
+            max_tokens = 1
+
+            allowed_ids = self.mmlu_allowed_token_ids
+
+            def prefix_allowed_tokens_fn(batch_id: int, input_ids):
+                # Restrict the *first* generated token to {A,B,C,D} (and variants).
+                return allowed_ids
+
+        # Generation kwargs
+        gen_kwargs = {
+            "max_new_tokens": int(max_tokens),
+            "do_sample": do_sample,
+            "pad_token_id": int(self.tokenizer.pad_token_id),
+            "use_cache": True,
+        }
+        if do_sample:
+            gen_kwargs.update({"temperature": float(temperature), "top_p": float(top_p)})
+        if stopping_criteria is not None:
+            gen_kwargs["stopping_criteria"] = stopping_criteria
+        if prefix_allowed_tokens_fn is not None:
+            gen_kwargs["prefix_allowed_tokens_fn"] = prefix_allowed_tokens_fn
+
+        # Timing + lock
+        streamer = TimingStreamer(self._synchronize_device)
+
+        t_lock_req = time.perf_counter()
+        with self._generation_lock:
+            t_lock_acq = time.perf_counter()
+            lock_wait_ms = (t_lock_acq - t_lock_req) * 1000.0
+
+            self._synchronize_device()
+            t0_gen = time.perf_counter()
+
+            # NOTE: We avoid return_dict_in_generate/output_scores here for speed.
+            with torch.inference_mode():
+                sequences = self.model.generate(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs.get("attention_mask"),
+                    streamer=streamer,
+                    **gen_kwargs,
+                )
+
+            self._synchronize_device()
+            t1_gen = time.perf_counter()
+
+        total_gen_time = max(0.0, t1_gen - t0_gen)
+
+        first_tok_t = streamer.first_token_time
+        if first_tok_t is None:
+            # If for some reason streaming didn't fire, fall back to total time.
+            first_tok_t = t1_gen
+        ttft_s = max(0.0, first_tok_t - t0_gen)
+
+        # Decode outputs (only the generated tail)
+        texts: List[str] = []
+        out_lens: List[int] = []
+        for i in range(bsz):
+            gen_ids = sequences[i, prompt_len:]
+            out_lens.append(int(gen_ids.numel()))
+            text = self.tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+            texts.append(text)
+
+        # Compute tpot using decode time excluding TTFT.
+        decode_s = max(0.0, total_gen_time - ttft_s)
+
+        t1_total = time.perf_counter()
+        total_latency_s = max(0.0, t1_total - t0_total)
+
+        metrics_list: List[Dict] = []
+        for out_len in out_lens:
+            if out_len <= 1:
+                tpot_ms = 0.0
+            else:
+                tpot_ms = (decode_s * 1000.0) / float(out_len - 1)
+
+            throughput = (float(out_len) / total_gen_time) if total_gen_time > 0 else 0.0
+
+            metrics_list.append(
+                {
+                    "success": True,
+                    "ttft_ms": float(ttft_s * 1000.0),
+                    "tpot_ms": float(tpot_ms),
+                    "output_length": int(out_len),
+                    "throughput_tokens_per_sec": float(throughput),
+                    "total_latency_ms": float(total_latency_s * 1000.0),
+                    # queue_wait_ms is added by the caller (scheduler/direct)
+                    "variant": self.variant,
+                    "model": self.model_name,
+                    "device": self.device,
+                }
+            )
+
+        return texts, metrics_list, float(max(0.0, lock_wait_ms))
+
+    # -------------------------------
+    # Public API
+    # -------------------------------
 
     def generate(
         self,
@@ -340,162 +569,108 @@ class SingleVariantServer:
         max_tokens: Optional[int] = None,
         temperature: float = 0.0,
         top_p: float = 1.0,
-        difficulty: str = "medium",
-        dataset_type: str = "mmlu",
-        prompt_mode: str = "slo",
+        dataset_type: str = "gsm8k",
+        difficulty: str = "easy",
+        prompt_mode: str = "accuracy",
+        use_batching: Optional[bool] = None,
     ) -> Tuple[str, Dict]:
-        """
-        Generate response and collect latency metrics.
+        """Generate completion text plus metrics."""
 
-        Returns:
-            generated_text, metrics_dict
-        """
-        metrics: Dict = {
-            "success": False,
-            "ttft_ms": 0.0,
-            "tpot_ms": 0.0,
-            "output_length": 0,
-            "throughput_tokens_per_sec": 0.0,
-            "total_latency_ms": 0.0,
-            "variant": self.variant,
-            "model": self.model_name.split("/")[-1],
-            "device": self.device,
-        }
-
-        dataset_type = (dataset_type or "mmlu").lower().strip()
+        dataset_type = dataset_type.lower()
+        prompt_mode = prompt_mode.lower()
+        difficulty = difficulty.lower()
 
         if max_tokens is None:
-            max_tokens = get_max_tokens(difficulty=difficulty, dataset_type=dataset_type, prompt_mode=prompt_mode)
-
-        # MMLU: force 1 token output (we also restrict allowed tokens)
+            max_tokens = get_max_tokens(dataset_type, difficulty, prompt_mode)
         if dataset_type == "mmlu":
             max_tokens = 1
 
-        t0_total = time.perf_counter()
+        # Decide whether to route through the batcher.
+        batching_enabled = self._scheduler is not None
+        if use_batching is None:
+            # Default: only batch SLO mode. Accuracy evaluation is usually sequential.
+            use_batching = bool(batching_enabled and prompt_mode == "slo")
+
+        if use_batching:
+            req = _PendingRequest(
+                prompt=prompt,
+                dataset_type=dataset_type,
+                difficulty=difficulty,
+                max_tokens=int(max_tokens),
+                prompt_mode=prompt_mode,
+                temperature=float(temperature),
+                top_p=float(top_p),
+                enqueue_time=time.perf_counter(),
+                event=threading.Event(),
+            )
+            assert self._scheduler is not None
+            self._scheduler.submit(req)
+            req.event.wait()
+
+            if req.error:
+                return "", {
+                    "success": False,
+                    "error": req.error,
+                    "queue_wait_ms": 0.0,
+                    "ttft_ms": 0.0,
+                    "tpot_ms": 0.0,
+                    "output_length": 0,
+                    "throughput_tokens_per_sec": 0.0,
+                    "total_latency_ms": 0.0,
+                    "variant": self.variant,
+                    "model": self.model_name,
+                    "device": self.device,
+                }
+
+            return req.result_text or "", req.result_metrics or {}
+
+        # Direct (non-batched) generation.
+        texts, metrics_list, lock_wait_ms = self._generate_hf_batch(
+            prompts=[prompt],
+            dataset_type=dataset_type,
+            max_tokens=int(max_tokens),
+            prompt_mode=prompt_mode,
+            temperature=float(temperature),
+            top_p=float(top_p),
+            require_all_final_answers=False,
+        )
+
+        metrics = metrics_list[0]
+        metrics["queue_wait_ms"] = float(lock_wait_ms)
+        return texts[0], metrics
+
+    def cleanup(self) -> None:
+        """Free GPU memory."""
+        try:
+            if self._scheduler is not None:
+                self._scheduler.shutdown()
+        except Exception:
+            pass
 
         try:
-            input_text = self._build_input_text(prompt)
+            del self.model
+            del self.tokenizer
+        except Exception:
+            pass
 
-            # Tokenize
-            inputs = self.tokenizer(
-                input_text,
-                return_tensors="pt",
-                padding=False,
-                truncation=True,
-                max_length=4096,
-            )
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            input_len = int(inputs["input_ids"].shape[1])
-
-            self._synchronize_device()
-
-            # Prepare generation args
-            gen_kwargs = dict(
-                **inputs,
-                max_new_tokens=int(max_tokens),
-                return_dict_in_generate=True,
-                output_scores=False,
-                pad_token_id=self.tokenizer.eos_token_id,
-                use_cache=True,
-            )
-
-            # Sampling vs greedy
-            do_sample = bool(temperature and temperature > 0.0)
-            if do_sample:
-                gen_kwargs["do_sample"] = True
-                gen_kwargs["temperature"] = float(temperature)
-                gen_kwargs["top_p"] = float(top_p)
-            else:
-                gen_kwargs["do_sample"] = False
-
-            # TTFT timing streamer
-            streamer = TimingStreamer(sync_fn=self._synchronize_device)
-            gen_kwargs["streamer"] = streamer
-
-            # Dataset-specific controls
-            if dataset_type == "mmlu" and self._mmlu_allowed_token_ids:
-                prompt_len = input_len
-
-                def prefix_allowed_tokens_fn(batch_id, input_ids):
-                    # First generated token: must be A/B/C/D variants
-                    cur_len = input_ids.shape[-1]
-                    if cur_len == prompt_len:
-                        return self._mmlu_allowed_token_ids
-                    # After first token, allow eos only (shouldn't matter because max_new_tokens=1)
-                    return [self.tokenizer.eos_token_id]
-
-                gen_kwargs["prefix_allowed_tokens_fn"] = prefix_allowed_tokens_fn
-
-            stopping = None
-            if dataset_type == "gsm8k":
-                stopping = StoppingCriteriaList([StopOnFinalAnswer(self.tokenizer, prompt_len=input_len)])
-                gen_kwargs["stopping_criteria"] = stopping
-
-            # Generate
-            t0_gen = time.perf_counter()
-            outputs = self.model.generate(**gen_kwargs)
-            self._synchronize_device()
-            t1_gen = time.perf_counter()
-
-            # TTFT
-            if streamer.first_token_time is not None:
-                t_ttft = streamer.first_token_time - t0_gen
-            else:
-                t_ttft = t1_gen - t0_gen
-            metrics["ttft_ms"] = t_ttft * 1000.0
-
-            # Decode generated tokens (exclude prompt)
-            seq = outputs.sequences
-            if getattr(seq, 'ndim', 2) == 1:
-                generated_ids = seq[input_len:]
-            else:
-                generated_ids = seq[0, input_len:]
-            out_len = int(generated_ids.shape[0])
-            metrics["output_length"] = out_len
-
-            generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-
-            total_gen_time = max(t1_gen - t0_gen, 1e-6)
-
-            # TPOT (after first token)
-            t_decode = max(total_gen_time - t_ttft, 1e-6)
-            if out_len > 1:
-                metrics["tpot_ms"] = (t_decode * 1000.0) / (out_len - 1)
-            else:
-                metrics["tpot_ms"] = 0.0
-
-            metrics["throughput_tokens_per_sec"] = out_len / total_gen_time
-
-            # Total end-to-end latency
-            self._synchronize_device()
-            metrics["total_latency_ms"] = (time.perf_counter() - t0_total) * 1000.0
-
-            metrics["success"] = True
-
-            # Cleanup
-            del outputs
-            self._maybe_cleanup_memory()
-
-            return generated_text, metrics
-
-        except Exception as e:
-            logger.error(f"Error during generation: {e}")
-            metrics["success"] = False
-            metrics["error"] = str(e)
-            self._maybe_cleanup_memory()
-            return "", metrics
-
-    def get_gpu_stats(self) -> Dict:
-        return GPUMonitor.get_gpu_info()
-
-    def force_memory_cleanup(self):
-        self._maybe_cleanup_memory(force=True)
-        GPUMonitor.log_gpu_status("After cleanup: ")
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
-    # Simple smoke test (CPU-friendly model)
-    logger.info("Testing SingleVariantServer with a small model...")
-    srv = SingleVariantServer(model_name="gpt2", variant="base", device="cpu")
-    out, m = srv.generate("Answer: A", max_tokens=1, dataset_type="mmlu")
+    # Minimal smoke test (won't run without model access).
+    server = SingleVariantServer(
+        model_name="meta-llama/Llama-3.1-8B-Instruct",
+        variant="med",
+        device="auto",
+        enable_batching=True,
+        max_batch_size=4,
+        batch_wait_ms=8,
+    )
+    out, m = server.generate(
+        prompt="You are a helpful assistant. Reply with one letter: A.",
+        dataset_type="mmlu",
+        prompt_mode="slo",
+    )
     print(out, m)

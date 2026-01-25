@@ -109,7 +109,8 @@ class ClosedLoopLoadGenerator:
         dataset_type = ex.get("dataset", "unknown")
         difficulty = ex.get("difficulty", "medium")
 
-        start_time = time.time()
+        # When the worker thread begins executing.
+        worker_start_time = time.time()
         inference_metrics: Dict[str, Any] = {}
 
         try:
@@ -133,6 +134,20 @@ class ClosedLoopLoadGenerator:
             inference_metrics = {"success": False, "error": str(e)}
 
         end_time = time.time()
+
+        # Queue wait time should reflect *both*:
+        #  1) executor/client-side queuing (submit -> worker starts)
+        #  2) server-side queuing/scheduling (server-reported queue_wait_ms)
+        server_queue_ms = float(inference_metrics.get("queue_wait_ms", 0.0) or 0.0)
+        executor_queue_ms = max(0.0, (worker_start_time - submit_time) * 1000.0)
+        total_queue_ms = executor_queue_ms + max(0.0, server_queue_ms)
+
+        # Define start_time as "when inference *actually* starts" for metrics:
+        # submit_time + total_queue_ms
+        start_time = submit_time + (total_queue_ms / 1000.0)
+        if start_time > end_time:
+            # Extremely defensive clamp (shouldn't happen, but avoids negative inference_time_ms)
+            start_time = worker_start_time
 
         rm = RequestMetrics(
             request_id=request_id,

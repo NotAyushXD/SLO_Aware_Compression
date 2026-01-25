@@ -39,9 +39,12 @@ MMLU_MAX_NEW_TOKENS = {
 # GSM8K needs room to finish. Accuracy mode budgets are intentionally larger.
 GSM8K_MAX_NEW_TOKENS = {
     "slo": {
-        "easy": 64,
+        # SLO mode should be short, but still long enough to reliably reach
+        # FINAL_ANSWER on multi-step problems.
+        # Keeping the same cap across difficulties improves batching efficiency.
+        "easy": 96,
         "medium": 96,
-        "hard": 128,
+        "hard": 96,
     },
     "accuracy": {
         "easy": 256,
@@ -171,11 +174,19 @@ def build_gsm8k_prompt(example: Dict[str, Any], prompt_mode: str) -> Tuple[str, 
             "Solution:"
         )
     else:
-        # SLO mode: no few-shot, shorter instruction.
+        # SLO mode: keep the prompt short, but strongly steer the model to
+        # (1) be concise and (2) actually emit FINAL_ANSWER within the token cap.
+        # A tiny format-only example improves formatting reliability without
+        # adding a lot of tokens.
         user = (
-            "Solve the following math problem.\n"
-            "End with a final line of the form:\n"
+            "Solve the math problem.\n"
+            "Keep the solution concise (<= 6 short lines).\n"
+            "End with exactly:\n"
             "FINAL_ANSWER: <number>\n\n"
+            "Example (format only):\n"
+            "Problem: A book has 10 pages and you read 3 pages. How many pages are left?\n"
+            "Solution: 10 - 3 = 7\n"
+            "FINAL_ANSWER: 7\n\n"
             f"Problem: {question}\n\n"
             "Solution:"
         )
