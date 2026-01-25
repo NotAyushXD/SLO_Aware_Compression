@@ -1,384 +1,309 @@
 # run_baseline_evaluation.py
 """
-End-to-end baseline evaluation orchestration
-Runs complete pipeline: preprocessing → server → load tests → evaluation
+End-to-end baseline evaluation script.
+
+Supports:
+- Load tests (closed-loop concurrency) + metric export
+- Held-out accuracy evaluation (MMLU + GSM8K)
+- Two prompt modes:
+    * slo      : shorter prompts / smaller token budgets (for later SLO work)
+    * accuracy : stronger prompts / few-shot for GSM8K / higher token budgets
+
+New CLI flags (v7):
+  --prompt_mode {slo,accuracy}
+  --disable_slo_calibration
+  --skip_load_test
+  --model (alias for --model_name)
+
+If you see "unrecognized arguments: --prompt_mode ...", you are running an older
+copy of this file.
 """
 
-import json
+from __future__ import annotations
+
 import argparse
+import json
 import os
-from pathlib import Path
-import logging
 import time
+import logging
+from typing import Dict, Any, List
 
 from preprocessing import DataPreprocessor
 from server import SingleVariantServer
 from load_generator import ClosedLoopLoadGenerator
-
 from metrics import MetricsCalculator, calibrate_slos
 from evaluation import HeldOutEvaluator
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
 
-def load_data(data_dir: str = "data/processed"):
-    """Load preprocessed datasets from JSONL files"""
-    train_data = []
-    val_data = []
-    test_data = []
-    
-    for split_name, split_list in [("train", train_data), ("val", val_data), ("test", test_data)]:
-        path = os.path.join(data_dir, f"{split_name}_data.jsonl")
-        if os.path.exists(path):
-            logger.info(f"Loading {split_name} data from {path}")
-            with open(path, 'r') as f:
-                for line in f:
-                    if line.strip():
-                        split_list.append(json.loads(line))
-        else:
-            logger.warning(f"File not found: {path}")
-    
-    logger.info(f"Loaded data: train={len(train_data)}, val={len(val_data)}, test={len(test_data)}")
-    
-    return train_data, val_data, test_data
+def load_jsonl(path: str) -> List[Dict[str, Any]]:
+    data: List[Dict[str, Any]] = []
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            data.append(json.loads(line))
+    return data
 
 
-def main(args):
-    """Run end-to-end baseline evaluation pipeline"""
-    
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    logger.info("="*80)
-    logger.info("END-TO-END BASELINE EVALUATION: MED-ONLY SERVER (8-BIT QUANTIZATION)")
-    logger.info("="*80)
-    
-    # Step 1: Data preprocessing (if needed)
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def main(args: argparse.Namespace) -> None:
+    ensure_dir(args.output_dir)
+
+    logger.info("=" * 80)
+    logger.info("CONFIGURATION:")
+    logger.info(f"  Model: {args.model_name}")
+    logger.info(f"  Variant: {args.variant}")
+    logger.info(f"  Device: {args.device}")
+    logger.info(f"  Prompt mode: {args.prompt_mode}")
+    logger.info(f"  Requests per test: {args.num_requests}")
+    logger.info(f"  Concurrency levels: {args.concurrencies}")
+    logger.info(f"  Data subset: {args.data_subset}")
+    logger.info(f"  Output dir: {args.output_dir}")
+    logger.info(f"  SLO calibration disabled: {args.disable_slo_calibration}")
+    logger.info(f"  Skip load test: {args.skip_load_test}")
+    logger.info("=" * 80)
+
+    # Step 0: Preprocess (optional)
     if args.preprocess:
-        logger.info("\n[STEP 0] PREPROCESSING DATASETS")
-        logger.info("-"*80)
-        
-        preprocessor = DataPreprocessor(
-            data_dir=args.data_dir,
-            output_dir=args.processed_dir
-        )
-        train, val, test = preprocessor.run_pipeline()
-    
-    # Step 2: Load preprocessed data
-    logger.info("\n[STEP 1] LOADING DATA")
-    logger.info("-"*80)
-    
-    train_data, val_data, test_data = load_data(args.processed_dir)
-    
-    if not val_data or not test_data:
-        logger.error("No validation or test data found!")
-        return
-    
+        logger.info("\n[STEP 0] PREPROCESSING DATA")
+        logger.info("-" * 80)
+        pre = DataPreprocessor(data_dir=args.data_dir, output_dir=args.processed_dir)
+        train_data, val_data, test_data = pre.run_full_pipeline()
+    else:
+        # Step 1: Load data
+        logger.info("\n[STEP 1] LOADING DATA")
+        logger.info("-" * 80)
+
+        train_path = os.path.join(args.processed_dir, "train_data.jsonl")
+        val_path = os.path.join(args.processed_dir, "val_data.jsonl")
+        test_path = os.path.join(args.processed_dir, "test_data.jsonl")
+
+        logger.info(f"Loading train data from {train_path}")
+        train_data = load_jsonl(train_path)
+        logger.info(f"Loading val data from {val_path}")
+        val_data = load_jsonl(val_path)
+        logger.info(f"Loading test data from {test_path}")
+        test_data = load_jsonl(test_path)
+
+    logger.info(f"Loaded data: train={len(train_data)}, val={len(val_data)}, test={len(test_data)}")
+
     # Use subset for faster iteration (optional)
-    if args.data_subset > 0:
-        val_data = val_data[:args.data_subset]
-        test_data = test_data[:args.data_subset]
+    if args.data_subset and args.data_subset > 0:
+        val_data = val_data[: args.data_subset]
+        test_data = test_data[: args.data_subset]
         logger.info(f"Using subset: val={len(val_data)}, test={len(test_data)}")
-    
-    # Step 3: Initialize server
+
+    # Step 2: Initialize server
     logger.info("\n[STEP 2] INITIALIZING SERVER")
-    logger.info("-"*80)
-    
-    try:
-        server = SingleVariantServer(
-            model_name=args.model_name,
-            variant=args.variant,
-            device=args.device,
-            dtype=args.dtype
-        )
-    except Exception as e:
-        logger.error(f"Failed to initialize server: {e}")
-        return
-    
-    # Step 4: Run load tests at multiple concurrency levels
-    logger.info("\n[STEP 3] RUNNING LOAD TESTS")
-    logger.info("-"*80)
-    
-    # Check if SLOs are already calibrated
+    logger.info("-" * 80)
+
+    server = SingleVariantServer(
+        model_name=args.model_name,
+        variant=args.variant,
+        device=args.device,
+        dtype=args.dtype,
+    )
+
+    # Load/Calibrate SLOs (optional)
     slo_file = os.path.join(args.output_dir, "slo_thresholds.json")
     current_slos = None
-    
-    if os.path.exists(slo_file):
-        try:
-            with open(slo_file, 'r') as f:
-                current_slos = json.load(f)
-            logger.info(f"Loaded existing SLOs from {slo_file}")
-            logger.info(f"Using SLOs: {current_slos}")
-        except Exception as e:
-            logger.warning(f"Failed to load existing SLOs: {e}")
-    
-    load_test_results = {}
-    all_metrics_summary = []
-    all_raw_metrics = [] # Accumulate for calibration
-    
-    for concurrency in args.concurrencies:
-        logger.info(f"\n>>> Testing with concurrency={concurrency}")
-        
-        # Create load generator
-        load_gen = ClosedLoopLoadGenerator(
-            inference_func=server.generate,
-            max_concurrency=concurrency,
-            num_requests=args.num_requests,
-            data_loader=val_data
-        )
-        
-        # Run load test
-        start_time = time.time()
-        metrics = load_gen.run()
-        load_duration = time.time() - start_time
-        
-        # Calculate metrics
-        all_raw_metrics.extend(metrics)
-        calc = MetricsCalculator(metrics, slo_dict=current_slos)
-        test_metrics = calc.compute_all_metrics()
-        load_test_results[concurrency] = test_metrics
-        
-        # Print report
-        calc.print_report(
-            title=f"LOAD TEST RESULTS (Concurrency {concurrency})"
-        )
-        
-        # Save detailed metrics to JSON
-        metrics_file = os.path.join(
-            args.output_dir,
-            f"metrics_concurrency_{concurrency}.json"
-        )
-        calc.save_metrics(metrics_file)
-        
-        # Save individual request logs
-        requests_file = os.path.join(
-            args.output_dir,
-            f"requests_concurrency_{concurrency}.jsonl"
-        )
-        load_gen.save_metrics(requests_file)
-        
-        # Summary entry
-        summary_entry = {
-            "concurrency": concurrency,
-            "num_requests": args.num_requests,
-            "duration_sec": load_duration,
-            "success_rate": test_metrics["summary"]["success_rate"],
-            "throughput_tokens_per_sec": test_metrics["summary"]["throughput_tokens_per_sec"],
-            "ttft_p99_ms": test_metrics["ttft"]["p99"],
-            "tpot_p95_ms": test_metrics["tpot"]["p95"],
-            "e2e_p99_ms": test_metrics["e2e_latency"]["p99"],
-            "slo_compliance": test_metrics["summary"]["slo_compliance"],
-            "slo_violations": test_metrics["summary"]["slo_violations"]
-        }
-        all_metrics_summary.append(summary_entry)
-        
-    # Calibrate SLOs if not already loaded
-    # if not current_slos and all_raw_metrics:
-    if False:
-        logger.info("\n[STEP 3.5] CALIBRATING SLOs")
-        logger.info("-"*80)
-        
-        current_slos = calibrate_slos(all_raw_metrics, percentile=95.0)
-        
-        # Save calibrated SLOs
-        with open(slo_file, 'w') as f:
-            json.dump(current_slos, f, indent=2)
-        logger.info(f"Saved calibrated SLOs to {slo_file}")
-        
-        # Re-calculate compliance for summary with new SLOs
-        logger.info("Recalculating compliance with new SLOs...")
-        all_metrics_summary = []
-        
-        # Need to regroup metrics by concurrency to rebuild summary correctly
-        # This assumes we want the summary table to reflect the new SLOs
-        # Since we stored test_metrics in load_test_results, we can recompute
-        # But we need raw metrics per concurrency. load_test_results only has the calculated dict.
-        # However, we can re-iterate over the logic if we kept the raw metrics separated.
-        # Simplification: Just update `all_metrics_summary` by re-running MetricsCalculator per concurrency slice?
-        # Better: iterate through load_test_results keys, reload the metrics from file or memory?
-        # We didn't keep metrics in memory by concurrency, only 'all_raw_metrics'.
-        # But we saved `requests_concurrency_{concurrency}.jsonl`. 
-        # Actually, in the loop we can keep them in memory if not too huge.
-        # Let's just fix the summary table retrospectively.
-        # Or, simpler: We only really need the compliance numbers for the table.
-        pass # Moving on, next run will use them. Or we can just print them.
-    
-    # Step 5: Evaluate accuracy on held-out test set
-    logger.info("\n[STEP 4] EVALUATING ACCURACY")
-    logger.info("-"*80)
-    
-    try:
-        evaluator = HeldOutEvaluator(
-            model=server,
-            data_loader=test_data,
-            batch_size=32
-        )
-        eval_results, detailed_predictions = evaluator.evaluate()
-        
-        # Save eval results
-        eval_file = os.path.join(args.output_dir, "eval_results.json")
-        with open(eval_file, 'w') as f:
-            json.dump(eval_results, f, indent=2)
-        
-        logger.info(f"Saved evaluation results to {eval_file}")
-        
-    except Exception as e:
-        logger.error(f"Evaluation failed: {e}")
-        eval_results = {}
-        detailed_predictions = []
-    
-    # Step 6: Summary report
-    logger.info("\n" + "="*80)
-    logger.info("FINAL SUMMARY REPORT")
-    logger.info("="*80)
-    
-    print("\nLoad Test Results by Concurrency:")
-    print(f"{'Concurrency':<12} {'Throughput':<18} {'TTFT P99':<12} {'TPOT P95':<12} {'E2E P99':<12} {'SLO Compl':<10}")
-    print("-" * 80)
-    
-    for summary in all_metrics_summary:
-        print(f"{summary['concurrency']:<12} "
-              f"{summary['throughput_tokens_per_sec']:<18.1f} "
-              f"{summary['ttft_p99_ms']:<12.1f} "
-              f"{summary['tpot_p95_ms']:<12.1f} "
-              f"{summary['e2e_p99_ms']:<12.1f} "
-              f"{summary['slo_compliance']*100:<10.1f}%")
-    
-    print("\nAccuracy Results:")
-    if eval_results:
-        for dataset_type in sorted(eval_results.keys()):
-            if dataset_type not in ["overall", "by_difficulty"]:
-                result = eval_results[dataset_type]
-                if isinstance(result, dict):
-                    # Use 'accuracy' if available, otherwise 'em', default to 0
-                    acc = result.get('accuracy', result.get('em', 0))
-                    correct = result.get('correct_count', 0)
-                    total = result.get('total_count', 0)
-                    print(f"  {dataset_type.upper():<10s}: {acc*100:6.2f}% ({correct}/{total})")
-        
-        overall = eval_results.get("overall", {})
-        if isinstance(overall, dict):
-            acc = overall.get('accuracy', overall.get('em', 0))
-            correct = overall.get('correct_count', 0)
-            total = overall.get('total_count', 0)
-            print(f"  {'OVERALL':<10s}: {acc*100:6.2f}% ({correct}/{total})")
+
+    if not args.disable_slo_calibration:
+        # Try to load existing thresholds
+        if os.path.exists(slo_file):
+            try:
+                with open(slo_file, "r") as f:
+                    current_slos = json.load(f)
+                logger.info(f"Loaded existing SLOs from {slo_file}")
+            except Exception as e:
+                logger.warning(f"Failed to load existing SLOs: {e}")
+
+    # Step 3: Run load tests (optional)
+    logger.info("\n[STEP 3] RUNNING LOAD TESTS")
+    logger.info("-" * 80)
+
+    load_test_results: Dict[int, Any] = {}
+    all_metrics_summary: List[Dict[str, Any]] = []
+    all_raw_metrics = []
+
+    if args.skip_load_test:
+        logger.info("Skipping load tests (--skip_load_test).")
     else:
-        print("  No evaluation results available")
-    
-    # Save summary
+        for concurrency in args.concurrencies:
+            logger.info(f"\n>>> Testing with concurrency={concurrency}")
+
+            load_gen = ClosedLoopLoadGenerator(
+                inference_func=server.generate,
+                max_concurrency=concurrency,
+                num_requests=args.num_requests,
+                data_loader=val_data,
+                prompt_mode=args.prompt_mode,
+            )
+
+            start_time = time.time()
+            request_metrics = load_gen.run()
+            duration = time.time() - start_time
+
+            all_raw_metrics.extend(request_metrics)
+
+            calc = MetricsCalculator(request_metrics, slo_dict=current_slos)
+            test_metrics = calc.compute_all_metrics()
+            load_test_results[concurrency] = test_metrics
+
+            # Print report
+            calc.print_report(title=f"LOAD TEST RESULTS (Concurrency {concurrency})")
+
+            # Save metrics JSON
+            metrics_file = os.path.join(args.output_dir, f"metrics_concurrency_{concurrency}.json")
+            calc.save_metrics(metrics_file)
+
+            # Save raw request logs JSONL
+            requests_file = os.path.join(args.output_dir, f"requests_concurrency_{concurrency}.jsonl")
+            load_gen.save_metrics(requests_file)
+
+            all_metrics_summary.append({
+                "concurrency": concurrency,
+                "num_requests": args.num_requests,
+                "duration_sec": duration,
+                "success_rate": test_metrics["summary"]["success_rate"],
+                "throughput_tokens_per_sec": test_metrics["summary"]["throughput_tokens_per_sec"],
+                "ttft_p99_ms": test_metrics["ttft"]["p99"],
+                "tpot_p95_ms": test_metrics["tpot"]["p95"],
+                "e2e_p99_ms": test_metrics["e2e_latency"]["p99"],
+                "slo_compliance": test_metrics["summary"]["slo_compliance"],
+                "slo_violations": test_metrics["summary"]["slo_violations"],
+            })
+
+        # Optional SLO calibration: only if enabled and we don't already have SLOs
+        if (not args.disable_slo_calibration) and (current_slos is None) and all_raw_metrics:
+            logger.info("\n[STEP 3.5] CALIBRATING SLOs (measurement-only)")
+            logger.info("-" * 80)
+
+            current_slos = calibrate_slos(all_raw_metrics, percentile=95.0)
+
+            # Save calibrated SLOs
+            try:
+                with open(slo_file, "w") as f:
+                    json.dump(current_slos, f, indent=2)
+                logger.info(f"Saved calibrated SLOs to {slo_file}")
+            except Exception as e:
+                logger.warning(f"Failed to write {slo_file}: {e}")
+
+    # Step 4: Evaluate accuracy
+    logger.info("\n[STEP 4] EVALUATING ACCURACY")
+    logger.info("-" * 80)
+
+    evaluator = HeldOutEvaluator(server, test_data, batch_size=32)
+    eval_results, detailed_predictions = evaluator.evaluate(prompt_mode=args.prompt_mode, verbose=args.verbose_eval)
+
+    # Step 5: Save results
+    logger.info("\n[STEP 5] SAVING OUTPUTS")
+    logger.info("-" * 80)
+
+    # Save eval results json
+    eval_out_file = os.path.join(args.output_dir, "eval_results.json")
+    with open(eval_out_file, "w") as f:
+        json.dump(eval_results, f, indent=2)
+    logger.info(f"Saved evaluation results to {eval_out_file}")
+
+    # Save summary json
     summary_file = os.path.join(args.output_dir, "summary.json")
-    with open(summary_file, 'w') as f:
+    with open(summary_file, "w") as f:
         json.dump({
-            "load_test_summary": all_metrics_summary,
-            "eval_results": eval_results,
             "config": {
                 "model_name": args.model_name,
-                "variant": "med",
+                "variant": args.variant,
+                "device": args.device,
+                "dtype": args.dtype,
+                "prompt_mode": args.prompt_mode,
                 "num_requests": args.num_requests,
                 "concurrencies": args.concurrencies,
-                "device": args.device
-            }
+                "data_subset": args.data_subset,
+                "disable_slo_calibration": args.disable_slo_calibration,
+                "skip_load_test": args.skip_load_test,
+            },
+            "slo_thresholds": current_slos,
+            "load_test_results": load_test_results,
+            "eval_results": eval_results,
         }, f, indent=2)
-    
+    logger.info(f"Saved overall summary to {summary_file}")
+
     # Save Excel report
     try:
         import pandas as pd
+
         excel_file = os.path.join(args.output_dir, "performance_summary.xlsx")
-        
-        # Prepare DataFrames
+
         df_load = pd.DataFrame(all_metrics_summary)
-        
-        # Flatten eval results for Accuracy sheet
-        eval_rows = []
-        if eval_results:
-            for dataset_type, res in eval_results.items():
-                row = res.copy()
-                row['dataset'] = dataset_type
-                eval_rows.append(row)
-        df_eval = pd.DataFrame(eval_rows)
-        
-        # Detailed outputs
+        df_eval = pd.DataFrame([
+            {"dataset": k, **v} for k, v in eval_results.items()
+        ]) if eval_results else pd.DataFrame()
         df_details = pd.DataFrame(detailed_predictions)
-        
+
         with pd.ExcelWriter(excel_file) as writer:
-            df_load.to_excel(writer, sheet_name='Load Test Metrics', index=False)
+            df_load.to_excel(writer, sheet_name="Load Test Metrics", index=False)
             if not df_eval.empty:
-                df_eval.to_excel(writer, sheet_name='Accuracy Metrics', index=False)
+                df_eval.to_excel(writer, sheet_name="Accuracy Metrics", index=False)
             if not df_details.empty:
-                df_details.to_excel(writer, sheet_name='Model Outputs', index=False)
-                
+                df_details.to_excel(writer, sheet_name="Model Outputs", index=False)
+
         logger.info(f"Saved Excel summary to {excel_file}")
-        
+
     except ImportError:
-        logger.warning("pandas or openpyxl not installed, skipping Excel export")
+        logger.warning("pandas/openpyxl not installed, skipping Excel export")
     except Exception as e:
         logger.error(f"Failed to save Excel report: {e}")
 
-
-    logger.info("\n" + "="*80)
+    logger.info("\n" + "=" * 80)
     logger.info("BASELINE EVALUATION COMPLETE")
     logger.info(f"Results saved to: {args.output_dir}")
-    logger.info("="*80)
-    logger.info("\nFiles generated:")
-    logger.info(f"  - summary.json (overall summary)")
-    logger.info(f"  - performance_summary.xlsx (Excel report)")
-    logger.info(f"  - eval_results.json (accuracy metrics)")
-    for concurrency in args.concurrencies:
-        logger.info(f"  - metrics_concurrency_{concurrency}.json")
-        logger.info(f"  - requests_concurrency_{concurrency}.jsonl")
+    logger.info("=" * 80)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="End-to-end baseline evaluation")
+
+    p.add_argument("--preprocess", action="store_true", help="Run preprocessing to create processed jsonl files.")
+    p.add_argument("--data_dir", type=str, default="data/raw", help="Raw data directory")
+    p.add_argument("--processed_dir", type=str, default="data/processed", help="Processed data directory")
+    p.add_argument("--data_subset", type=int, default=0, help="Use first N examples from val/test for faster runs (0 = all)")
+
+    # Model/server config
+    p.add_argument("--model_name", "--model", dest="model_name", type=str, default="meta-llama/Llama-3.1-8B",
+                   help="HF model name (alias: --model)")
+    p.add_argument("--device", type=str, default="auto", help="auto|cuda|cpu|mps")
+    p.add_argument("--dtype", type=str, default="auto", help="auto|float16|bfloat16")
+    p.add_argument("--variant", type=str, default="med", choices=["base", "med", "cheap"],
+                   help="base=fp16/bf16, med=8-bit, cheap=4-bit")
+
+    # Benchmark controls
+    p.add_argument("--num_requests", type=int, default=10, help="Requests per load test")
+    p.add_argument("--concurrencies", type=int, nargs="+", default=[1, 2, 4], help="Concurrency levels to test")
+    p.add_argument("--output_dir", type=str, default="outputs", help="Where to write metrics and reports")
+
+    # New (v7)
+    p.add_argument("--prompt_mode", type=str, choices=["slo", "accuracy"], default="slo",
+                   help="Prompt mode: accuracy (best correctness) vs slo (shorter outputs for later SLO work)")
+    p.add_argument("--disable_slo_calibration", action="store_true",
+                   help="Disable SLO calibration and ignore slo_thresholds.json.")
+    p.add_argument("--skip_load_test", action="store_true",
+                   help="Skip load tests and only run accuracy evaluation.")
+    p.add_argument("--verbose_eval", action="store_true",
+                   help="Print a few example prompts/outputs during evaluation.")
+
+    return p
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="End-to-end baseline MED-only server evaluation"
-    )
-    
-    # Data configuration
-    parser.add_argument("--preprocess", action="store_true",
-                       help="Run preprocessing (download and process datasets)")
-    parser.add_argument("--data_dir", default="data/raw",
-                       help="Raw data directory")
-    parser.add_argument("--processed_dir", default="data/processed",
-                       help="Processed data directory")
-    parser.add_argument("--data_subset", type=int, default=0,
-                       help="Use subset of data (0=all, >0=limit to N examples)")
-    
-    # Model configuration
-    parser.add_argument("--model_name", 
-                       default="meta-llama/Llama-3.1-8B",
-                       help="HuggingFace model name")
-    parser.add_argument("--device", default="cuda",
-                       help="Device: 'cuda' or 'cpu'")
-    parser.add_argument("--dtype", default="auto",
-                       help="Data type: 'auto', 'float16', 'bfloat16'")
-    parser.add_argument("--variant", default="med",
-                       help="Server variant: 'base', 'med', 'cheap'")
-    
-    # Load test configuration
-    parser.add_argument("--num_requests", type=int, default=5000,
-                       help="Number of requests per concurrency level")
-    parser.add_argument('--concurrencies', 
-                    nargs='+', 
-                    type=int,
-                    default=[1, 4, 8],
-                    help='List of concurrency levels')
-
-    
-    # Output configuration
-    parser.add_argument("--output_dir", default="results/baseline_med",
-                       help="Output directory for results")
-    
-    args = parser.parse_args()
-    
-    logger.info(f"Configuration:")
-    logger.info(f"  Model: {args.model_name}")
-    logger.info(f"  Device: {args.device}")
-    logger.info(f"  Requests per test: {args.num_requests}")
-    logger.info(f"  Concurrency levels: {args.concurrencies}")
-    logger.info(f"  Output dir: {args.output_dir}")
-    
-    main(args)
+    parser = build_parser()
+    main(parser.parse_args())

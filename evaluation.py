@@ -1,19 +1,26 @@
+# evaluation.py
 """
-CRITICAL FIX: Proper answer extraction to catch hallucinations
+Evaluation utilities for MMLU + GSM8K.
 
-Previous issue: Model outputs wrong problem (e.g., "Linda is painting...")
-This should be caught by answer extraction and marked as WRONG.
+Key goals (for your current debugging phase):
+- Strict answer extraction (no "grab the last number in the text" fallbacks).
+- Separate "format adherence" from "reasoning correctness" so you can see
+  whether accuracy is low because:
+    (a) the model didn't follow output format, OR
+    (b) it followed format but got the answer wrong.
 
-New logic:
-  1. Extract ONLY what matches expected format
-  2. If no valid answer found → mark as INCORRECT
-  3. Track hallucination_detected for debugging
+This is especially important for GSM8K where many failures come from
+missing FINAL_ANSWER lines or truncation.
 """
+
+from __future__ import annotations
 
 import re
 import json
 import logging
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Any
+
+from prompt_templates import build_llama_formatted_prompt
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,371 +28,197 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from prompt_templates import build_llama_formatted_prompt
 
 class EvaluationMetrics:
-    """Evaluate model predictions against ground truth"""
-    
     @staticmethod
-    def extract_answer(response: str, dataset_type: str) -> str:
-        response = response.strip()
+    def extract_mmlu_answer(text: str) -> str:
+        if not text:
+            return ""
+        t = text.strip().upper()
+
+        # 1) "ANSWER: B" / "FINAL ANSWER: C"
+        m = re.search(r"(?:FINAL\s*ANSWER|ANSWER|CORRECT\s*ANSWER)\s*[:=\s]*([A-D])\b", t)
+        if m:
+            return m.group(1)
+
+        # 2) Single-letter response (optionally with punctuation)
+        m = re.fullmatch(r"\s*([A-D])[\.\)]?\s*", t)
+        if m:
+            return m.group(1)
+
+        # 3) First line is a single letter
+        first = t.splitlines()[0].strip() if t.splitlines() else t.strip()
+        m = re.fullmatch(r"([A-D])[\.\)]?", first)
+        if m:
+            return m.group(1)
+
+        return ""
+
+    @staticmethod
+    def extract_gsm8k_answer(text: str) -> str:
+        """
+        STRICT extraction: ONLY accept answers on a line that starts with FINAL_ANSWER.
+
+        Accept examples:
+            FINAL_ANSWER: 7
+            FINAL_ANSWER: 7.0
+            final_answer: -12
+
+        Reject:
+            any standalone numbers without FINAL_ANSWER
+        """
+        if not text:
+            return ""
+
+        matches = re.findall(
+            r"^\s*FINAL_ANSWER\s*[:=\s]*([-+]?\d+(?:\.\d+)?)\s*$",
+            text,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        if not matches:
+            return ""
+        # If the model prints multiple FINAL_ANSWER lines, take the last.
+        return matches[-1].strip()
+
+    @staticmethod
+    def is_correct(pred_text: str, truth: str, dataset_type: str) -> Tuple[bool, str, bool]:
+        """
+        Returns:
+            (is_correct, extracted_answer, format_ok)
+        """
+        dataset_type = (dataset_type or "").lower().strip()
+        truth = (truth or "").strip()
 
         if dataset_type == "mmlu":
-            return EvaluationMetrics.extract_mmlu_answer(response)
-        elif dataset_type == "gsm8k":
-            return EvaluationMetrics.extract_gsm8k_answer(response)
+            extracted = EvaluationMetrics.extract_mmlu_answer(pred_text)
+            format_ok = extracted != ""
+            return (format_ok and extracted == truth.upper(), extracted, format_ok)
 
-        return ""
+        if dataset_type == "gsm8k":
+            extracted = EvaluationMetrics.extract_gsm8k_answer(pred_text)
+            format_ok = extracted != ""
+            if not format_ok:
+                return (False, "", False)
+            try:
+                pred_val = float(extracted)
+                truth_val = float(truth)
+                return (abs(pred_val - truth_val) < 1e-6, extracted, True)
+            except Exception:
+                return (False, extracted, True)
 
-    @staticmethod
-    def extract_mmlu_answer(response: str) -> str:
-        """
-        Extract a single valid MMLU answer: A, B, C, or D.
-
-        Accepted formats:
-        - "A"
-        - "ANSWER: B"
-        - "The correct answer is C"
-        - "D."
-        """
-
-        if not response:
-            return ""
-
-        text = response.strip().upper()
-
-        # Strategy 1: Explicit answer markers
-        match = re.search(
-            r'(?:FINAL\s+ANSWER|ANSWER|CORRECT\s+ANSWER)\s*[:=\s]*([A-D])\b',
-            text
-        )
-
-        if match:
-            return match.group(1)
-
-        # Strategy 2: Single-letter response (possibly with punctuation)
-        match = re.fullmatch(r'\s*([A-D])[\.\)]?\s*', text)
-        if match:
-            return match.group(1)
-
-        # Strategy 3: First non-empty line is a single letter
-        first_line = text.splitlines()[0].strip()
-        match = re.fullmatch(r'([A-D])[\.\)]?', first_line)
-        if match:
-            return match.group(1)
-
-        # Anything else is INVALID
-        return ""
+        return (False, "", False)
 
     @staticmethod
-    def extract_gsm8k_answer(response: str) -> str:
-        """
-        Extract GSM8K numeric answer.
+    def evaluate_group(preds: List[str], truths: List[str], dataset_type: str) -> Dict[str, Any]:
+        correct = 0
+        format_ok = 0
+        total = len(preds)
 
-        Expected format:
-        FINAL_ANSWER: <number>
+        for p, t in zip(preds, truths):
+            ok, _, fmt = EvaluationMetrics.is_correct(p, t, dataset_type)
+            correct += int(ok)
+            format_ok += int(fmt)
 
-        Rejects:
-        - Numbers embedded in text
-        - Multiple numbers
-        - No explicit final answer
-        """
-
-        if not response:
-            return ""
-
-        # Strict FINAL_ANSWER extraction
-        match = re.search(
-            r'FINAL_ANSWER\s*[:=\s]*([-+]?\d+(?:\.\d+)?)',
-            response,
-            re.IGNORECASE
-        )
-
-        if match:
-            return match.group(1)
-
-        return ""
-
-    @staticmethod
-    def detect_hallucination(response: str, dataset_type: str) -> bool:
-        if not response:
-            return False
-
-        response_lower = response.lower()
-
-        hallucination_keywords = {
-            "mmlu": ["linda", "mason", "john", "mary", "sarah"],
-            "gsm8k": ["linda", "painting", "bedroom", "attic"]
-        }
-
-        for kw in hallucination_keywords.get(dataset_type, []):
-            if kw in response_lower:
-                return True
-
-        return False
-
-    @staticmethod
-    def exact_match_mmlu(prediction: str, ground_truth: str) -> bool:
-        extracted = EvaluationMetrics.extract_mmlu_answer(prediction)
-        if not extracted:
-            return False
-        return extracted == ground_truth.strip().upper()
-    
-    @staticmethod
-    def exact_match_gsm8k(prediction: str, ground_truth: str) -> bool:
-        extracted = EvaluationMetrics.extract_gsm8k_answer(prediction)
-        if not extracted:
-            return False
-
-        try:
-            pred = float(extracted)
-            truth = float(ground_truth)
-            return abs(pred - truth) < 1e-6
-        except ValueError:
-            return False
-    
-    @staticmethod
-    def evaluate_batch(
-        predictions: List[str],
-        ground_truths: List[str],
-        dataset_type: str
-    ) -> Dict:
-        """
-        Evaluate batch of predictions.
-        
-        Args:
-            predictions: List of generated texts
-            ground_truths: List of correct answers
-            dataset_type: 'mmlu' or 'gsm8k'
-        
-        Returns:
-            Dict with accuracy, correct_count, total_count
-        """
-        assert len(predictions) == len(ground_truths), f"Mismatch: {len(predictions)} predictions vs {len(ground_truths)} truths"
-        
-        correct_count = 0
-        hallucination_count = 0
-        
-        for pred, truth in zip(predictions, ground_truths):
-            # Check for hallucination first
-            is_hall = EvaluationMetrics.detect_hallucination(pred, dataset_type)
-            if is_hall:
-                hallucination_count += 1
-            
-            # Check if answer matches
-            if dataset_type == "mmlu":
-                extracted = EvaluationMetrics.extract_mmlu_answer(pred)
-                is_correct = extracted != "" and extracted == truth.strip().upper()
-            elif dataset_type == "gsm8k":
-                extracted = EvaluationMetrics.extract_gsm8k_answer(pred)
-                is_correct = extracted != "" and EvaluationMetrics.exact_match_gsm8k(pred, truth)
-            else:
-                is_correct = False
-            
-            if is_correct:
-                correct_count += 1
-        
-        total = len(predictions)
-        accuracy = correct_count / max(total, 1)
-        
         return {
-            "accuracy": accuracy,
-            "em": accuracy,
-            "correct_count": correct_count,
+            "accuracy": correct / max(total, 1),
+            "correct_count": correct,
             "total_count": total,
-            "hallucination_count": hallucination_count,
-            "hallucination_rate": hallucination_count / max(total, 1)
+            "format_ok_count": format_ok,
+            "format_ok_rate": format_ok / max(total, 1),
+            "format_fail_count": total - format_ok,
         }
 
 
 class HeldOutEvaluator:
-    """Evaluate model on held-out test set"""
-    
-    def __init__(self, model, data_loader: List[Dict], batch_size: int = 32):
-        """
-        Args:
-            model: Server object with generate method
-            data_loader: List of prompt, answer, dataset, ... dicts
-            batch_size: Batch size for display logging
-        """
+    def __init__(self, model, data_loader: List[Dict[str, Any]], batch_size: int = 32):
         self.model = model
         self.data_loader = data_loader
         self.batch_size = batch_size
-    
-    def evaluate(self) -> Tuple[Dict, List[Dict]]:
-        """
-        Run evaluation on held-out test set.
-        
-        Returns:
-            Tuple containing:
-            - Dict with per-dataset and overall results
-            - List of detailed prediction dictionaries
-        """
+
+    def evaluate(self, prompt_mode: str = "slo", verbose: bool = False) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         logger.info("=" * 70)
-        logger.info(f"EVALUATING ON {len(self.data_loader)} EXAMPLES")
+        logger.info(f"EVALUATING ON {len(self.data_loader)} EXAMPLES (prompt_mode={prompt_mode})")
         logger.info("=" * 70)
-        
-        all_predictions = []
-        all_ground_truths = []
-        all_dataset_types = []
-        all_prompts = []
-        all_hallucinations = []
-        detailed_results = []
-        
-        for i, example in enumerate(self.data_loader):
-            try:
-                dataset_type = example.get("dataset", "mmlu")
-                formatted_prompt, max_tokens, stops = build_llama_formatted_prompt(
-                        example, dataset_type
-                    )
-                
-                # Generate
-                generated_text, metrics = self.model.generate(
-                                            prompt=formatted_prompt, 
-                                            max_tokens=max_tokens,
-                                            difficulty=example.get("difficulty", "medium")
-                                        )
-                print(formatted_prompt)
-                print(generated_text)
-                print("_______________________")
-                
-                all_predictions.append(generated_text)
-                all_ground_truths.append(example.get("answer", ""))
-                all_dataset_types.append(dataset_type)
-                all_prompts.append(formatted_prompt)
-                
-                # Check for hallucination
-                is_hallucination = EvaluationMetrics.detect_hallucination(generated_text, dataset_type)
-                all_hallucinations.append(is_hallucination)
-            
-            except Exception as e:
-                logger.error(f"Failed to generate for example {i}: {e}")
-                all_predictions.append("")
-                all_ground_truths.append(example.get("answer", ""))
-                all_dataset_types.append(example.get("dataset", "mmlu"))
-                all_prompts.append("")
-                all_hallucinations.append(False)
-            
-            if (i + 1) % self.batch_size == 0:
-                logger.info(f"Generated {i + 1}/{len(self.data_loader)} predictions")
-        
-        # Evaluate by dataset type
-        results = {}
-        for dataset_type in set(all_dataset_types):
-            indices = [j for j, dt in enumerate(all_dataset_types) if dt == dataset_type]
-            preds = [all_predictions[j] for j in indices]
-            truths = [all_ground_truths[j] for j in indices]
-            prompts = [all_prompts[j] for j in indices]
-            hallucinations = [all_hallucinations[j] for j in indices]
-            
-            result = EvaluationMetrics.evaluate_batch(preds, truths, dataset_type)
-            results[dataset_type] = result
-            
-            logger.info(f"\n{dataset_type.upper()} Results")
-            logger.info(f"  Accuracy: {result['accuracy']*100:.2f}%")
-            logger.info(f"  Correct: {result['correct_count']}/{result['total_count']}")
-            logger.info(f"  ⚠️ Hallucination Rate: {result['hallucination_rate']*100:.2f}%")
-            
-            # Build detailed results
-            for ptext, ttext, predtext, is_hall in zip(prompts, truths, preds, hallucinations):
-                extracted = EvaluationMetrics.extract_answer(predtext, dataset_type)
-                
-                if dataset_type == "mmlu":
-                    is_correct = EvaluationMetrics.exact_match_mmlu(predtext, ttext)
-                elif dataset_type == "gsm8k":
-                    is_correct = EvaluationMetrics.exact_match_gsm8k(predtext, ttext)
-                else:
-                    is_correct = False
-                
-                detailed_results.append({
-                    "dataset": dataset_type,
-                    "prompt": ptext,
-                    "ground_truth": ttext,
-                    "prediction": predtext,
-                    "extracted_answer": extracted,
-                    "is_correct": is_correct,
-                    "is_hallucination": is_hall,
-                    "extracted_answer_length": len(extracted),
-                    "binary_score": 1.0 if is_correct else 0.0
-                })
-        
-        # Overall results
-        overall_correct = sum(r["correct_count"] for r in results.values())
-        overall_total = sum(r["total_count"] for r in results.values())
-        
+
+        preds_by_type: Dict[str, List[str]] = {}
+        truths_by_type: Dict[str, List[str]] = {}
+        detailed: List[Dict[str, Any]] = []
+
+        for i, ex in enumerate(self.data_loader):
+            dataset_type = ex.get("dataset", "mmlu")
+            formatted_prompt, max_tokens, _stops = build_llama_formatted_prompt(ex, dataset_type, prompt_mode=prompt_mode)
+
+            # Generate
+            pred_text, inf_metrics = self.model.generate(
+                prompt=formatted_prompt,
+                max_tokens=max_tokens,
+                difficulty=ex.get("difficulty", "medium"),
+                dataset_type=dataset_type,
+                prompt_mode=prompt_mode,
+            )
+
+            truth = ex.get("answer", "")
+            ok, extracted, fmt_ok = EvaluationMetrics.is_correct(pred_text, truth, dataset_type)
+
+            preds_by_type.setdefault(dataset_type, []).append(pred_text)
+            truths_by_type.setdefault(dataset_type, []).append(truth)
+
+            detailed.append({
+                "dataset": dataset_type,
+                "difficulty": ex.get("difficulty", "medium"),
+                "prompt_mode": prompt_mode,
+                "prompt": formatted_prompt,
+                "ground_truth": truth,
+                "prediction": pred_text,
+                "extracted_answer": extracted,
+                "format_ok": fmt_ok,
+                "is_correct": ok,
+                "binary_score": int(ok),
+                # keep a few useful debug fields from inference metrics (if present)
+                "output_length": inf_metrics.get("output_length"),
+                "ttft_ms": inf_metrics.get("ttft_ms"),
+                "tpot_ms": inf_metrics.get("tpot_ms"),
+                "throughput_tokens_per_sec": inf_metrics.get("throughput_tokens_per_sec"),
+            })
+
+            if verbose and (i < 5):
+                logger.info("-" * 70)
+                logger.info(f"[{i}] {dataset_type} ({ex.get('difficulty','medium')})")
+                logger.info(f"PROMPT:\n{formatted_prompt}")
+                logger.info(f"PRED:\n{pred_text}")
+                logger.info(f"TRUTH: {truth} | EXTRACTED: {extracted} | OK={ok} | FORMAT_OK={fmt_ok}")
+
+        # Aggregate metrics
+        results: Dict[str, Any] = {}
+        total_correct = 0
+        total = 0
+        total_format_ok = 0
+
+        for dtype in sorted(preds_by_type.keys()):
+            group = EvaluationMetrics.evaluate_group(preds_by_type[dtype], truths_by_type[dtype], dtype)
+            results[dtype] = group
+            total_correct += group["correct_count"]
+            total += group["total_count"]
+            total_format_ok += group["format_ok_count"]
+
         results["overall"] = {
-            "accuracy": overall_correct / max(overall_total, 1),
-            "em": overall_correct / max(overall_total, 1),
-            "correct_count": overall_correct,
-            "total_count": overall_total,
-            "hallucination_count": sum(r.get("hallucination_count", 0) for r in results.values()),
-            "hallucination_rate": sum(1 for h in all_hallucinations if h) / max(len(all_hallucinations), 1)
+            "accuracy": total_correct / max(total, 1),
+            "correct_count": total_correct,
+            "total_count": total,
+            "format_ok_rate": total_format_ok / max(total, 1),
         }
-        
+
         logger.info("\n" + "=" * 70)
-        logger.info("OVERALL RESULTS")
-        logger.info(f"Accuracy: {results['overall']['accuracy']*100:.2f}%")
-        logger.info(f"Correct: {results['overall']['correct_count']}/{results['overall']['total_count']}")
-        logger.info(f"⚠️ HALLUCINATION RATE: {results['overall']['hallucination_rate']*100:.2f}%")
+        for dtype in sorted(preds_by_type.keys()):
+            g = results[dtype]
+            logger.info(f"{dtype.upper()} Results")
+            logger.info(f"  Accuracy: {g['accuracy']*100:.2f}% ({g['correct_count']}/{g['total_count']})")
+            logger.info(f"  Format OK: {g['format_ok_rate']*100:.2f}% ({g['format_ok_count']}/{g['total_count']})")
         logger.info("=" * 70)
-        
-        return results, detailed_results
+        o = results["overall"]
+        logger.info("OVERALL RESULTS")
+        logger.info(f"  Accuracy: {o['accuracy']*100:.2f}% ({o['correct_count']}/{o['total_count']})")
+        logger.info(f"  Format OK: {o['format_ok_rate']*100:.2f}%")
+        logger.info("=" * 70)
 
-
-if __name__ == "__main__":
-    # Test parsing
-    logger.info("=" * 70)
-    logger.info("MMLU EXTRACTION TEST")
-    logger.info("=" * 70)
-    
-    mmlu_test_cases = [
-        ("ANSWER: A", "A", True),
-        ("ANSWER: B", "B", True),
-        ("The answer is ANSWER C", "C", True),
-        ("ANSWER: D (correct)", "D", True),
-        ("A", "A", True),
-        ("B", "B", True),
-        ("Linda is painting her bedroom...", "", False),
-        ("", "", False),
-    ]
-    
-    mmlu_pass = 0
-    for i, (prediction, truth, expected) in enumerate(mmlu_test_cases, 1):
-        extracted = EvaluationMetrics.extract_answer(prediction, "mmlu")
-        result = EvaluationMetrics.exact_match_mmlu(prediction, truth)
-        
-        status = "✅ PASS" if result == expected else "❌ FAIL"
-        if result == expected:
-            mmlu_pass += 1
-        
-        logger.info(f"{status} Case {i}: Extracted='{extracted}', Expected='{truth}', Match={result}")
-    
-    logger.info(f"Score: {mmlu_pass}/{len(mmlu_test_cases)} ({mmlu_pass*100//len(mmlu_test_cases)}%)")
-    
-    logger.info("\n" + "=" * 70)
-    logger.info("GSM8K EXTRACTION TEST (THE CRITICAL ONE)")
-    logger.info("=" * 70)
-    
-    gsm8k_test_cases = [
-        ("FINAL_ANSWER: 15", "15", True),
-        ("FINAL_ANSWER: 100", "100", True),
-        ("The answer is FINAL_ANSWER 42", "42", True),
-        ("Linda is repainting her bedroom... 50 gallons...", "", False),
-        ("Step 1: ...\nFINAL_ANSWER: 3600", "3600", True),
-        ("", "", False),
-    ]
-    
-    gsm8k_pass = 0
-    for i, (prediction, truth, expected) in enumerate(gsm8k_test_cases, 1):
-        extracted = EvaluationMetrics.extract_answer(prediction, "gsm8k")
-        result = EvaluationMetrics.exact_match_gsm8k(prediction, truth)
-        is_hall = EvaluationMetrics.detect_hallucination(prediction, "gsm8k")
-        
-        status = "✅ PASS" if result == expected else "❌ FAIL"
-        if result == expected:
-            gsm8k_pass += 1
-        
-        halluc_flag = " [HALLUCINATION DETECTED]" if is_hall else ""
-        logger.info(f"{status} Case {i}: Extracted='{extracted}', Expected='{truth}', Match={result}{halluc_flag}")
-    
-    logger.info(f"Score: {gsm8k_pass}/{len(gsm8k_test_cases)} ({gsm8k_pass*100//len(gsm8k_test_cases)}%)")
+        return results, detailed

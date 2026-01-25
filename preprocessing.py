@@ -8,8 +8,14 @@ import json
 import os
 import numpy as np
 from pathlib import Path
-from datasets import load_dataset
-import tiktoken
+try:
+    from datasets import load_dataset  # type: ignore
+except ImportError:  # pragma: no cover
+    load_dataset = None  # type: ignore
+try:
+    import tiktoken  # type: ignore
+except ImportError:  # pragma: no cover
+    tiktoken = None  # type: ignore
 import logging
 from typing import List, Dict, Tuple
 
@@ -26,7 +32,11 @@ class DataPreprocessor:
     def __init__(self, data_dir="data/raw", output_dir="data/processed"):
         self.data_dir = data_dir
         self.output_dir = output_dir
-        self.tokenizer = tiktoken.encoding_for_model("gpt-3.5-turbo")
+        # Token counting is best-effort; preprocessing can run without tiktoken.
+        if tiktoken is not None:
+            self.tokenizer = tiktoken.encoding_for_model("gpt-3.5-turbo")
+        else:
+            self.tokenizer = None
         
         # Create directories
         os.makedirs(data_dir, exist_ok=True)
@@ -98,7 +108,7 @@ class DataPreprocessor:
                     prompt = f"{question}\nA) {choices[0]}\nB) {choices[1]}\nC) {choices[2]}\nD) {choices[3]}"
                     
                     # Count tokens
-                    input_tokens = len(self.tokenizer.encode(question))
+                    input_tokens = len(self.tokenizer.encode(question)) if self.tokenizer is not None else len(question.split())
                     
                     processed.append({
                         "dataset": "mmlu",
@@ -178,8 +188,8 @@ class DataPreprocessor:
                         difficulty = "hard"
                     
                     # Count tokens
-                    input_tokens = len(self.tokenizer.encode(question))
-                    output_tokens = len(self.tokenizer.encode(answer))
+                    input_tokens = len(self.tokenizer.encode(question)) if self.tokenizer is not None else len(question.split())
+                    output_tokens = len(self.tokenizer.encode(answer)) if self.tokenizer is not None else len(answer.split())
                     
                     processed.append({
                         "dataset": "gsm8k",
