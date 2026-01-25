@@ -10,7 +10,6 @@ import torch
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    BaseStreamer,
     BitsAndBytesConfig,
     StoppingCriteria,
     StoppingCriteriaList,
@@ -64,21 +63,31 @@ class GPUMonitor:
 # -------------------------------
 
 
-class TimingStreamer(BaseStreamer):
-    """Records a reasonable TTFT by ignoring the initial prompt push."""
+class TimingStreamer:
+    """Records TTFT (time-to-first-generated-token).
+
+    HuggingFace may call streamer.put() once with the full prompt token IDs before generation.
+    We ignore that *prompt push* and only timestamp the first generated token.
+    This class intentionally does NOT depend on transformers.BaseStreamer (not always exported).
+    """
 
     def __init__(self, sync_fn):
         self._sync_fn = sync_fn
         self.first_token_time: Optional[float] = None
-        self._saw_prompt = False
+        self._ignored_prompt_push = False
 
     def put(self, value):
-        # HF generate pushes the *prompt* once (shape [B, prompt_len]) before decoding.
-        if not self._saw_prompt:
-            self._saw_prompt = True
+        # The initial prompt push typically contains >1 token overall (prompt_len * batch_size).
+        # Generated token pushes usually contain only 1 token per sequence (batch_size tokens total).
+        try:
+            n = int(value.numel()) if isinstance(value, torch.Tensor) else len(value)
+        except Exception:
+            n = 1
+
+        if not self._ignored_prompt_push and n > 1:
+            self._ignored_prompt_push = True
             return
 
-        # First generated token for the batch.
         if self.first_token_time is None:
             self._sync_fn()
             self.first_token_time = time.perf_counter()
