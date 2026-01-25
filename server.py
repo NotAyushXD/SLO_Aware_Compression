@@ -64,8 +64,11 @@ class StopOnFinalAnswer(StoppingCriteria):
         self._pat = re.compile(r"FINAL_ANSWER\s*[:=\s]*[-+]?\d+(?:\.\d+)?", re.IGNORECASE)
 
     def __call__(self, input_ids, scores, **kwargs) -> bool:
-        # input_ids shape: [batch, seq]
-        gen_ids = input_ids[0, self.prompt_len:]
+        # input_ids can be [batch, seq] or [seq] depending on transformers version
+        if getattr(input_ids, 'ndim', 2) == 1:
+            gen_ids = input_ids[self.prompt_len:]
+        else:
+            gen_ids = input_ids[0, self.prompt_len:]
         if gen_ids.numel() == 0:
             return False
         text = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
@@ -296,7 +299,7 @@ class SingleVariantServer:
         try:
             # A short deterministic warmup to populate caches
             for _ in range(iterations):
-                _ = self.generate("Warmup", max_tokens=4, temperature=0.0, top_p=1.0, dataset_type="mmlu", prompt_mode="slo")
+                _ = self.generate("Warmup", max_tokens=4, temperature=0.0, top_p=1.0, dataset_type="warmup", prompt_mode="slo")
             logger.info("Warmup complete")
         except Exception as e:
             logger.warning(f"Warmup failed: {e}")
@@ -415,7 +418,8 @@ class SingleVariantServer:
 
                 def prefix_allowed_tokens_fn(batch_id, input_ids):
                     # First generated token: must be A/B/C/D variants
-                    if input_ids.shape[1] == prompt_len:
+                    cur_len = input_ids.shape[-1]
+                    if cur_len == prompt_len:
                         return self._mmlu_allowed_token_ids
                     # After first token, allow eos only (shouldn't matter because max_new_tokens=1)
                     return [self.tokenizer.eos_token_id]
@@ -441,7 +445,11 @@ class SingleVariantServer:
             metrics["ttft_ms"] = t_ttft * 1000.0
 
             # Decode generated tokens (exclude prompt)
-            generated_ids = outputs.sequences[0, input_len:]
+            seq = outputs.sequences
+            if getattr(seq, 'ndim', 2) == 1:
+                generated_ids = seq[input_len:]
+            else:
+                generated_ids = seq[0, input_len:]
             out_len = int(generated_ids.shape[0])
             metrics["output_length"] = out_len
 
