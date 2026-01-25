@@ -307,12 +307,8 @@ class MetricsCalculator:
             print("\nSample SLO Violations (first 10):")
             for i, violation in enumerate(metrics['slo_violations'][:10], 1):
                 print(f"  {i}. Request {violation['request_id']} ({violation['difficulty']})")
-                ttft_bad = violation['ttft_ms'] > violation['ttft_slo']
-                tpot_bad = violation['tpot_ms'] > violation['tpot_slo']
-                if ttft_bad:
-                    print(f"     TTFT: {violation['ttft_ms']:.1f}ms > {violation['ttft_slo']}ms SLO")
-                if tpot_bad:
-                    print(f"     TPOT: {violation['tpot_ms']:.1f}ms > {violation['tpot_slo']}ms SLO")
+                print(f"     TTFT: {violation['ttft_ms']:.1f}ms > {violation['ttft_slo']}ms SLO")
+                print(f"     TPOT: {violation['tpot_ms']:.1f}ms > {violation['tpot_slo']}ms SLO")
         
         print("\n" + "="*80)
         

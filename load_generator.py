@@ -1,165 +1,214 @@
 # load_generator.py
 """
-Closed-loop load generator (fixed concurrency) that actually maintains the
-target concurrency until num_requests is reached.
+Closed-loop load generator (fixed concurrency).
 
-This fixes the classic bug where as_completed() only iterates over the initial
-futures, causing you to run ~2x concurrency requests instead of the full count.
+Key fixes vs earlier versions:
+- True closed-loop behavior: keep ~N in-flight requests until total is reached.
+- Correct queue_wait_time_ms: submit_time recorded at submission, start_time when worker starts.
+- Adds prompt_mode plumbing (accuracy vs slo) without breaking parallel execution.
 
-Used by run_baseline_evaluation.py for load tests + SLO measurement.
+This tool is mainly for your SLO work. For pure accuracy debugging you can also
+skip load tests via --skip_load_test in run_baseline_evaluation.py (added in v7).
 """
 
 from __future__ import annotations
 
-import json
 import time
-import logging
+import json
 import threading
-from dataclasses import dataclass, field
-from typing import List, Dict, Any, Callable, Optional
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from typing import List, Dict, Callable, Any, Optional
+from dataclasses import dataclass, asdict
+import logging
 
-logger = logging.getLogger("load_generator")
-logger.setLevel(logging.INFO)
+from prompt_templates import build_llama_formatted_prompt
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class RequestMetrics:
     request_id: int
-    dataset: str = ""
-    difficulty: str = ""
-    prompt_mode: str = ""
-    prompt: str = ""
-    submit_time: float = 0.0
-    start_time: float = 0.0
-    end_time: float = 0.0
-    queue_wait_ms: float = 0.0
-    inference_metrics: Dict[str, Any] = field(default_factory=dict)
+    dataset_type: str
+    submit_time: float
+    start_time: float
+    end_time: float
+    difficulty: str
+    inference_metrics: Dict[str, Any]
+
+    @property
+    def e2e_latency_ms(self) -> float:
+        return (self.end_time - self.submit_time) * 1000.0
+
+    @property
+    def queue_wait_time_ms(self) -> float:
+        return (self.start_time - self.submit_time) * 1000.0
+
+    @property
+    def inference_time_ms(self) -> float:
+        return (self.end_time - self.start_time) * 1000.0
+
+    @property
+    def ttft_ms(self) -> float:
+        return float(self.inference_metrics.get("ttft_ms", 0.0) or 0.0)
+
+    @property
+    def tpot_ms(self) -> float:
+        return float(self.inference_metrics.get("tpot_ms", 0.0) or 0.0)
+
+    @property
+    def success(self) -> bool:
+        return bool(self.inference_metrics.get("success", False))
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "request_id": self.request_id,
-            "dataset": self.dataset,
-            "difficulty": self.difficulty,
-            "prompt_mode": self.prompt_mode,
-            "prompt": self.prompt,
-            "start_time": self.start_time,
-            "end_time": self.end_time,
-            "duration_s": self.end_time - self.start_time,
-            "queue_wait_ms": self.queue_wait_ms,
-            "inference_metrics": self.inference_metrics,
-        }
+        d = asdict(self)
+        d["e2e_latency_ms"] = self.e2e_latency_ms
+        d["queue_wait_time_ms"] = self.queue_wait_time_ms
+        d["inference_time_ms"] = self.inference_time_ms
+        return d
 
 
 class ClosedLoopLoadGenerator:
-    """
-    Executes a closed-loop load test:
-    - maintain up to `max_concurrency` in-flight requests
-    - submit next request immediately when one finishes
-    - stop when `num_requests` completed
-    """
-
     def __init__(
         self,
-        inference_func: Callable[[Dict[str, Any]], tuple],
+        inference_func: Callable[..., Any],
         max_concurrency: int,
         num_requests: int,
         data_loader: List[Dict[str, Any]],
         prompt_mode: str = "slo",
+        seed: int = 0,
     ):
         self.inference_func = inference_func
         self.max_concurrency = int(max_concurrency)
         self.num_requests = int(num_requests)
-        self.data_loader = list(data_loader)
-        self.prompt_mode = (prompt_mode or "slo").lower()
+        self.data_loader = data_loader
+        self.prompt_mode = prompt_mode
+        self.seed = seed
 
         self.request_metrics: List[RequestMetrics] = []
-        self.lock = threading.Lock()
-        self.completed_count = 0
+        self._lock = threading.Lock()
 
         logger.info("Initialized ClosedLoopLoadGenerator")
         logger.info(f"  Concurrency: {self.max_concurrency}")
         logger.info(f"  Total requests: {self.num_requests}")
         logger.info(f"  Data pool size: {len(self.data_loader)}")
+        logger.info(f"  Prompt mode: {self.prompt_mode}")
 
-    def _run_one(self, request_id: int, example: Dict[str, Any], submitted_time: float) -> RequestMetrics:
-        m = RequestMetrics(
-            request_id=request_id,
-            dataset=(example.get("dataset") or example.get("dataset_type") or "").lower(),
-            difficulty=(example.get("difficulty") or "medium").lower(),
-            prompt_mode=self.prompt_mode,
-            prompt=(example.get("prompt") or ""),
-        )
-        m.submit_time = submitted_time
-        m.start_time = time.time()
-        m.queue_wait_ms = (m.start_time - submitted_time) * 1000.0
+    def _select_example(self, request_id: int) -> Dict[str, Any]:
+        # deterministic cycling is fine for load testing
+        if not self.data_loader:
+            return {"dataset": "unknown", "prompt": "", "answer": "", "difficulty": "medium"}
+        return self.data_loader[request_id % len(self.data_loader)]
+
+    def run_request(self, request_id: int, submit_time: float) -> RequestMetrics:
+        ex = self._select_example(request_id)
+        dataset_type = ex.get("dataset", "unknown")
+        difficulty = ex.get("difficulty", "medium")
+
+        start_time = time.time()
+        inference_metrics: Dict[str, Any] = {}
 
         try:
-            _, inf = self.inference_func(example)
-            m.inference_metrics = inf or {}
-            m.inference_metrics.setdefault("success", True)
+            prompt, max_tokens, _stops = build_llama_formatted_prompt(ex, dataset_type, prompt_mode=self.prompt_mode)
+
+            # Call server.generate; keep backward-compat fallbacks
+            try:
+                _text, inf = self.inference_func(
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    difficulty=difficulty,
+                    dataset_type=dataset_type,
+                    prompt_mode=self.prompt_mode,
+                )
+            except TypeError:
+                # Older server.generate signatures
+                _text, inf = self.inference_func(prompt=prompt, max_tokens=max_tokens, difficulty=difficulty)
+
+            inference_metrics = inf or {}
         except Exception as e:
-            logger.error(f"Request {request_id} failed: {e}")
-            m.inference_metrics = {"success": False, "error": str(e)}
+            inference_metrics = {"success": False, "error": str(e)}
 
-        m.end_time = time.time()
+        end_time = time.time()
 
-        with self.lock:
-            self.request_metrics.append(m)
-            self.completed_count += 1
-
-        return m
+        rm = RequestMetrics(
+            request_id=request_id,
+            dataset_type=dataset_type,
+            submit_time=submit_time,
+            start_time=start_time,
+            end_time=end_time,
+            difficulty=difficulty,
+            inference_metrics=inference_metrics,
+        )
+        return rm
 
     def run(self) -> List[RequestMetrics]:
         logger.info("=" * 70)
         logger.info(f"STARTING LOAD TEST: {self.num_requests} requests @ {self.max_concurrency} concurrency")
         logger.info("=" * 70)
 
-        start = time.time()
-        next_id = 0
-        in_flight = set()
+        t0 = time.time()
 
-        with ThreadPoolExecutor(max_workers=self.max_concurrency) as ex:
-            # Prime the queue
+        in_flight = {}
+        next_id = 0
+
+        with ThreadPoolExecutor(max_workers=self.max_concurrency) as pool:
+            # Initial fill
             while next_id < self.num_requests and len(in_flight) < self.max_concurrency:
-                example = self.data_loader[next_id % len(self.data_loader)]
-                submitted_time = time.time()
-                fut = ex.submit(self._run_one, next_id, example, submitted_time)
-                in_flight.add(fut)
+                submit_time = time.time()
+                fut = pool.submit(self.run_request, next_id, submit_time)
+                in_flight[fut] = next_id
                 next_id += 1
 
-            # Maintain concurrency
-            while in_flight:
-                done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+            completed = 0
+            last_log = t0
 
-                # Submit new tasks for each completed future
-                for _ in done:
+            while in_flight:
+                done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
+
+                for fut in done:
+                    req_id = in_flight.pop(fut)
+                    try:
+                        rm = fut.result()
+                    except Exception as e:
+                        rm = RequestMetrics(
+                            request_id=req_id,
+                            dataset_type="unknown",
+                            submit_time=t0,
+                            start_time=t0,
+                            end_time=time.time(),
+                            difficulty="medium",
+                            inference_metrics={"success": False, "error": str(e)},
+                        )
+
+                    with self._lock:
+                        self.request_metrics.append(rm)
+
+                    completed += 1
+
+                    # Submit next to maintain closed-loop
                     if next_id < self.num_requests:
-                        example = self.data_loader[next_id % len(self.data_loader)]
-                        submitted_time = time.time()
-                        fut = ex.submit(self._run_one, next_id, example, submitted_time)
-                        in_flight.add(fut)
+                        submit_time = time.time()
+                        nfut = pool.submit(self.run_request, next_id, submit_time)
+                        in_flight[nfut] = next_id
                         next_id += 1
 
-                # Progress logging
-                if self.completed_count and self.completed_count % 100 == 0:
-                    elapsed = time.time() - start
-                    rate = self.completed_count / max(elapsed, 1e-6)
-                    eta = (self.num_requests - self.completed_count) / max(rate, 1e-6)
-                    logger.info(f"Progress: {self.completed_count}/{self.num_requests} "
-                                f"({rate:.2f} req/sec, ETA: {eta:.0f}s)")
+                now = time.time()
+                if now - last_log > 30 and completed > 0:
+                    rate = completed / max(now - t0, 1e-6)
+                    eta = (self.num_requests - completed) / max(rate, 1e-6)
+                    logger.info(f"Progress: {completed}/{self.num_requests} ({rate:.2f} req/sec, ETA: {eta:.0f}s)")
+                    last_log = now
 
-        elapsed = time.time() - start
-        logger.info(f"Load test complete in {elapsed:.1f}s")
+        total = time.time() - t0
+        logger.info(f"Load test complete in {total:.1f}s")
         return self.request_metrics
 
-    def save_metrics(self, output_file: str) -> None:
-        with open(output_file, "w") as f:
-            json.dump([m.to_dict() for m in self.request_metrics], f, indent=2)
-        logger.info(f"Saved metrics to {output_file}")
-
-    def save_requests_jsonl(self, output_file: str) -> None:
-        with open(output_file, "w") as f:
+    def save_metrics(self, path: str) -> None:
+        with open(path, "w") as f:
             for m in self.request_metrics:
                 f.write(json.dumps(m.to_dict()) + "\n")
-        logger.info(f"Saved metrics to {output_file}")
+        logger.info(f"Saved metrics to {path}")
