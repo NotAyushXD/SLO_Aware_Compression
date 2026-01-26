@@ -70,15 +70,30 @@ class EvaluationMetrics:
         if not text:
             return ""
 
+        # Allow comma-separated thousands (e.g., 40,000). Keep extraction strict
+        # to the FINAL_ANSWER line so we don't "hallucinate" an answer by grabbing
+        # some random number in the reasoning.
         matches = re.findall(
-            r"^\s*FINAL_ANSWER\s*[:=\s]*([-+]?\d+(?:\.\d+)?)\s*$",
+            r"^\s*FINAL_ANSWER\s*[:=\s]*([-+]?\d[\d,]*(?:\.\d+)?)\s*$",
             text,
             flags=re.IGNORECASE | re.MULTILINE,
         )
         if not matches:
             return ""
         # If the model prints multiple FINAL_ANSWER lines, take the last.
-        return matches[-1].strip()
+        # Normalize: remove commas so numeric comparison works.
+        return matches[-1].strip().replace(",", "")
+
+    @staticmethod
+    def _normalize_number_string(s: str) -> str:
+        """Normalize a numeric string for float() comparison."""
+        if s is None:
+            return ""
+        t = str(s).strip()
+        # Common thousand separators / currency symbols.
+        t = t.replace(",", "")
+        t = t.replace("$", "").replace("₹", "").replace("€", "").replace("£", "")
+        return t
 
     @staticmethod
     def is_correct(pred_text: str, truth: str, dataset_type: str) -> Tuple[bool, str, bool]:
@@ -100,8 +115,8 @@ class EvaluationMetrics:
             if not format_ok:
                 return (False, "", False)
             try:
-                pred_val = float(extracted)
-                truth_val = float(truth)
+                pred_val = float(EvaluationMetrics._normalize_number_string(extracted))
+                truth_val = float(EvaluationMetrics._normalize_number_string(truth))
                 return (abs(pred_val - truth_val) < 1e-6, extracted, True)
             except Exception:
                 return (False, extracted, True)

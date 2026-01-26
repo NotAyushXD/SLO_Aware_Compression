@@ -21,6 +21,30 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("server")
 
 
+def _resolve_dtype(requested: str, device: str) -> str:
+    """Resolve "auto" into an explicit dtype where it materially helps.
+
+    Why: on some GPUs (e.g., Tesla T4), bf16 is either unsupported or causes
+    implicit casts (and warnings) that can hurt latency. We pick float16 on
+    pre-Ampere GPUs by default.
+    """
+
+    if requested != "auto":
+        return requested
+    if device != "cuda":
+        return requested
+
+    # Prefer bf16 on GPUs that support it; otherwise float16.
+    try:
+        major, _minor = torch.cuda.get_device_capability(0)
+        # Ampere (8.0) and newer generally support bf16.
+        if major >= 8 and getattr(torch.cuda, "is_bf16_supported", lambda: False)():
+            return "bfloat16"
+    except Exception:
+        pass
+    return "float16"
+
+
 # -------------------------------
 # Utilities
 # -------------------------------
@@ -103,7 +127,9 @@ class StopOnFinalAnswer(StoppingCriteria):
     contain a FINAL_ANSWER, which makes it safe for batched GSM8K.
     """
 
-    _PATTERN = re.compile(r"FINAL_ANSWER\s*[:=\s]*[-+]?\d+(?:\.\d+)?")
+    # Match a numeric FINAL_ANSWER. We allow commas because models sometimes emit
+    # thousands separators (e.g., 40,000).
+    _PATTERN = re.compile(r"FINAL_ANSWER\s*[:=\s]*[-+]?\d[\d,]*(?:\.\d+)?")
 
     def __init__(self, tokenizer, prompt_len: int, require_all: bool = False):
         super().__init__()
@@ -116,7 +142,11 @@ class StopOnFinalAnswer(StoppingCriteria):
         # input_ids: [batch, seq] or [seq]
         if input_ids.ndim == 1:
             text = self.tokenizer.decode(input_ids[self.prompt_len :], skip_special_tokens=True)
-            return bool(self._PATTERN.search(text))
+            m = self._PATTERN.search(text)
+            # Avoid stopping on a *prefix* of the final answer. We only stop once
+            # the model has produced at least one character *after* the matched
+            # numeric answer (typically a newline/space/punctuation).
+            return bool(m and m.end() < len(text))
 
         bsz = int(input_ids.shape[0])
         if self._done is None or len(self._done) != bsz:
@@ -126,7 +156,8 @@ class StopOnFinalAnswer(StoppingCriteria):
             if self._done[i]:
                 continue
             text = self.tokenizer.decode(input_ids[i, self.prompt_len :], skip_special_tokens=True)
-            if self._PATTERN.search(text):
+            m = self._PATTERN.search(text)
+            if m and m.end() < len(text):
                 self._done[i] = True
 
         return all(self._done) if self.require_all else any(self._done)
@@ -290,7 +321,8 @@ class SingleVariantServer:
         self.model_name = model_name
         self.variant = variant
         self.device = "cuda" if (device == "auto" and torch.cuda.is_available()) else device
-        self.dtype = dtype
+        # Resolve dtype early so the load path can pick the right precision.
+        self.dtype = _resolve_dtype(dtype, self.device)
 
         logger.info("=" * 69)
         logger.info(f"Initializing {variant.upper()} server")
@@ -298,7 +330,7 @@ class SingleVariantServer:
         logger.info(f"  Model: {model_name}")
         logger.info(f"  Variant: {variant}")
         logger.info(f"  Device: {self.device}")
-        logger.info(f"  Dtype: {dtype}")
+        logger.info(f"  Dtype: {self.dtype}")
         if self.device == "cuda":
             GPUMonitor.log_gpu_status(prefix="  ")
 
@@ -320,18 +352,24 @@ class SingleVariantServer:
 
         # Load model
         quant_config = BitsAndBytesConfig(load_in_8bit=True)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto" if self.device == "cuda" else None,
-            torch_dtype=(
-                torch.float16
-                if dtype == "float16"
-                else torch.bfloat16
-                if dtype == "bfloat16"
-                else "auto"
-            ),
-            quantization_config=quant_config,
-        )
+
+        model_dtype = "auto"
+        if self.dtype == "float16":
+            model_dtype = torch.float16
+        elif self.dtype == "bfloat16":
+            model_dtype = torch.bfloat16
+
+        load_kwargs = {
+            "device_map": "auto" if self.device == "cuda" else None,
+            "quantization_config": quant_config,
+        }
+
+        # transformers>=4.57 deprecates `torch_dtype` in favor of `dtype`.
+        # Keep compatibility with older versions.
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(model_name, dtype=model_dtype, **load_kwargs)
+        except TypeError:
+            self.model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=model_dtype, **load_kwargs)
         self.model.eval()
 
         logger.info("Model loaded successfully")

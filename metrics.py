@@ -186,8 +186,10 @@ class MetricsCalculator:
                     "difficulty": difficulty,
                     "ttft_ms": ttft,
                     "ttft_slo": slo["ttft_ms"],
+                    "ttft_ok": ttft_ok,
                     "tpot_ms": tpot,
-                    "tpot_slo": slo["tpot_ms"]
+                    "tpot_slo": slo["tpot_ms"],
+                    "tpot_ok": tpot_ok,
                 })
         
         slo_compliance = slo_compliant / max(successful, 1)
@@ -305,10 +307,17 @@ class MetricsCalculator:
         # SLO violations
         if metrics['slo_violations']:
             print("\nSample SLO Violations (first 10):")
-            for i, violation in enumerate(metrics['slo_violations'][:10], 1):
-                print(f"  {i}. Request {violation['request_id']} ({violation['difficulty']})")
-                print(f"     TTFT: {violation['ttft_ms']:.1f}ms > {violation['ttft_slo']}ms SLO")
-                print(f"     TPOT: {violation['tpot_ms']:.1f}ms > {violation['tpot_slo']}ms SLO")
+            for i, v in enumerate(metrics['slo_violations'][:10], 1):
+                parts = []
+                if not v.get('ttft_ok', True):
+                    parts.append(f"TTFT: {v['ttft_ms']:.1f}ms > {v['ttft_slo']}ms SLO")
+                if not v.get('tpot_ok', True):
+                    parts.append(f"TPOT: {v['tpot_ms']:.1f}ms > {v['tpot_slo']}ms SLO")
+                # Backward compatible fallback (should be rare)
+                if not parts:
+                    parts.append(f"TTFT: {v['ttft_ms']:.1f}ms > {v['ttft_slo']}ms SLO")
+                    parts.append(f"TPOT: {v['tpot_ms']:.1f}ms > {v['tpot_slo']}ms SLO")
+                print(f"  {i}. Request {v['request_id']} ({v['difficulty']}): " + " | ".join(parts))
         
         print("\n" + "="*80)
         
