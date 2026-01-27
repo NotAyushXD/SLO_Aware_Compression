@@ -175,21 +175,21 @@ def main(args: argparse.Namespace) -> None:
             request_metrics = load_gen.run()
             duration = time.time() - start_time
 
-all_raw_metrics.extend(request_metrics)
+            all_raw_metrics.extend(request_metrics)
 
-# If enabled, calibrate SLO thresholds from a chosen baseline concurrency run,
-# then use those thresholds for compliance/violation reporting.
-if (not args.disable_slo_calibration) and (current_slos is None) and (concurrency == args.slo_calibrate_from_concurrency):
-    logger.info(f"Calibrating SLOs from concurrency={concurrency} at p{args.slo_calibrate_percentile:.1f}...")
-    current_slos = calibrate_slos(request_metrics, percentile=args.slo_calibrate_percentile)
-    try:
-        with open(slo_file, "w") as f:
-            json.dump(current_slos, f, indent=2)
-        logger.info(f"Saved calibrated SLOs to {slo_file}")
-    except Exception as e:
-        logger.warning(f"Failed to save calibrated SLOs: {e}")
+            # If enabled, calibrate SLO thresholds from a chosen baseline concurrency run,
+            # then use those thresholds for compliance/violation reporting.
+            if (not args.disable_slo_calibration) and (current_slos is None) and (concurrency == args.slo_calibrate_from_concurrency):
+                logger.info(f"Calibrating SLOs from concurrency={concurrency} at p{args.slo_calibrate_percentile:.1f}...")
+                current_slos = calibrate_slos(request_metrics, percentile=args.slo_calibrate_percentile)
+            try:
+                with open(slo_file, "w") as f:
+                    json.dump(current_slos, f, indent=2)
+                logger.info(f"Saved calibrated SLOs to {slo_file}")
+            except Exception as e:
+                logger.warning(f"Failed to save calibrated SLOs: {e}")
 
-calc = MetricsCalculator(request_metrics, slo_dict=current_slos)
+            calc = MetricsCalculator(request_metrics, slo_dict=current_slos)
             test_metrics = calc.compute_all_metrics()
             load_test_results[concurrency] = test_metrics
 
@@ -217,20 +217,20 @@ calc = MetricsCalculator(request_metrics, slo_dict=current_slos)
                 "slo_violations": test_metrics["summary"]["slo_violations"],
             })
 
-        # Optional SLO calibration: only if enabled and we don't already have SLOs
-        if (not args.disable_slo_calibration) and (current_slos is None) and all_raw_metrics:
-            logger.info("\n[STEP 3.5] CALIBRATING SLOs (measurement-only)")
-            logger.info("-" * 80)
+    # Optional SLO calibration: only if enabled and we don't already have SLOs
+    if (not args.disable_slo_calibration) and (current_slos is None) and all_raw_metrics:
+        logger.info("\n[STEP 3.5] CALIBRATING SLOs (measurement-only)")
+        logger.info("-" * 80)
 
-            current_slos = calibrate_slos(all_raw_metrics, percentile=args.slo_calibrate_percentile)
+        current_slos = calibrate_slos(all_raw_metrics, percentile=args.slo_calibrate_percentile)
 
-            # Save calibrated SLOs
-            try:
-                with open(slo_file, "w") as f:
-                    json.dump(current_slos, f, indent=2)
-                logger.info(f"Saved calibrated SLOs to {slo_file}")
-            except Exception as e:
-                logger.warning(f"Failed to write {slo_file}: {e}")
+        # Save calibrated SLOs
+        try:
+            with open(slo_file, "w") as f:
+                json.dump(current_slos, f, indent=2)
+            logger.info(f"Saved calibrated SLOs to {slo_file}")
+        except Exception as e:
+            logger.warning(f"Failed to write {slo_file}: {e}")
 
     # Step 4: Evaluate accuracy (optionally skipped)
     eval_results, detailed_predictions = {}, []
