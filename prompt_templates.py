@@ -181,6 +181,8 @@ def build_gsm8k_prompt(example: Dict[str, Any], prompt_mode: str) -> Tuple[str, 
         user = (
             "Solve the math problem.\n"
             "Keep the solution concise (<= 6 short lines).\n"
+            "IMPORTANT: your last line MUST use the exact token 'FINAL_ANSWER:' (with underscore).\n"
+            "Do not write 'Final Answer', 'FINAL ANSWER', or any other variation.\n"
             "End with exactly:\n"
             "FINAL_ANSWER: <number>\n\n"
             "Example (format only):\n"

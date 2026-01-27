@@ -55,36 +55,37 @@ class EvaluationMetrics:
         return ""
 
     @staticmethod
-    def extract_gsm8k_answer(text: str) -> str:
-        """
-        STRICT extraction: ONLY accept answers on a line that starts with FINAL_ANSWER.
+    def extract_gsm8k_answer(text: str) -> Optional[str]:
+        """Extract GSM8K final answer from model output.
 
-        Accept examples:
-            FINAL_ANSWER: 7
-            FINAL_ANSWER: 7.0
-            final_answer: -12
+        We primarily expect the canonical format:
+            FINAL_ANSWER: <value>
 
-        Reject:
-            any standalone numbers without FINAL_ANSWER
+        But in practice models sometimes emit minor variations (spaces/hyphens) or LaTeX boxed answers.
+        This extractor is tolerant to those while still being conservative.
         """
         if not text:
-            return ""
+            return None
 
-        # Allow comma-separated thousands (e.g., 40,000). Keep extraction strict
-        # to the FINAL_ANSWER line so we don't "hallucinate" an answer by grabbing
-        # some random number in the reasoning.
-        matches = re.findall(
-            r"^\s*FINAL_ANSWER\s*[:=\s]*([-+]?\d[\d,]*(?:\.\d+)?)\s*$",
-            text,
-            flags=re.IGNORECASE | re.MULTILINE,
-        )
-        if not matches:
-            return ""
-        # If the model prints multiple FINAL_ANSWER lines, take the last.
-        # Normalize: remove commas so numeric comparison works.
-        return matches[-1].strip().replace(",", "")
+        # 1) Canonical / near-canonical markers (case-insensitive).
+        #    Accept: FINAL_ANSWER:, FINAL ANSWER:, FINAL-ANSWER:
+        marker_pat = re.compile(r"^\s*FINAL[\s_-]*ANSWER\s*[:=]\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+        m = marker_pat.search(text)
+        if m:
+            return m.group(1).strip()
 
-    @staticmethod
+        # 2) Some models write 'Final answer:' without the 'FINAL' emphasis.
+        fa_pat = re.compile(r"^\s*Final\s+answer\s*[:=]\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+        m = fa_pat.search(text)
+        if m:
+            return m.group(1).strip()
+
+        # 3) LaTeX boxed answer fallback (common in math traces).
+        boxed = re.findall(r"\\boxed\{([^}]+)\}", text)
+        if boxed:
+            return boxed[-1].strip()
+
+        return None
     def _normalize_number_string(s: str) -> str:
         """Normalize a numeric string for float() comparison."""
         if s is None:

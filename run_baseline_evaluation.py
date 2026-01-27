@@ -26,7 +26,7 @@ import json
 import os
 import time
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 
 from preprocessing import DataPreprocessor
 from server import SingleVariantServer
@@ -131,7 +131,15 @@ def main(args: argparse.Namespace) -> None:
     slo_file = os.path.join(args.output_dir, "slo_thresholds.json")
     current_slos = None
 
-    if not args.disable_slo_calibration:
+    if args.slo_thresholds_path:
+        try:
+            with open(args.slo_thresholds_path, "r") as f:
+                current_slos = json.load(f)
+            logger.info(f"Loaded SLOs from {args.slo_thresholds_path}")
+        except Exception as e:
+            logger.warning(f"Failed to load SLOs from {args.slo_thresholds_path}: {e}")
+
+    if (current_slos is None) and (not args.disable_slo_calibration):
         # Try to load existing thresholds
         if os.path.exists(slo_file):
             try:
@@ -140,85 +148,6 @@ def main(args: argparse.Namespace) -> None:
                 logger.info(f"Loaded existing SLOs from {slo_file}")
             except Exception as e:
                 logger.warning(f"Failed to load existing SLOs: {e}")
-
-    # Step 2.5: Generate labelled router logs (optional)
-    #
-    # These logs are intended to train a lightweight router that decides whether
-    # to route a prompt to SLO vs Accuracy mode. Each JSONL row includes:
-    #   - request_id
-    #   - prompt (input text)
-    #   - label_quality (1 if correct else 0)
-    #   - label_latency_ms (end-to-end latency)
-    # plus debugging fields (dataset, difficulty, outputs, full metrics).
-    router_logs_info: Dict[str, Any] = {"enabled": False}
-    if getattr(args, "generate_router_logs", False):
-        logger.info("\n[STEP 2.5] GENERATING ROUTER LOGS")
-        logger.info("-" * 80)
-
-        split = getattr(args, "router_split", "train")
-        split_data = {
-            "train": train_data,
-            "val": val_data,
-            "test": test_data,
-        }.get(split, train_data)
-
-        max_examples = int(getattr(args, "router_subset", 0) or 0)
-        if max_examples and max_examples > 0:
-            split_data = split_data[:max_examples]
-
-        router_eval = HeldOutEvaluator(split_data)
-        router_results, router_detailed = router_eval.evaluate_dataset(
-            server=server,
-            prompt_mode=args.prompt_mode,
-            max_examples=len(split_data),
-            verbose=getattr(args, "verbose_eval", False),
-        )
-
-        mode_suffix = "slo" if args.prompt_mode == "slo" else "acc"
-        default_log_path = os.path.join(
-            args.output_dir,
-            f"{split}_logs_{mode_suffix}.jsonl",
-        )
-        router_log_path = (getattr(args, "router_log_path", "") or "").strip() or default_log_path
-        os.makedirs(os.path.dirname(router_log_path) or ".", exist_ok=True)
-
-        with open(router_log_path, "w", encoding="utf-8") as f:
-            for request_id, row in enumerate(router_detailed):
-                metrics = row.get("metrics") or {}
-                # Prefer E2E latency as the label (what a real user experiences)
-                latency_ms = metrics.get("total_latency_ms")
-                try:
-                    latency_ms = float(latency_ms) if latency_ms is not None else None
-                except Exception:
-                    latency_ms = None
-
-                record = {
-                    "request_id": int(request_id),
-                    "split": split,
-                    "prompt_mode": args.prompt_mode,
-                    "dataset": row.get("dataset"),
-                    "difficulty": row.get("difficulty"),
-                    "prompt": row.get("prompt"),
-                    "label_quality": int(bool(row.get("is_correct"))),
-                    "label_latency_ms": latency_ms,
-                    # Debugging / optional supervision
-                    "output": row.get("output"),
-                    "extracted_answer": row.get("extracted_answer"),
-                    "correct_answer": row.get("correct_answer"),
-                    "metrics": metrics,
-                }
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-        logger.info(f"Saved router logs to: {router_log_path}")
-
-        router_logs_info = {
-            "enabled": True,
-            "split": split,
-            "prompt_mode": args.prompt_mode,
-            "num_examples": len(router_detailed),
-            "file": router_log_path,
-            "summary": router_results,
-        }
 
     # Step 3: Run load tests (optional)
     logger.info("\n[STEP 3] RUNNING LOAD TESTS")
@@ -246,9 +175,21 @@ def main(args: argparse.Namespace) -> None:
             request_metrics = load_gen.run()
             duration = time.time() - start_time
 
-            all_raw_metrics.extend(request_metrics)
+all_raw_metrics.extend(request_metrics)
 
-            calc = MetricsCalculator(request_metrics, slo_dict=current_slos)
+# If enabled, calibrate SLO thresholds from a chosen baseline concurrency run,
+# then use those thresholds for compliance/violation reporting.
+if (not args.disable_slo_calibration) and (current_slos is None) and (concurrency == args.slo_calibrate_from_concurrency):
+    logger.info(f"Calibrating SLOs from concurrency={concurrency} at p{args.slo_calibrate_percentile:.1f}...")
+    current_slos = calibrate_slos(request_metrics, percentile=args.slo_calibrate_percentile)
+    try:
+        with open(slo_file, "w") as f:
+            json.dump(current_slos, f, indent=2)
+        logger.info(f"Saved calibrated SLOs to {slo_file}")
+    except Exception as e:
+        logger.warning(f"Failed to save calibrated SLOs: {e}")
+
+calc = MetricsCalculator(request_metrics, slo_dict=current_slos)
             test_metrics = calc.compute_all_metrics()
             load_test_results[concurrency] = test_metrics
 
@@ -281,7 +222,7 @@ def main(args: argparse.Namespace) -> None:
             logger.info("\n[STEP 3.5] CALIBRATING SLOs (measurement-only)")
             logger.info("-" * 80)
 
-            current_slos = calibrate_slos(all_raw_metrics, percentile=95.0)
+            current_slos = calibrate_slos(all_raw_metrics, percentile=args.slo_calibrate_percentile)
 
             # Save calibrated SLOs
             try:
@@ -344,7 +285,6 @@ def main(args: argparse.Namespace) -> None:
             "slo_thresholds": current_slos,
             "load_test_results": load_test_results,
             "eval_results": eval_results,
-            "router_logs": router_logs_info,
         }, f, indent=2)
     logger.info(f"Saved overall summary to {summary_file}")
 
@@ -406,6 +346,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Prompt mode: accuracy (best correctness) vs slo (shorter outputs for later SLO work)")
     p.add_argument("--disable_slo_calibration", action="store_true",
                    help="Disable SLO calibration and ignore slo_thresholds.json.")
+    p.add_argument("--slo_calibrate_percentile", type=float, default=95.0,
+                   help="Percentile to use when calibrating SLO thresholds (default: 95.0)")
+    p.add_argument("--slo_calibrate_from_concurrency", type=int, default=1,
+                   help="Which concurrency run to use for SLO calibration (default: 1)")
+    p.add_argument("--slo_thresholds_path", type=str, default=None,
+                   help="Path to slo_thresholds.json to load and use for compliance checks")
+
     p.add_argument("--skip_load_test", action="store_true",
                    help="Skip load tests and only run accuracy evaluation.")
     p.add_argument("--skip_accuracy_eval", action="store_true",
@@ -420,40 +367,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="How long to wait (ms) to form a batch before running it.")
     p.add_argument("--verbose_eval", action="store_true",
                    help="Print a few example prompts/outputs during evaluation.")
-
-    # Router training logs (labelled dataset)
-    p.add_argument(
-        "--generate_router_logs",
-        action="store_true",
-        help=(
-            "Generate per-example JSONL logs on a chosen split for router training. "
-            "Each row includes the prompt text plus labels: quality (correct=1/0) and latency (ms)."
-        ),
-    )
-    p.add_argument(
-        "--router_split",
-        type=str,
-        choices=["train", "val", "test"],
-        default="train",
-        help="Which split to run when generating router logs.",
-    )
-    p.add_argument(
-        "--router_subset",
-        type=int,
-        default=0,
-        help=(
-            "Limit router-log generation to the first N examples (0 = all). "
-            "Use the same value across slo + accuracy runs to keep request_id aligned."
-        ),
-    )
-    p.add_argument(
-        "--router_log_path",
-        type=str,
-        default="",
-        help=(
-            "Where to write the JSONL router logs. Default: <output_dir>/{split}_logs_{slo|acc}.jsonl"
-        ),
-    )
 
     return p
 
