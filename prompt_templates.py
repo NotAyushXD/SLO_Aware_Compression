@@ -1,246 +1,144 @@
-# prompt_templates.py
 """
-Prompt templates for (MMLU + GSM8K) with two explicit modes:
+prompt_templates.py
 
-- prompt_mode="accuracy": maximize correctness / instruction adherence.
-  * GSM8K: includes 1-2 few-shot exemplars, higher max_new_tokens, ends with "Solution:".
-  * MMLU: concise, answer-only.
+Centralized prompt templates + decoding parameters for the evaluation harness.
 
-- prompt_mode="slo": smaller budgets / shorter outputs (kept for later SLO work).
-
-Design goals (accuracy mode):
-1) Avoid "template continuation" failures (do NOT end prompts with bullet lists).
-2) Avoid placeholder traps like "FINAL_ANSWER: <number>" or "[number only]" which models often copy.
-3) Make the model reliably reach a FINAL_ANSWER line.
-
-This file is *model-agnostic*: it returns plain-text prompts. If you use an Instruct model,
-server.py should wrap (system,user) into the model's chat template.
+Paper-friendly changes:
+- SLO-mode GSM8K prompt is now *concise but not brittle* (accuracy drop was too large).
+- SLO-mode GSM8K max_new_tokens increased modestly to preserve correctness while still
+  encouraging short outputs.
 """
 
 from __future__ import annotations
 
-from typing import Tuple, Dict, Any, List
-import logging
+from typing import Dict, List, Tuple
 
-logger = logging.getLogger(__name__)
-
-PROMPT_MODES = ("slo", "accuracy")
-
-# ---------------------------------------------------------------------------
-# Token budgets
-# ---------------------------------------------------------------------------
-
-# Keep MMLU tiny (we want a single letter). We'll also hard-restrict in server.py.
-MMLU_MAX_NEW_TOKENS = {
-    "slo":      {"easy": 2, "medium": 2, "hard": 2},
-    "accuracy": {"easy": 2, "medium": 2, "hard": 2},
+# Per-dataset max_new_tokens by prompt_mode
+GSM8K_MAX_NEW_TOKENS: Dict[str, int] = {
+    "accuracy": 256,
+    # Increased from 96 -> 160 to avoid brittle truncation and large GSM8K accuracy drop.
+    "slo": 160,
 }
 
-# GSM8K needs room to finish. Accuracy mode budgets are intentionally larger.
-GSM8K_MAX_NEW_TOKENS = {
-    "slo": {
-        # SLO mode should be short, but still long enough to reliably reach
-        # FINAL_ANSWER on multi-step problems.
-        # Keeping the same cap across difficulties improves batching efficiency.
-        "easy": 96,
-        "medium": 96,
-        "hard": 96,
-    },
-    "accuracy": {
-        "easy": 256,
-        "medium": 384,
-        "hard": 512,
-    },
+MMLU_MAX_NEW_TOKENS: Dict[str, int] = {
+    "accuracy": 4,
+    "slo": 4,
 }
 
-DEFAULT_DIFFICULTY = "medium"
 
+def build_gsm8k_prompt(question: str, prompt_mode: str = "accuracy") -> Tuple[str, List[str]]:
+    prompt_mode = (prompt_mode or "accuracy").lower()
 
-def _norm_difficulty(difficulty: str) -> str:
-    d = (difficulty or DEFAULT_DIFFICULTY).lower().strip()
-    if d not in ("easy", "medium", "hard"):
-        logger.warning(f"Unknown difficulty='{difficulty}', using '{DEFAULT_DIFFICULTY}'.")
-        return DEFAULT_DIFFICULTY
-    return d
+    if prompt_mode == "slo":
+        user_prompt = f"""You are running under a strict latency SLO. Be concise but correct.
 
+Rules:
+- Do the math carefully.
+- Write only brief calculations (no explanations). Keep it short (≤ 10 short lines).
+- End with exactly one line: FINAL_ANSWER: <number>
 
-def _norm_prompt_mode(prompt_mode: str) -> str:
-    m = (prompt_mode or "slo").lower().strip()
-    if m not in PROMPT_MODES:
-        logger.warning(f"Unknown prompt_mode='{prompt_mode}', using 'slo'.")
-        return "slo"
-    return m
-
-
-def get_max_tokens(difficulty: str, dataset_type: str, prompt_mode: str = "slo") -> int:
-    """Return max_new_tokens for a dataset+mode+difficulty."""
-    difficulty = _norm_difficulty(difficulty)
-    prompt_mode = _norm_prompt_mode(prompt_mode)
-    dataset_type = (dataset_type or "").lower().strip()
-
-    if dataset_type == "mmlu":
-        return MMLU_MAX_NEW_TOKENS[prompt_mode][difficulty]
-    if dataset_type == "gsm8k":
-        return GSM8K_MAX_NEW_TOKENS[prompt_mode][difficulty]
-
-    # Fallback
-    return 128 if prompt_mode == "accuracy" else 64
-
-
-# ---------------------------------------------------------------------------
-# MMLU prompt building
-# ---------------------------------------------------------------------------
-
-def _parse_mmlu_prompt(raw_prompt: str) -> Tuple[str, Dict[str, str]]:
-    """
-    raw_prompt format from preprocessing:
-      "{question}\nA) ...\nB) ...\nC) ...\nD) ..."
-    """
-    raw_prompt = raw_prompt or ""
-    lines = [ln.strip() for ln in raw_prompt.splitlines() if ln.strip()]
-    question = lines[0] if lines else ""
-
-    choices = {"A": "", "B": "", "C": "", "D": ""}
-    for ln in lines[1:]:
-        if len(ln) >= 3 and ln[0] in "ABCD" and ln[1] == ")":
-            choices[ln[0]] = ln[2:].strip()
-    return question, choices
-
-
-def build_mmlu_prompt(example: Dict[str, Any], prompt_mode: str) -> Tuple[str, str, int, List[str]]:
-    difficulty = _norm_difficulty(example.get("difficulty", DEFAULT_DIFFICULTY))
-    prompt_mode = _norm_prompt_mode(prompt_mode)
-
-    system = "You are a knowledgeable assistant. Answer accurately and concisely."
-
-    raw = example.get("prompt", "")
-    question, choices = _parse_mmlu_prompt(raw)
-
-    # End with an explicit "Answer:" cue; do NOT end with bullet rules.
-    user = (
-        "Answer the following multiple-choice question.\n\n"
-        f"Question: {question}\n\n"
-        f"A) {choices['A']}\n"
-        f"B) {choices['B']}\n"
-        f"C) {choices['C']}\n"
-        f"D) {choices['D']}\n\n"
-        "Select the correct option.\n"
-        "Respond with ONLY the letter (A, B, C, or D).\n\n"
-        "Answer:"
-    )
-
-    max_new_tokens = get_max_tokens(difficulty, "mmlu", prompt_mode)
-    stop_sequences = ["\n"]  # optional (server may enforce token restriction anyway)
-    return system, user, max_new_tokens, stop_sequences
-
-
-# ---------------------------------------------------------------------------
-# GSM8K prompt building
-# ---------------------------------------------------------------------------
-
-_GSM8K_FEWSHOT = (
-    "Example 1:\n"
-    "Problem: A book has 10 pages and you read 3 pages. How many pages are left?\n"
-    "Solution: 10 - 3 = 7\n"
-    "FINAL_ANSWER: 7\n\n"
-    "Example 2:\n"
-    "Problem: Sara has 4 notebooks. She buys 6 more and then loses 2. How many notebooks does she have now?\n"
-    "Solution: 4 + 6 - 2 = 8\n"
-    "FINAL_ANSWER: 8\n\n"
-)
-
-def build_gsm8k_prompt(example: Dict[str, Any], prompt_mode: str) -> Tuple[str, str, int, List[str]]:
-    difficulty = _norm_difficulty(example.get("difficulty", DEFAULT_DIFFICULTY))
-    prompt_mode = _norm_prompt_mode(prompt_mode)
-
-    system = "You are a careful math problem solver."
-
-    rules = (
-        "You will solve a grade-school math word problem.\n"
-        "Write a clear solution.\n"
-        "Your LAST line must be exactly:\n"
-        "FINAL_ANSWER: <number>\n"
-        "Where <number> is the final numeric answer (no units, no extra words).\n"
-    )
-
-    question = example.get("prompt", "")
-
-    if prompt_mode == "accuracy":
-        user = (
-            f"{rules}\n\n"
-            f"{_GSM8K_FEWSHOT}"
-            "Now solve:\n"
-            f"Problem: {question}\n\n"
-            "Solution:"
-        )
+Question:
+{question}
+"""
     else:
-        # SLO mode: keep the prompt short, but strongly steer the model to
-        # (1) be concise and (2) actually emit FINAL_ANSWER within the token cap.
-        # A tiny format-only example improves formatting reliability without
-        # adding a lot of tokens.
-        user = (
-            "Solve the math problem.\n"
-            "Keep the solution concise (<= 6 short lines).\n"
-            "IMPORTANT: your last line MUST use the exact token 'FINAL_ANSWER:' (with underscore).\n"
-            "Do not write 'Final Answer', 'FINAL ANSWER', or any other variation.\n"
-            "End with exactly:\n"
-            "FINAL_ANSWER: <number>\n\n"
-            "Example (format only):\n"
-            "Problem: A book has 10 pages and you read 3 pages. How many pages are left?\n"
-            "Solution: 10 - 3 = 7\n"
-            "FINAL_ANSWER: 7\n\n"
-            f"Problem: {question}\n\n"
-            "Solution:"
-        )
+        # Accuracy mode: allows fuller reasoning
+        user_prompt = f"""Solve the math word problem carefully.
 
-    max_new_tokens = get_max_tokens(difficulty, "gsm8k", prompt_mode)
+Instructions:
+- Show your work step-by-step.
+- End with exactly one line: FINAL_ANSWER: <number>
 
-    # Do not use aggressive stop strings here; server can optionally stop after FINAL_ANSWER.
+Question:
+{question}
+"""
+
     stop_sequences: List[str] = []
-    return system, user, max_new_tokens, stop_sequences
+    return user_prompt, stop_sequences
 
 
-# ---------------------------------------------------------------------------
-# Unified entry point used by load_generator.py and evaluation.py
-# ---------------------------------------------------------------------------
+def build_mmlu_prompt(question: str, choices: Dict[str, str], prompt_mode: str = "accuracy") -> Tuple[str, List[str]]:
+    prompt_mode = (prompt_mode or "accuracy").lower()
 
-def build_llama_formatted_prompt(
-    example: Dict[str, Any],
-    dataset_type: str,
-    prompt_mode: str = "slo",
-) -> Tuple[str, int, List[str]]:
-    """
-    Returns:
-        formatted_prompt: plain text "system\\n\\nuser" (server can split and wrap with chat template)
-        max_new_tokens: int
-        stop_sequences: list[str]
-    """
-    dataset_type = (dataset_type or "").lower().strip()
-    prompt_mode = _norm_prompt_mode(prompt_mode)
+    choice_lines = "\n".join([f"{k}. {v}" for k, v in choices.items()])
 
-    if dataset_type == "mmlu":
-        system, user, max_new_tokens, stops = build_mmlu_prompt(example, prompt_mode)
-    elif dataset_type == "gsm8k":
-        system, user, max_new_tokens, stops = build_gsm8k_prompt(example, prompt_mode)
+    if prompt_mode == "slo":
+        user_prompt = f"""Answer the multiple-choice question under a strict latency SLO.
+
+Rules:
+- Think silently.
+- Output ONLY the single letter (A/B/C/D). No extra text.
+
+Question:
+{question}
+
+Choices:
+{choice_lines}
+"""
     else:
-        # fallback
-        system = "You are a helpful assistant."
-        user = example.get("prompt", "")
-        max_new_tokens = get_max_tokens(example.get("difficulty", DEFAULT_DIFFICULTY), dataset_type, prompt_mode)
-        stops = []
+        user_prompt = f"""Answer the multiple-choice question.
 
-    formatted = f"{system}\n\n{user}".strip()
-    return formatted, max_new_tokens, stops
+Instructions:
+- Choose the best option.
+- Output ONLY the single letter (A/B/C/D). No extra text.
+
+Question:
+{question}
+
+Choices:
+{choice_lines}
+"""
+
+    # Strong stop: newline or end-of-turn token.
+    stop_sequences: List[str] = ["\n", "<|eot_id|>"]
+    return user_prompt, stop_sequences
 
 
-def split_system_user(formatted_prompt: str) -> Tuple[str, str]:
+def get_max_tokens(dataset_type: str, prompt_mode: str) -> int:
+    dataset_type = (dataset_type or "").lower()
+    prompt_mode = (prompt_mode or "accuracy").lower()
+
+    if dataset_type == "gsm8k":
+        return GSM8K_MAX_NEW_TOKENS.get(prompt_mode, GSM8K_MAX_NEW_TOKENS["accuracy"])
+    if dataset_type == "mmlu":
+        return MMLU_MAX_NEW_TOKENS.get(prompt_mode, MMLU_MAX_NEW_TOKENS["accuracy"])
+
+    return 128
+
+
+def build_llama_formatted_prompt(system_prompt: str, user_prompt: str) -> str:
     """
-    Split "system\\n\\nuser" back into (system, user).
-    If not splittable, returns ("", formatted_prompt).
+    Minimal Llama-3 style chat formatting that works both with and without HF chat_template.
+
+    Note: If you rely on tokenizer.apply_chat_template elsewhere, keep this consistent.
     """
-    if not formatted_prompt:
-        return "", ""
-    parts = formatted_prompt.split("\n\n", 1)
-    if len(parts) == 2:
-        return parts[0].strip(), parts[1].strip()
-    return "", formatted_prompt.strip()
+    system_prompt = (system_prompt or "").strip()
+    user_prompt = (user_prompt or "").strip()
+
+    if system_prompt:
+        return f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{user_prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    return f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{user_prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+
+
+def build_prompt(example: Dict, prompt_mode: str) -> Tuple[str, List[str], int]:
+    dataset_type = (example.get("dataset_type") or "").lower()
+    prompt_mode = (prompt_mode or "accuracy").lower()
+
+    # A light system prompt helps standardize behavior across datasets.
+    system_prompt = (
+        "You are a helpful assistant. Follow the requested output format exactly. "
+        "Do not include any additional commentary beyond what is requested."
+    )
+
+    if dataset_type == "gsm8k":
+        user_prompt, stop_sequences = build_gsm8k_prompt(example["question"], prompt_mode=prompt_mode)
+        max_new_tokens = get_max_tokens("gsm8k", prompt_mode)
+    elif dataset_type == "mmlu":
+        user_prompt, stop_sequences = build_mmlu_prompt(example["question"], example["choices"], prompt_mode=prompt_mode)
+        max_new_tokens = get_max_tokens("mmlu", prompt_mode)
+    else:
+        user_prompt = example.get("question", "")
+        stop_sequences = []
+        max_new_tokens = 128
+
+    formatted = build_llama_formatted_prompt(system_prompt, user_prompt)
+    return formatted, stop_sequences, max_new_tokens

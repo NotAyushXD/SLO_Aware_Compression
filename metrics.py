@@ -1,358 +1,240 @@
-# metrics.py
 """
-Metrics calculation and SLO compliance checking
-Computes percentiles, throughput, and SLO attainment
+metrics.py
+
+Metrics and SLO logic for the load test harness.
+
+Paper-friendly changes:
+- Summary now includes prompt/output token statistics.
+- SLO compliance includes separate TTFT/TPOT violation counts (useful for analysis).
+- SLO calibration supports an optional safety margin (multiplicative) so calibrated SLOs
+  are a bit more robust to run-to-run noise.
 """
 
-import numpy as np
-from typing import List, Dict, Optional
-from dataclasses import dataclass
+from __future__ import annotations
+
 import json
-import logging
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-
-
-def calibrate_slos(metrics: List, percentile: float = 95.0) -> Dict:
-    """
-    Calibrate SLOs based on percentile of observed metrics, grouped by difficulty.
-    
-    Args:
-        metrics: List of RequestMetrics objects
-        percentile: Percentile to use for calibration (default 95.0)
-        
-    Returns:
-        Dictionary of SLO thresholds by difficulty
-    """
-    if not metrics:
-        return MetricsCalculator.DEFAULT_SLOS.copy()
-        
-    # Group by difficulty
-    by_difficulty = {}
-    for m in metrics:
-        if not m.success:
-            continue
-        
-        diff = m.difficulty
-        if diff not in by_difficulty:
-            by_difficulty[diff] = {"ttft": [], "tpot": []}
-        
-        by_difficulty[diff]["ttft"].append(m.ttft_ms)
-        by_difficulty[diff]["tpot"].append(m.tpot_ms)
-    
-    calibrated = {}
-    
-    # Calculate percentiles for each difficulty
-    for diff, values in by_difficulty.items():
-        ttft_p = np.percentile(values["ttft"], percentile) if values["ttft"] else 0
-        tpot_p = np.percentile(values["tpot"], percentile) if values["tpot"] else 0
-        
-        # Round up to nearest unit for cleaner numbers (optional, but good for SLOs)
-        calibrated[diff] = {
-            "ttft_ms": float(np.ceil(ttft_p)),
-            "tpot_ms": float(np.ceil(tpot_p))
-        }
-    
-    # Fill in missing difficulties with defaults or estimates
-    for diff in MetricsCalculator.DEFAULT_SLOS:
-        if diff not in calibrated:
-            calibrated[diff] = MetricsCalculator.DEFAULT_SLOS[diff].copy()
-            
-    logger.info(f"Calibrated SLOs at p{percentile}: {calibrated}")
-    return calibrated
+import math
+import statistics
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
-class PercentileMetrics:
-    """Container for percentile-based metrics"""
-    p50: float
-    p75: float
-    p90: float
-    p95: float
-    p99: float
-    mean: float
-    std: float
+class SLOProfile:
+    ttft_ms: float
+    tpot_ms: float
+
+
+@dataclass
+class InferenceMetrics:
+    request_id: int
+    success: bool
+    error: Optional[str]
+    submit_time: float
+    start_time: float
+    end_time: float
+
+    prompt_tokens: int
+    output_tokens: int
+
+    # From server (may be None if unavailable)
+    ttft_ms: Optional[float]
+    tpot_ms: Optional[float]
+    queue_wait_ms: Optional[float]
+
+    dataset_type: str
+    difficulty: str
+    prompt_mode: str
+    variant: str = "unknown"
+
+    def e2e_latency_ms(self) -> float:
+        return max(0.0, (self.end_time - self.submit_time) * 1000.0)
 
 
 class MetricsCalculator:
-    """Calculate comprehensive metrics from request logs"""
-    
-    # Default SLO targets by difficulty level
-    # DEFAULT_SLOS = {
-    #     "easy": {"ttft_ms": 200, "tpot_ms": 20},
-    #     "medium": {"ttft_ms": 300, "tpot_ms": 25},
-    #     "hard": {"ttft_ms": 500, "tpot_ms": 40}
-    # }
-    DEFAULT_SLOS = {
-        "easy": {"ttft_ms": 150, "tpot_ms": 1000},
-        "medium": {"ttft_ms": 250, "tpot_ms": 1000},
-        "hard": {"ttft_ms": 400, "tpot_ms": 1500}
-    }
-    
-    def __init__(self, request_metrics: List, slo_dict: Optional[Dict] = None):
-        """
-        Args:
-            request_metrics: List of RequestMetrics objects
-            slo_dict: SLO thresholds by difficulty; uses defaults if None
-        """
-        self.metrics = request_metrics
-        self.slo_dict = slo_dict or self.DEFAULT_SLOS
-        
-        logger.info(f"Initialized MetricsCalculator with {len(request_metrics)} metrics")
-    
-    def calculate_percentiles(self, values: List[float]) -> PercentileMetrics:
-        """Calculate percentile metrics from values list"""
+    def __init__(self, metrics: List[InferenceMetrics], slo_profiles: Optional[Dict[str, SLOProfile]] = None):
+        self.metrics = metrics
+        self.slo_profiles = slo_profiles or {}
+        self._cached_summary: Optional[Dict[str, Any]] = None
+
+    # -----------------------------
+    # Helpers
+    # -----------------------------
+    @staticmethod
+    def _percentile(values: List[float], p: float) -> float:
         if not values:
-            return PercentileMetrics(0, 0, 0, 0, 0, 0, 0)
-        
-        values = sorted(values)
-        return PercentileMetrics(
-            p50=float(np.percentile(values, 50)),
-            p75=float(np.percentile(values, 75)),
-            p90=float(np.percentile(values, 90)),
-            p95=float(np.percentile(values, 95)),
-            p99=float(np.percentile(values, 99)),
-            mean=float(np.mean(values)),
-            std=float(np.std(values))
-        )
-    
-    def compute_all_metrics(self) -> Dict:
-        """
-        Compute comprehensive metrics across all requests
-        
-        Returns:
-            Dict with summary, latency, throughput, and SLO metrics
-        """
-        # Basic statistics
-        total_requests = len(self.metrics)
+            return float("nan")
+        if p <= 0:
+            return min(values)
+        if p >= 100:
+            return max(values)
+        k = (len(values) - 1) * (p / 100.0)
+        f = math.floor(k)
+        c = math.ceil(k)
+        if f == c:
+            return sorted(values)[int(k)]
+        d0 = sorted(values)[int(f)] * (c - k)
+        d1 = sorted(values)[int(c)] * (k - f)
+        return d0 + d1
+
+    @staticmethod
+    def _safe_mean(values: List[float]) -> float:
+        return float(statistics.mean(values)) if values else float("nan")
+
+    @staticmethod
+    def _safe_stdev(values: List[float]) -> float:
+        return float(statistics.pstdev(values)) if len(values) > 1 else 0.0
+
+    # -----------------------------
+    # Summary
+    # -----------------------------
+    def summary(self) -> Dict[str, Any]:
+        if self._cached_summary is not None:
+            return self._cached_summary
+
+        total = len(self.metrics)
         successful = sum(1 for m in self.metrics if m.success)
-        success_rate = successful / max(total_requests, 1)
-        
-        # Extract latency values
-        ttft_values = [m.ttft_ms for m in self.metrics if m.ttft_ms > 0]
-        tpot_values = [m.tpot_ms for m in self.metrics if m.tpot_ms > 0]
-        e2e_latency_values = [m.e2e_latency_ms for m in self.metrics]
-        queue_wait_values = [m.queue_wait_time_ms for m in self.metrics]
-        
-        # Calculate percentiles
-        ttft_percentiles = self.calculate_percentiles(ttft_values)
-        tpot_percentiles = self.calculate_percentiles(tpot_values)
-        e2e_percentiles = self.calculate_percentiles(e2e_latency_values)
-        queue_percentiles = self.calculate_percentiles(queue_wait_values)
-        
-        # Throughput calculation
+        failed = total - successful
+
+        e2e = [m.e2e_latency_ms() for m in self.metrics if m.success]
+        ttft = [m.ttft_ms for m in self.metrics if m.success and m.ttft_ms is not None]
+        tpot = [m.tpot_ms for m in self.metrics if m.success and m.tpot_ms is not None]
+        qwait = [m.queue_wait_ms for m in self.metrics if m.success and m.queue_wait_ms is not None]
+
+        output_tokens = [m.output_tokens for m in self.metrics if m.success]
+        prompt_tokens = [m.prompt_tokens for m in self.metrics if m.success]
+
+        # Throughput: output tokens / wall time of the whole test (using end-start across all requests)
         if self.metrics:
-            first_submit = min(m.submit_time for m in self.metrics)
-            last_complete = max(m.end_time for m in self.metrics)
-            total_duration = max(last_complete - first_submit, 0.001)
-            
-            total_output_tokens = sum(m.inference_metrics.get("output_length", 0)
-                                      for m in self.metrics if m.success)
-            throughput = total_output_tokens / total_duration
+            test_start = min(m.submit_time for m in self.metrics)
+            test_end = max(m.end_time for m in self.metrics)
+            duration_s = max(1e-6, test_end - test_start)
         else:
-            throughput = 0
-        
-        # SLO compliance check
-        slo_compliant = 0
-        slo_violations = 0
-        slo_violation_details = []
-        
+            duration_s = 0.0
+
+        throughput_toks = (sum(output_tokens) / duration_s) if duration_s > 0 else 0.0
+
+        # SLO compliance
+        slo_ok_count = 0
+        slo_ttft_viol = 0
+        slo_tpot_viol = 0
+        slo_total_checked = 0
+
         for m in self.metrics:
             if not m.success:
-                slo_violations += 1
                 continue
-            
-            difficulty = m.difficulty
-            slo = self.slo_dict.get(difficulty, self.slo_dict["medium"])
-            
-            ttft = m.ttft_ms
-            tpot = m.tpot_ms
-            
-            # Check SLO compliance
-            ttft_ok = ttft <= slo["ttft_ms"]
-            tpot_ok = tpot <= slo["tpot_ms"]
-            
-            if ttft_ok and tpot_ok:
-                slo_compliant += 1
-            else:
-                slo_violations += 1
-                slo_violation_details.append({
-                    "request_id": m.request_id,
-                    "difficulty": difficulty,
-                    "ttft_ms": ttft,
-                    "ttft_slo": slo["ttft_ms"],
-                    "ttft_ok": ttft_ok,
-                    "tpot_ms": tpot,
-                    "tpot_slo": slo["tpot_ms"],
-                    "tpot_ok": tpot_ok,
-                })
-        
-        slo_compliance = slo_compliant / max(successful, 1)
-        
-        # Escalation analysis (requests routed to expensive variants)
-        # For single-variant baseline, this is 0
-        escalation_rate = 0.0
-        
-        return {
-            "summary": {
-                "total_requests": total_requests,
-                "successful_requests": successful,
-                "failed_requests": total_requests - successful,
-                "success_rate": success_rate,
-                "slo_compliant": slo_compliant,
-                "slo_violations": slo_violations,
-                "slo_compliance": slo_compliance,
-                "escalation_rate": escalation_rate,
-                "total_duration_sec": total_duration if self.metrics else 0,
-                "throughput_tokens_per_sec": throughput
+            prof = self.slo_profiles.get(m.difficulty)
+            if not prof:
+                continue
+
+            slo_total_checked += 1
+            ok = True
+            if m.ttft_ms is not None and m.ttft_ms > prof.ttft_ms:
+                ok = False
+                slo_ttft_viol += 1
+            if m.tpot_ms is not None and m.tpot_ms > prof.tpot_ms:
+                ok = False
+                slo_tpot_viol += 1
+            if ok:
+                slo_ok_count += 1
+
+        slo_compliance = (slo_ok_count / slo_total_checked) if slo_total_checked > 0 else float("nan")
+
+        out: Dict[str, Any] = {
+            "total_requests": total,
+            "successful": successful,
+            "failed": failed,
+            "success_rate": (successful / total) if total > 0 else float("nan"),
+            "total_duration_sec": duration_s,
+            "throughput_tokens_per_sec": throughput_toks,
+            "slo_checked": slo_total_checked,
+            "slo_compliance": slo_compliance,
+            "slo_violations_total": (slo_total_checked - slo_ok_count) if slo_total_checked > 0 else 0,
+            "slo_violations_ttft": slo_ttft_viol,
+            "slo_violations_tpot": slo_tpot_viol,
+            "latency_ms": {
+                "e2e": self._latency_block(e2e),
+                "ttft": self._latency_block(ttft),
+                "tpot": self._latency_block(tpot),
+                "queue_wait": self._latency_block(qwait),
             },
-            "ttft": {
-                "p50": ttft_percentiles.p50,
-                "p75": ttft_percentiles.p75,
-                "p90": ttft_percentiles.p90,
-                "p95": ttft_percentiles.p95,
-                "p99": ttft_percentiles.p99,
-                "mean": ttft_percentiles.mean,
-                "std": ttft_percentiles.std
+            "tokens": {
+                "prompt_total": int(sum(prompt_tokens)),
+                "output_total": int(sum(output_tokens)),
+                "prompt_mean": self._safe_mean([float(x) for x in prompt_tokens]),
+                "output_mean": self._safe_mean([float(x) for x in output_tokens]),
+                "prompt_p95": self._percentile([float(x) for x in prompt_tokens], 95),
+                "output_p95": self._percentile([float(x) for x in output_tokens], 95),
             },
-            "tpot": {
-                "p50": tpot_percentiles.p50,
-                "p75": tpot_percentiles.p75,
-                "p90": tpot_percentiles.p90,
-                "p95": tpot_percentiles.p95,
-                "p99": tpot_percentiles.p99,
-                "mean": tpot_percentiles.mean,
-                "std": tpot_percentiles.std
-            },
-            "e2e_latency": {
-                "p50": e2e_percentiles.p50,
-                "p75": e2e_percentiles.p75,
-                "p90": e2e_percentiles.p90,
-                "p95": e2e_percentiles.p95,
-                "p99": e2e_percentiles.p99,
-                "mean": e2e_percentiles.mean,
-                "std": e2e_percentiles.std
-            },
-            "queue_wait": {
-                "p50": queue_percentiles.p50,
-                "p75": queue_percentiles.p75,
-                "p90": queue_percentiles.p90,
-                "p95": queue_percentiles.p95,
-                "p99": queue_percentiles.p99,
-                "mean": queue_percentiles.mean,
-                "std": queue_percentiles.std
-            },
-            "slo_violations": slo_violation_details[:10]  # First 10 violations
         }
-    
-    def print_report(self, title: str = "BASELINE SERVER METRICS REPORT"):
-        """Print formatted metrics report"""
-        metrics = self.compute_all_metrics()
-        
-        print("\n" + "="*80)
-        print(title)
-        print("="*80)
-        
-        # Summary section
-        print("\nSUMMARY:")
-        print(f"  Total Requests:        {metrics['summary']['total_requests']:6d}")
-        print(f"  Successful:            {metrics['summary']['successful_requests']:6d}")
-        print(f"  Failed:                {metrics['summary']['failed_requests']:6d}")
-        print(f"  Success Rate:          {metrics['summary']['success_rate']*100:6.2f}%")
-        print(f"  Total Duration:        {metrics['summary']['total_duration_sec']:6.2f} seconds")
-        print(f"  Throughput:            {metrics['summary']['throughput_tokens_per_sec']:6.1f} tokens/sec")
-        print(f"  SLO Compliance:        {metrics['summary']['slo_compliance']*100:6.2f}%")
-        print(f"  SLO Violations:        {metrics['summary']['slo_violations']:6d}")
-        print(f"  Escalation Rate:       {metrics['summary']['escalation_rate']*100:6.2f}%")
-        
-        # TTFT section
-        print("\nTTFT (Time-to-First-Token) in milliseconds:")
-        print(f"  P50:  {metrics['ttft']['p50']:7.2f} ms")
-        print(f"  P75:  {metrics['ttft']['p75']:7.2f} ms")
-        print(f"  P90:  {metrics['ttft']['p90']:7.2f} ms")
-        print(f"  P95:  {metrics['ttft']['p95']:7.2f} ms")
-        print(f"  P99:  {metrics['ttft']['p99']:7.2f} ms")
-        print(f"  Mean: {metrics['ttft']['mean']:7.2f} ms (±{metrics['ttft']['std']:.2f})")
-        
-        # TPOT section
-        print("\nTPOT (Time-Per-Output-Token) in milliseconds:")
-        print(f"  P50:  {metrics['tpot']['p50']:7.2f} ms")
-        print(f"  P75:  {metrics['tpot']['p75']:7.2f} ms")
-        print(f"  P90:  {metrics['tpot']['p90']:7.2f} ms")
-        print(f"  P95:  {metrics['tpot']['p95']:7.2f} ms")
-        print(f"  P99:  {metrics['tpot']['p99']:7.2f} ms")
-        print(f"  Mean: {metrics['tpot']['mean']:7.2f} ms (±{metrics['tpot']['std']:.2f})")
-        
-        # E2E Latency section
-        print("\nE2E Latency (End-to-End) in milliseconds:")
-        print(f"  P50:  {metrics['e2e_latency']['p50']:7.2f} ms")
-        print(f"  P75:  {metrics['e2e_latency']['p75']:7.2f} ms")
-        print(f"  P90:  {metrics['e2e_latency']['p90']:7.2f} ms")
-        print(f"  P95:  {metrics['e2e_latency']['p95']:7.2f} ms")
-        print(f"  P99:  {metrics['e2e_latency']['p99']:7.2f} ms")
-        print(f"  Mean: {metrics['e2e_latency']['mean']:7.2f} ms (±{metrics['e2e_latency']['std']:.2f})")
-        
-        # Queue wait section
-        print("\nQueue Wait Time in milliseconds:")
-        print(f"  P50:  {metrics['queue_wait']['p50']:7.2f} ms")
-        print(f"  P95:  {metrics['queue_wait']['p95']:7.2f} ms")
-        print(f"  P99:  {metrics['queue_wait']['p99']:7.2f} ms")
-        print(f"  Mean: {metrics['queue_wait']['mean']:7.2f} ms")
-        
-        # SLO violations
-        if metrics['slo_violations']:
-            print("\nSample SLO Violations (first 10):")
-            for i, v in enumerate(metrics['slo_violations'][:10], 1):
-                parts = []
-                if not v.get('ttft_ok', True):
-                    parts.append(f"TTFT: {v['ttft_ms']:.1f}ms > {v['ttft_slo']}ms SLO")
-                if not v.get('tpot_ok', True):
-                    parts.append(f"TPOT: {v['tpot_ms']:.1f}ms > {v['tpot_slo']}ms SLO")
-                # Backward compatible fallback (should be rare)
-                if not parts:
-                    parts.append(f"TTFT: {v['ttft_ms']:.1f}ms > {v['ttft_slo']}ms SLO")
-                    parts.append(f"TPOT: {v['tpot_ms']:.1f}ms > {v['tpot_slo']}ms SLO")
-                print(f"  {i}. Request {v['request_id']} ({v['difficulty']}): " + " | ".join(parts))
-        
-        print("\n" + "="*80)
-        
-        return metrics
-    
-    def save_metrics(self, output_file: str):
-        """Save metrics to JSON file"""
-        metrics = self.compute_all_metrics()
-        with open(output_file, 'w') as f:
-            json.dump(metrics, f, indent=2)
-        logger.info(f"Saved metrics to {output_file}")
 
+        self._cached_summary = out
+        return out
 
-if __name__ == "__main__":
-    # Test with mock metrics
-    from load_generator import RequestMetrics
-    
-    # Create mock metrics
-    mock_metrics = [
-        RequestMetrics(
-            request_id=i,
-            dataset_type="mmlu",
-            submit_time=time.time() - 100 + i * 0.1,
-            start_time=time.time() - 100 + i * 0.1,
-            end_time=time.time() - 100 + i * 0.1 + 0.5,
-            difficulty="easy" if i % 3 == 0 else "medium",
-            inference_metrics={
-                "ttft_ms": 50 + i % 50,
-                "tpot_ms": 15 + i % 10,
-                "output_length": 100,
-                "success": True
+    def _latency_block(self, values: List[float]) -> Dict[str, Any]:
+        if not values:
+            return {
+                "p50": float("nan"),
+                "p75": float("nan"),
+                "p90": float("nan"),
+                "p95": float("nan"),
+                "p99": float("nan"),
+                "mean": float("nan"),
+                "stdev": float("nan"),
             }
-        )
-        for i in range(100)
-    ]
-    
-    calc = MetricsCalculator(mock_metrics)
-    calc.print_report("TEST METRICS REPORT")
+        return {
+            "p50": self._percentile(values, 50),
+            "p75": self._percentile(values, 75),
+            "p90": self._percentile(values, 90),
+            "p95": self._percentile(values, 95),
+            "p99": self._percentile(values, 99),
+            "mean": self._safe_mean(values),
+            "stdev": self._safe_stdev(values),
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.summary(), indent=2)
+
+    def save_json(self, path: str):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(self.to_json())
+
+
+def calibrate_slos(
+    metrics: List[InferenceMetrics],
+    percentile: float = 95.0,
+    safety_margin: float = 1.00,
+    defaults: Optional[Dict[str, SLOProfile]] = None,
+) -> Dict[str, SLOProfile]:
+    """
+    Calibrate SLO thresholds from a set of metrics.
+
+    safety_margin: multiplicative factor (>1.0 loosens, <1.0 tightens)
+    """
+    defaults = defaults or {
+        "easy": SLOProfile(ttft_ms=300, tpot_ms=150),
+        "medium": SLOProfile(ttft_ms=500, tpot_ms=250),
+        "hard": SLOProfile(ttft_ms=800, tpot_ms=400),
+    }
+
+    # Group by difficulty
+    by_diff: Dict[str, List[InferenceMetrics]] = {}
+    for m in metrics:
+        if not m.success:
+            continue
+        by_diff.setdefault(m.difficulty, []).append(m)
+
+    out: Dict[str, SLOProfile] = {}
+    for diff, default_prof in defaults.items():
+        group = by_diff.get(diff, [])
+        ttft_vals = [m.ttft_ms for m in group if m.ttft_ms is not None]
+        tpot_vals = [m.tpot_ms for m in group if m.tpot_ms is not None]
+
+        if ttft_vals and tpot_vals:
+            ttft_p = MetricsCalculator._percentile([float(x) for x in ttft_vals], percentile) * float(safety_margin)
+            tpot_p = MetricsCalculator._percentile([float(x) for x in tpot_vals], percentile) * float(safety_margin)
+            out[diff] = SLOProfile(ttft_ms=float(ttft_p), tpot_ms=float(tpot_p))
+        else:
+            out[diff] = default_prof
+
+    return out
