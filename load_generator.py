@@ -1,229 +1,170 @@
-# load_generator.py
-"""
-Closed-loop load generator (fixed concurrency).
+"""load_generator.py
 
-Key fixes vs earlier versions:
-- True closed-loop behavior: keep ~N in-flight requests until total is reached.
-- Correct queue_wait_time_ms: submit_time recorded at submission, start_time when worker starts.
-- Adds prompt_mode plumbing (accuracy vs slo) without breaking parallel execution.
+Closed-loop load generator for the SLO-aware compression harness.
 
-This tool is mainly for your SLO work. For pure accuracy debugging you can also
-skip load tests via --skip_load_test in run_baseline_evaluation.py (added in v7).
+Design goals:
+- Simple and dependency-light (threads, not asyncio)
+- Works with `SingleVariantServer.generate()` (server.py)
+- Captures latency metrics at the request level so `metrics.py` can compute
+  TTFT/TPOT/E2E/queue percentiles and SLO compliance.
+
+The generator is "closed loop": each worker sends the next request only after
+it finishes the previous one. This approximates many real serving setups where
+clients wait for a response before sending the next request.
 """
 
 from __future__ import annotations
 
-import time
 import json
+import random
 import threading
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-from typing import List, Dict, Callable, Any, Optional
-from dataclasses import dataclass, asdict
-import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict
+from typing import Any, Dict, List, Optional
 
-from prompt_templates import build_llama_formatted_prompt
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-
-@dataclass
-class RequestMetrics:
-    request_id: int
-    dataset_type: str
-    submit_time: float
-    start_time: float
-    end_time: float
-    difficulty: str
-    inference_metrics: Dict[str, Any]
-
-    @property
-    def e2e_latency_ms(self) -> float:
-        return (self.end_time - self.submit_time) * 1000.0
-
-    @property
-    def queue_wait_time_ms(self) -> float:
-        return (self.start_time - self.submit_time) * 1000.0
-
-    @property
-    def inference_time_ms(self) -> float:
-        return (self.end_time - self.start_time) * 1000.0
-
-    @property
-    def ttft_ms(self) -> float:
-        return float(self.inference_metrics.get("ttft_ms", 0.0) or 0.0)
-
-    @property
-    def tpot_ms(self) -> float:
-        return float(self.inference_metrics.get("tpot_ms", 0.0) or 0.0)
-
-    @property
-    def success(self) -> bool:
-        return bool(self.inference_metrics.get("success", False))
-
-    def to_dict(self) -> Dict[str, Any]:
-        d = asdict(self)
-        d["e2e_latency_ms"] = self.e2e_latency_ms
-        d["queue_wait_time_ms"] = self.queue_wait_time_ms
-        d["inference_time_ms"] = self.inference_time_ms
-        return d
+from metrics import InferenceMetrics
+from prompt_templates import build_prompt
 
 
 class ClosedLoopLoadGenerator:
     def __init__(
         self,
-        inference_func: Callable[..., Any],
-        max_concurrency: int,
-        num_requests: int,
-        data_loader: List[Dict[str, Any]],
-        prompt_mode: str = "slo",
-        seed: int = 0,
-    ):
-        self.inference_func = inference_func
-        self.max_concurrency = int(max_concurrency)
-        self.num_requests = int(num_requests)
-        self.data_loader = data_loader
+        server: Any,
+        concurrency: int,
+        total_requests: int,
+        data_pool: List[Dict[str, Any]],
+        prompt_mode: str,
+        max_new_tokens: int,
+        seed: int = 123,
+    ) -> None:
+        self.server = server
+        self.concurrency = int(concurrency)
+        self.total_requests = int(total_requests)
+        self.data_pool = data_pool
         self.prompt_mode = prompt_mode
-        self.seed = seed
+        self.max_new_tokens = int(max_new_tokens)
+        self.rng = random.Random(seed)
 
-        self.request_metrics: List[RequestMetrics] = []
         self._lock = threading.Lock()
+        self._next_request_id = 0
 
-        logger.info("Initialized ClosedLoopLoadGenerator")
-        logger.info(f"  Concurrency: {self.max_concurrency}")
-        logger.info(f"  Total requests: {self.num_requests}")
-        logger.info(f"  Data pool size: {len(self.data_loader)}")
-        logger.info(f"  Prompt mode: {self.prompt_mode}")
+    def _sample_example(self) -> Dict[str, Any]:
+        return self.rng.choice(self.data_pool)
 
-    def _select_example(self, request_id: int) -> Dict[str, Any]:
-        # deterministic cycling is fine for load testing
-        if not self.data_loader:
-            return {"dataset": "unknown", "prompt": "", "answer": "", "difficulty": "medium"}
-        return self.data_loader[request_id % len(self.data_loader)]
+    def _run_one(self, request_id: int) -> InferenceMetrics:
+        ex = self._sample_example()
+        dataset_type = ex.get("dataset_type") or ex.get("dataset") or "gsm8k"
+        difficulty = ex.get("difficulty", "easy")
+        question = ex.get("question")
 
-    def run_request(self, request_id: int, submit_time: float) -> RequestMetrics:
-        ex = self._select_example(request_id)
-        dataset_type = ex.get("dataset", "unknown")
-        difficulty = ex.get("difficulty", "medium")
+        if question is None:
+            # Fallback for older processed format (stores `prompt` only)
+            question = str(ex.get("prompt", ""))
 
-        # When the worker thread begins executing.
-        worker_start_time = time.time()
-        inference_metrics: Dict[str, Any] = {}
+        choices = ex.get("choices")
 
-        try:
-            prompt, max_tokens, _stops = build_llama_formatted_prompt(ex, dataset_type, prompt_mode=self.prompt_mode)
+        prompt = build_prompt(
+            dataset_type=dataset_type,
+            question=question,
+            choices=choices,
+            prompt_mode=self.prompt_mode,
+            difficulty=difficulty,
+        )
 
-            # Call server.generate; keep backward-compat fallbacks
-            try:
-                _text, inf = self.inference_func(
-                    prompt=prompt,
-                    max_tokens=max_tokens,
-                    difficulty=difficulty,
-                    dataset_type=dataset_type,
-                    prompt_mode=self.prompt_mode,
-                )
-            except TypeError:
-                # Older server.generate signatures
-                _text, inf = self.inference_func(prompt=prompt, max_tokens=max_tokens, difficulty=difficulty)
-
-            inference_metrics = inf or {}
-        except Exception as e:
-            inference_metrics = {"success": False, "error": str(e)}
-
+        submit_time = time.time()
+        start_time = time.time()
+        outputs, per_req_metrics = self.server.generate(
+            [prompt],
+            dataset_type=dataset_type,
+            difficulty=difficulty,
+            prompt_mode=self.prompt_mode,
+            max_new_tokens=self.max_new_tokens,
+            temperature=0.0,
+        )
         end_time = time.time()
 
-        # Queue wait time should reflect *both*:
-        #  1) executor/client-side queuing (submit -> worker starts)
-        #  2) server-side queuing/scheduling (server-reported queue_wait_ms)
-        server_queue_ms = float(inference_metrics.get("queue_wait_ms", 0.0) or 0.0)
-        executor_queue_ms = max(0.0, (worker_start_time - submit_time) * 1000.0)
-        total_queue_ms = executor_queue_ms + max(0.0, server_queue_ms)
+        metrics_dict = per_req_metrics[0] if per_req_metrics else {}
 
-        # Define start_time as "when inference *actually* starts" for metrics:
-        # submit_time + total_queue_ms
-        start_time = submit_time + (total_queue_ms / 1000.0)
-        if start_time > end_time:
-            # Extremely defensive clamp (shouldn't happen, but avoids negative inference_time_ms)
-            start_time = worker_start_time
-
-        rm = RequestMetrics(
+        return InferenceMetrics(
             request_id=request_id,
-            dataset_type=dataset_type,
+            variant=str(getattr(self.server, "variant", "unknown")),
+            dataset_type=str(dataset_type),
+            difficulty=str(difficulty),
+            prompt_mode=str(self.prompt_mode),
+            success=True,
             submit_time=submit_time,
             start_time=start_time,
             end_time=end_time,
-            difficulty=difficulty,
-            inference_metrics=inference_metrics,
+            queue_wait_ms=float(metrics_dict.get("queue_wait_ms", 0.0) or 0.0),
+            ttft_ms=float(metrics_dict.get("ttft_ms", 0.0) or 0.0),
+            tpot_ms=float(metrics_dict.get("tpot_ms", 0.0) or 0.0),
+            prompt_tokens=int(metrics_dict.get("prompt_tokens", 0) or 0),
+            output_tokens=int(metrics_dict.get("output_tokens", metrics_dict.get("output_length", 0)) or 0),
         )
-        return rm
 
-    def run(self) -> List[RequestMetrics]:
-        logger.info("=" * 70)
-        logger.info(f"STARTING LOAD TEST: {self.num_requests} requests @ {self.max_concurrency} concurrency")
-        logger.info("=" * 70)
+    def _worker_loop(self) -> List[InferenceMetrics]:
+        results: List[InferenceMetrics] = []
+        while True:
+            with self._lock:
+                if self._next_request_id >= self.total_requests:
+                    break
+                request_id = self._next_request_id
+                self._next_request_id += 1
 
-        t0 = time.time()
-
-        in_flight = {}
-        next_id = 0
-
-        with ThreadPoolExecutor(max_workers=self.max_concurrency) as pool:
-            # Initial fill
-            while next_id < self.num_requests and len(in_flight) < self.max_concurrency:
-                submit_time = time.time()
-                fut = pool.submit(self.run_request, next_id, submit_time)
-                in_flight[fut] = next_id
-                next_id += 1
-
-            completed = 0
-            last_log = t0
-
-            while in_flight:
-                done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
-
-                for fut in done:
-                    req_id = in_flight.pop(fut)
-                    try:
-                        rm = fut.result()
-                    except Exception as e:
-                        rm = RequestMetrics(
-                            request_id=req_id,
-                            dataset_type="unknown",
-                            submit_time=t0,
-                            start_time=t0,
-                            end_time=time.time(),
-                            difficulty="medium",
-                            inference_metrics={"success": False, "error": str(e)},
-                        )
-
-                    with self._lock:
-                        self.request_metrics.append(rm)
-
-                    completed += 1
-
-                    # Submit next to maintain closed-loop
-                    if next_id < self.num_requests:
-                        submit_time = time.time()
-                        nfut = pool.submit(self.run_request, next_id, submit_time)
-                        in_flight[nfut] = next_id
-                        next_id += 1
-
+            try:
+                results.append(self._run_one(request_id))
+            except Exception:
+                # Record failure with timestamps so metrics can still compute duration.
                 now = time.time()
-                if now - last_log > 30 and completed > 0:
-                    rate = completed / max(now - t0, 1e-6)
-                    eta = (self.num_requests - completed) / max(rate, 1e-6)
-                    logger.info(f"Progress: {completed}/{self.num_requests} ({rate:.2f} req/sec, ETA: {eta:.0f}s)")
-                    last_log = now
+                results.append(
+                    InferenceMetrics(
+                        request_id=request_id,
+                        variant=str(getattr(self.server, "variant", "unknown")),
+                        dataset_type="unknown",
+                        difficulty="unknown",
+                        prompt_mode=str(self.prompt_mode),
+                        success=False,
+                        submit_time=now,
+                        start_time=now,
+                        end_time=now,
+                        queue_wait_ms=0.0,
+                        ttft_ms=0.0,
+                        tpot_ms=0.0,
+                        prompt_tokens=0,
+                        output_tokens=0,
+                    )
+                )
+        return results
 
-        total = time.time() - t0
-        logger.info(f"Load test complete in {total:.1f}s")
-        return self.request_metrics
+    def run(self, log_every: int = 5) -> List[InferenceMetrics]:
+        """Run the load test and return per-request metrics."""
+        if not self.data_pool:
+            raise ValueError("data_pool is empty; cannot run load test")
 
-    def save_metrics(self, path: str) -> None:
-        with open(path, "w") as f:
-            for m in self.request_metrics:
-                f.write(json.dumps(m.to_dict()) + "\n")
-        logger.info(f"Saved metrics to {path}")
+        start = time.time()
+        all_results: List[InferenceMetrics] = []
+
+        with ThreadPoolExecutor(max_workers=self.concurrency) as ex:
+            futures = [ex.submit(self._worker_loop) for _ in range(self.concurrency)]
+            done_count = 0
+            for fut in as_completed(futures):
+                worker_results = fut.result()
+                all_results.extend(worker_results)
+                done_count += len(worker_results)
+                if log_every and done_count % log_every == 0:
+                    elapsed = time.time() - start
+                    rps = done_count / elapsed if elapsed > 0 else 0.0
+                    print(f"Progress: {done_count}/{self.total_requests} ({rps:.2f} req/sec)")
+
+        # Ensure stable order by request_id
+        all_results.sort(key=lambda m: m.request_id)
+        total_time = time.time() - start
+        print(f"Load test complete in {total_time:.1f}s")
+        return all_results
+
+    @staticmethod
+    def save_requests_jsonl(metrics_list: List[InferenceMetrics], path: str) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            for m in metrics_list:
+                f.write(json.dumps(asdict(m)) + "\n")

@@ -297,6 +297,9 @@ class SingleVariantServer:
     @staticmethod
     def _resolve_dtype(dtype: str) -> torch.dtype:
         dtype = str(dtype).lower()
+        # Backward-compatible default used by older harnesses.
+        if dtype == "auto":
+            return torch.float16
         if dtype in {"float16", "fp16"}:
             return torch.float16
         if dtype in {"bfloat16", "bf16"}:
