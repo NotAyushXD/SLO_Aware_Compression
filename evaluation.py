@@ -1,217 +1,209 @@
-"""evaluation.py
+# evaluation.py
+"""Evaluation utilities for MMLU + GSM8K.
 
-Accuracy/format evaluation for GSM8K + MMLU for the SLO-aware compression harness.
-
-Key design choice:
-- We evaluate *task correctness* (GSM8K numeric answer, MMLU choice letter)
-- We track *format compliance* separately (did the model output the expected format)
-
-The evaluation runs against a `SingleVariantServer` (server.py) via:
-    outputs, per_request_metrics = server.generate([...])
-
-This keeps the evaluation logic identical across variants (base/med/cheap).
+Key goals:
+- Strict answer extraction (avoid "grab last number" fallbacks).
+- Separate "format adherence" from correctness.
+- Save per-example debug info (including inference timing components).
 """
 
 from __future__ import annotations
 
-import json
+import logging
 import re
-from dataclasses import asdict
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
-from prompt_templates import build_prompt
+from prompt_templates import build_llama_formatted_prompt
 
-
-# -----------------------------
-# Parsing helpers
-# -----------------------------
-
-_MMLU_LETTERS = {"A", "B", "C", "D"}
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 
-def _extract_mmlu_answer(text: str) -> Optional[str]:
-    """Return first A/B/C/D letter found at start of output (robust)."""
-    if text is None:
-        return None
-    s = str(text).strip()
-    if not s:
-        return None
+class EvaluationMetrics:
+    @staticmethod
+    def extract_mmlu_answer(text: str) -> str:
+        if not text:
+            return ""
+        t = text.strip().upper()
 
-    # Common patterns: "A", "A.", "A)" etc.
-    m = re.match(r"^\s*([A-D])\b", s)
-    if m:
-        return m.group(1)
+        m = re.search(r"(?:FINAL\s*ANSWER|ANSWER|CORRECT\s*ANSWER)\s*[:=\s]*([A-D])\b", t)
+        if m:
+            return m.group(1)
 
-    # As a fallback, find the first occurrence of an isolated letter.
-    m = re.search(r"\b([A-D])\b", s)
-    if m:
-        return m.group(1)
+        m = re.fullmatch(r"\s*([A-D])[\.\)]?\s*", t)
+        if m:
+            return m.group(1)
 
-    return None
+        first = t.splitlines()[0].strip() if t.splitlines() else t.strip()
+        m = re.fullmatch(r"([A-D])[\.\)]?", first)
+        if m:
+            return m.group(1)
 
+        return ""
 
-def _normalize_number_string(s: str) -> str:
-    s = s.strip()
-    s = s.replace(",", "")
-    s = s.replace("$", "")
-    s = s.replace("%", "")
-    return s
+    @staticmethod
+    def extract_gsm8k_answer(text: str) -> str:
+        if not text:
+            return ""
 
-
-def _extract_gsm8k_answer(text: str) -> Optional[str]:
-    """Extract a numeric final answer from GSM8K style output.
-
-    We accept the last number in the output (covers many formats).
-    """
-    if text is None:
-        return None
-
-    s = str(text).strip()
-    if not s:
-        return None
-
-    # Prefer a line like "Answer: 42" or "Final: 42"
-    m = re.search(r"(?i)(final|answer)\s*[:=]\s*([-+]?\d[\d,]*\.?\d*)", s)
-    if m:
-        return _normalize_number_string(m.group(2))
-
-    # Otherwise take the last number in the entire output.
-    nums = re.findall(r"[-+]?\d[\d,]*\.?\d*", s)
-    if not nums:
-        return None
-    return _normalize_number_string(nums[-1])
-
-
-def _answers_match(pred: str, gt: str) -> bool:
-    """Loose match used for GSM8K numeric answers."""
-    if pred is None or gt is None:
-        return False
-    p = _normalize_number_string(str(pred))
-    g = _normalize_number_string(str(gt))
-
-    # Exact string match first
-    if p == g:
-        return True
-
-    # Numeric fallback
-    try:
-        return float(p) == float(g)
-    except Exception:
-        return False
-
-
-# -----------------------------
-# Evaluation
-# -----------------------------
-
-
-def evaluate_dataset(
-    server,
-    examples: List[Dict],
-    prompt_mode: str,
-    max_tokens: int = 256,
-    save_path: Optional[str] = None,
-) -> Dict:
-    """Evaluate a list of normalized examples.
-
-    Each example must have keys:
-      - dataset_type: "gsm8k"|"mmlu"
-      - difficulty: "easy"|"medium"|"hard"
-      - question: str
-      - choices: Optional[List[str]]
-      - answer: str
-    """
-
-    per_example_logs: List[Dict] = []
-
-    totals = {"n": 0, "correct": 0, "format_ok": 0}
-    by_dataset = {
-        "gsm8k": {"n": 0, "correct": 0, "format_ok": 0},
-        "mmlu": {"n": 0, "correct": 0, "format_ok": 0},
-    }
-
-    for idx, ex in enumerate(examples):
-        dataset_type = ex["dataset_type"]
-        difficulty = ex.get("difficulty", "easy")
-        question = ex.get("question", "")
-        choices = ex.get("choices")
-        gt = ex.get("answer", "")
-
-        prompt = build_prompt(
-            dataset_type=dataset_type,
-            question=question,
-            choices=choices,
-            prompt_mode=prompt_mode,
-            difficulty=difficulty,
+        matches = re.findall(
+            r"^\s*FINAL_ANSWER\s*[:=\s]*([-+]?\d[\d,]*(?:\.\d+)?)\s*$",
+            text,
+            flags=re.IGNORECASE | re.MULTILINE,
         )
+        if not matches:
+            return ""
+        return matches[-1].strip().replace(",", "")
 
-        outputs, metrics_list = server.generate(
-            [prompt],
-            dataset_type=dataset_type,
-            difficulty=difficulty,
-            prompt_mode=prompt_mode,
-            max_new_tokens=max_tokens,
-            temperature=0.0,
-        )
+    @staticmethod
+    def _normalize_number_string(s: str) -> str:
+        if s is None:
+            return ""
+        t = str(s).strip()
+        t = t.replace(",", "")
+        t = t.replace("$", "").replace("₹", "").replace("€", "").replace("£", "")
+        return t
 
-        text = outputs[0] if outputs else ""
-        metrics = metrics_list[0] if metrics_list else {}
+    @staticmethod
+    def is_correct(pred_text: str, truth: str, dataset_type: str) -> Tuple[bool, str, bool]:
+        dataset_type = (dataset_type or "").lower().strip()
+        truth = (truth or "").strip()
 
         if dataset_type == "mmlu":
-            pred = _extract_mmlu_answer(text)
-            format_ok = pred in _MMLU_LETTERS
-            is_correct = (pred is not None) and (pred.strip().upper() == str(gt).strip().upper())
-        else:
-            pred = _extract_gsm8k_answer(text)
-            format_ok = pred is not None
-            is_correct = pred is not None and _answers_match(pred, gt)
+            extracted = EvaluationMetrics.extract_mmlu_answer(pred_text)
+            format_ok = extracted != ""
+            return (format_ok and extracted == truth.upper(), extracted, format_ok)
 
-        totals["n"] += 1
-        totals["correct"] += int(is_correct)
-        totals["format_ok"] += int(format_ok)
+        if dataset_type == "gsm8k":
+            extracted = EvaluationMetrics.extract_gsm8k_answer(pred_text)
+            format_ok = extracted != ""
+            if not format_ok:
+                return (False, "", False)
+            try:
+                pred_val = float(EvaluationMetrics._normalize_number_string(extracted))
+                truth_val = float(EvaluationMetrics._normalize_number_string(truth))
+                return (abs(pred_val - truth_val) < 1e-6, extracted, True)
+            except Exception:
+                return (False, extracted, True)
 
-        if dataset_type in by_dataset:
-            by_dataset[dataset_type]["n"] += 1
-            by_dataset[dataset_type]["correct"] += int(is_correct)
-            by_dataset[dataset_type]["format_ok"] += int(format_ok)
+        return (False, "", False)
 
-        per_example_logs.append(
-            {
-                "idx": idx,
-                "dataset_type": dataset_type,
-                "difficulty": difficulty,
-                "prompt_mode": prompt_mode,
-                "ground_truth": gt,
-                "prediction": pred,
-                "correct": bool(is_correct),
-                "format_ok": bool(format_ok),
-                "output_text": text,
-                "metrics": metrics,
-            }
-        )
+    @staticmethod
+    def evaluate_group(preds: List[str], truths: List[str], dataset_type: str) -> Dict[str, Any]:
+        correct = 0
+        format_ok = 0
+        total = len(preds)
 
-    summary = {
-        "prompt_mode": prompt_mode,
-        "overall": {
-            "n": totals["n"],
-            "accuracy": (totals["correct"] / totals["n"]) if totals["n"] else 0.0,
-            "format_ok": (totals["format_ok"] / totals["n"]) if totals["n"] else 0.0,
-            "correct": totals["correct"],
-        },
-        "by_dataset": {
-            k: {
-                "n": v["n"],
-                "accuracy": (v["correct"] / v["n"]) if v["n"] else 0.0,
-                "format_ok": (v["format_ok"] / v["n"]) if v["n"] else 0.0,
-                "correct": v["correct"],
-            }
-            for k, v in by_dataset.items()
-        },
-        "logs": per_example_logs,
-    }
+        for p, t in zip(preds, truths):
+            ok, _ex, fmt = EvaluationMetrics.is_correct(p, t, dataset_type)
+            correct += int(ok)
+            format_ok += int(fmt)
 
-    if save_path:
-        with open(save_path, "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2)
+        return {
+            "accuracy": correct / max(total, 1),
+            "correct_count": correct,
+            "total_count": total,
+            "format_ok_count": format_ok,
+            "format_ok_rate": format_ok / max(total, 1),
+            "format_fail_count": total - format_ok,
+        }
 
-    return summary
+
+class HeldOutEvaluator:
+    def __init__(self, model, data_loader: List[Dict[str, Any]], batch_size: int = 32):
+        self.model = model
+        self.data_loader = data_loader
+        self.batch_size = int(batch_size)
+
+    def evaluate(self, prompt_mode: str = "slo", verbose: bool = False) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        logger.info("=" * 70)
+        logger.info(f"EVALUATING ON {len(self.data_loader)} EXAMPLES (prompt_mode={prompt_mode})")
+        logger.info("=" * 70)
+
+        preds_by_type: Dict[str, List[str]] = {}
+        truths_by_type: Dict[str, List[str]] = {}
+        detailed: List[Dict[str, Any]] = []
+
+        for i, ex in enumerate(self.data_loader):
+            dataset_type = ex.get("dataset", "mmlu")
+            formatted_prompt, max_tokens, _stops = build_llama_formatted_prompt(ex, dataset_type, prompt_mode=prompt_mode)
+
+            pred_text, inf_metrics = self.model.generate(
+                prompt=formatted_prompt,
+                max_tokens=max_tokens,
+                difficulty=ex.get("difficulty", "medium"),
+                dataset_type=dataset_type,
+                prompt_mode=prompt_mode,
+            )
+
+            truth = ex.get("answer", "")
+            ok, extracted, fmt_ok = EvaluationMetrics.is_correct(pred_text, truth, dataset_type)
+
+            preds_by_type.setdefault(dataset_type, []).append(pred_text)
+            truths_by_type.setdefault(dataset_type, []).append(truth)
+
+            detailed.append(
+                {
+                    "dataset": dataset_type,
+                    "difficulty": ex.get("difficulty", "medium"),
+                    "prompt_mode": prompt_mode,
+                    "prompt": formatted_prompt,
+                    "ground_truth": truth,
+                    "prediction": pred_text,
+                    "extracted_answer": extracted,
+                    "format_ok": fmt_ok,
+                    "is_correct": ok,
+                    "binary_score": int(ok),
+                    # Useful timing components (may be absent depending on server version)
+                    "output_length": inf_metrics.get("output_length"),
+                    "ttft_ms": inf_metrics.get("ttft_ms"),
+                    "ttft_infer_ms": inf_metrics.get("ttft_infer_ms"),
+                    "ttft_model_ms": inf_metrics.get("ttft_model_ms"),
+                    "tpot_ms": inf_metrics.get("tpot_ms"),
+                    "scheduler_wait_ms": inf_metrics.get("scheduler_wait_ms"),
+                    "queue_wait_ms": inf_metrics.get("queue_wait_ms"),
+                    "tokenize_ms": inf_metrics.get("tokenize_ms"),
+                    "total_latency_ms": inf_metrics.get("total_latency_ms"),
+                    "throughput_tokens_per_sec": inf_metrics.get("throughput_tokens_per_sec"),
+                }
+            )
+
+            if verbose and (i < 5):
+                logger.info("-" * 70)
+                logger.info(f"[{i}] {dataset_type} ({ex.get('difficulty','medium')})")
+                logger.info(f"PRED:\n{pred_text}")
+                logger.info(f"TRUTH: {truth} | EXTRACTED: {extracted} | OK={ok} | FORMAT_OK={fmt_ok}")
+
+        results: Dict[str, Any] = {}
+        total_correct = 0
+        total = 0
+        total_format_ok = 0
+
+        for dtype in sorted(preds_by_type.keys()):
+            group = EvaluationMetrics.evaluate_group(preds_by_type[dtype], truths_by_type[dtype], dtype)
+            results[dtype] = group
+            total_correct += group["correct_count"]
+            total += group["total_count"]
+            total_format_ok += group["format_ok_count"]
+
+        results["overall"] = {
+            "accuracy": total_correct / max(total, 1),
+            "correct_count": total_correct,
+            "total_count": total,
+            "format_ok_rate": total_format_ok / max(total, 1),
+        }
+
+        logger.info("\n" + "=" * 70)
+        for dtype in sorted(preds_by_type.keys()):
+            g = results[dtype]
+            logger.info(f"{dtype.upper()} Results")
+            logger.info(f"  Accuracy: {g['accuracy']*100:.2f}% ({g['correct_count']}/{g['total_count']})")
+            logger.info(f"  Format OK: {g['format_ok_rate']*100:.2f}% ({g['format_ok_count']}/{g['total_count']})")
+        logger.info("=" * 70)
+        o = results["overall"]
+        logger.info("OVERALL RESULTS")
+        logger.info(f"  Accuracy: {o['accuracy']*100:.2f}% ({o['correct_count']}/{o['total_count']})")
+        logger.info(f"  Format OK: {o['format_ok_rate']*100:.2f}%")
+        logger.info("=" * 70)
+
+        return results, detailed

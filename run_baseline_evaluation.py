@@ -1,20 +1,32 @@
+#!/usr/bin/env python
 """run_baseline_evaluation.py
 
-Unified harness to:
-1) Run accuracy/format evaluation (GSM8K + MMLU) under either:
-   - prompt_mode=accuracy (normal answers)
-   - prompt_mode=slo      (short, SLO-friendly answers)
-2) Run serving/load smoke tests to measure TTFT/TPOT/queue/E2E under concurrency.
-3) Optionally calibrate per-difficulty SLO thresholds from a baseline run
-   (typically concurrency=1) and then report SLO compliance at other concurrencies.
+Single entry point used for:
+  1) Accuracy smoke (correctness + formatting)
+  2) SLO-mode accuracy guardrail (SLO prompt should still answer correctly)
+  3) Serving/load smoke (TTFT/TPOT/queue + dynamic SLO calibration)
 
-This script is intentionally "single-variant" for the ablation story:
-- base  = fp16
-- med   = int8
-- cheap = int4
+Paper-facing reliability features in this patch bundle:
+- TTFT definition for calibration is Option A (queue-inclusive), implemented in server.py:
 
-Router logic lives outside this file; here we focus on clean, reproducible
-measurements that you can put in the paper.
+    TTFT_A = scheduler_wait_ms + ttft_infer_ms
+
+  where:
+    scheduler_wait_ms : time from enqueue -> dequeue (micro-batching scheduler)
+    ttft_infer_ms     : tokenize_ms + lock_wait_ms + model_prefill+first_decode
+
+  (For non-batched calls, scheduler_wait_ms=0 and ttft_ms == ttft_infer_ms.)
+
+- SLO thresholds are calibrated from concurrency=1 and saved as percentile profiles:
+    p90 / p95 / p99 (for paper sensitivity analysis).
+
+Outputs written to --output_dir:
+  config.json
+  accuracy_results.json
+  accuracy_detailed.jsonl
+  slo_thresholds.json            (if load tests + calibration enabled)
+  metrics_concurrency_<N>.json
+  requests_concurrency_<N>.jsonl
 """
 
 from __future__ import annotations
@@ -26,357 +38,340 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from evaluation import Evaluator
+from evaluation import HeldOutEvaluator
 from load_generator import ClosedLoopLoadGenerator
-from metrics import MetricsCalculator, calibrate_slos
-from preprocessing import format_example_for_evaluation, load_processed_data
+from metrics import MetricsCalculator, calibrate_slo_profiles
+from preprocessing import DataPreprocessor
 from server import SingleVariantServer
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-LOGGER = logging.getLogger("__main__")
+
+def _read_jsonl(path: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if not os.path.exists(path):
+        return out
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            out.append(json.loads(line))
+    return out
 
 
-def _setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+def _write_json(path: str, obj: Any) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
+
+
+def _write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+
+
+def _load_slo_profiles(path: str) -> Optional[Dict[str, Dict]]:
+    if not os.path.exists(path):
+        return None
+    with open(path, "r") as f:
+        data = json.load(f)
+
+    # Preferred format
+    if isinstance(data, dict) and "profiles" in data and isinstance(data["profiles"], dict):
+        return data["profiles"]
+
+    # Backward compatible: top-level percentile keys
+    if isinstance(data, dict) and any(k.startswith("p") for k in data.keys()):
+        return {k: v for k, v in data.items() if isinstance(v, dict)}
+
+    # Backward compatible: single slo dict
+    if isinstance(data, dict) and any(k in data for k in ("easy", "medium", "hard")):
+        return {"p95": data}
+
+    return None
+
+
+def _effective_enable_batching(prompt_mode: str, enable_batching_flag: Optional[bool]) -> bool:
+    if enable_batching_flag is None:
+        return prompt_mode == "slo"
+    return bool(enable_batching_flag)
+
+
+def _log_env() -> None:
+    logger.info(f"PyTorch version: {torch.__version__}")
+    logger.info(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        try:
+            logger.info(f"CUDA version: {torch.version.cuda}")
+            logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+        except Exception:
+            pass
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+
+    p.add_argument("--model", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
+    p.add_argument("--variant", type=str, default="med", choices=["base", "med", "cheap"])
+    p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
+    p.add_argument("--dtype", type=str, default="auto", choices=["auto", "float16", "bfloat16"])
+
+    p.add_argument("--prompt_mode", type=str, default="accuracy", choices=["accuracy", "slo"])
+
+    p.add_argument("--preprocess", action="store_true", help="Run dataset preprocessing")
+    p.add_argument("--data_dir", type=str, default="data/raw")
+    p.add_argument("--processed_dir", type=str, default="data/processed")
+
+    p.add_argument("--data_subset", type=int, default=0, help="If >0, truncate val+test to N examples")
+    p.add_argument("--seed", type=int, default=0)
+
+    p.add_argument("--output_dir", type=str, default="outputs")
+
+    p.add_argument("--skip_load_test", action="store_true")
+    p.add_argument("--num_requests", type=int, default=20)
+    p.add_argument("--concurrencies", type=int, nargs="+", default=[1, 2, 4])
+
+    p.add_argument("--skip_accuracy_eval", action="store_true")
+
+    # Batching flags: allow explicit on/off, else default to (prompt_mode == slo)
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--enable_batching", dest="enable_batching", action="store_true")
+    g.add_argument("--disable_batching", dest="enable_batching", action="store_false")
+    p.set_defaults(enable_batching=None)
+
+    p.add_argument("--max_batch_size", type=int, default=8)
+    p.add_argument("--batch_wait_ms", type=int, default=8)
+
+    # Dynamic SLO calibration
+    p.add_argument("--disable_slo_calibration", action="store_true")
+    p.add_argument("--slo_calibration_concurrency", type=int, default=1)
+    p.add_argument("--slo_calibration_percentiles", type=float, nargs="+", default=[90.0, 95.0, 99.0])
+    p.add_argument("--slo_primary_percentile", type=float, default=95.0)
+
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    _log_env()
+
+    # ------------------------------------------------------------------
+    # CONFIGURATION LOG
+    # ------------------------------------------------------------------
+    effective_device = "cuda" if (args.device == "auto" and torch.cuda.is_available()) else args.device
+    effective_enable_batching = _effective_enable_batching(args.prompt_mode, args.enable_batching)
+
+    logger.info("=" * 80)
+    logger.info("CONFIGURATION:")
+    logger.info(f"  Model: {args.model}")
+    logger.info(f"  Variant: {args.variant}")
+    logger.info(f"  Device: {args.device}")
+    logger.info(f"  Prompt mode: {args.prompt_mode}")
+    logger.info(f"  Data subset: {args.data_subset}")
+    logger.info(f"  Output dir: {str(out_dir)}")
+    logger.info(f"  Skip load test: {args.skip_load_test}")
+    logger.info(f"  Skip accuracy eval: {args.skip_accuracy_eval}")
+    logger.info(f"  Batching enabled (effective): {effective_enable_batching}")
+    logger.info(f"  Max batch size: {args.max_batch_size}")
+    logger.info(f"  Batch wait (ms): {args.batch_wait_ms}")
+    logger.info(f"  SLO calibration disabled: {args.disable_slo_calibration}")
+    logger.info("  TTFT definition: Option A (queue-inclusive)" )
+    logger.info("=" * 80)
+
+    # Save config for reproducibility
+    _write_json(
+        str(out_dir / "config.json"),
+        {
+            "model": args.model,
+            "variant": args.variant,
+            "device_arg": args.device,
+            "device_effective": effective_device,
+            "dtype": args.dtype,
+            "prompt_mode": args.prompt_mode,
+            "seed": args.seed,
+            "data_dir": args.data_dir,
+            "processed_dir": args.processed_dir,
+            "data_subset": args.data_subset,
+            "skip_load_test": args.skip_load_test,
+            "num_requests": args.num_requests,
+            "concurrencies": args.concurrencies,
+            "skip_accuracy_eval": args.skip_accuracy_eval,
+            "enable_batching": effective_enable_batching,
+            "max_batch_size": args.max_batch_size,
+            "batch_wait_ms": args.batch_wait_ms,
+            "disable_slo_calibration": args.disable_slo_calibration,
+            "slo_calibration_concurrency": args.slo_calibration_concurrency,
+            "slo_calibration_percentiles": args.slo_calibration_percentiles,
+            "slo_primary_percentile": args.slo_primary_percentile,
+            "ttft_definition": "OptionA_queue_inclusive",
+        },
     )
 
+    # ------------------------------------------------------------------
+    # STEP 1: LOAD DATA
+    # ------------------------------------------------------------------
+    logger.info("\n[STEP 1] LOADING DATA")
+    logger.info("-" * 80)
 
-def _resolve_device(device: str) -> str:
-    device = str(device).lower()
-    if device == "auto":
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    if device not in {"cuda", "cpu"}:
-        raise ValueError("device must be one of: auto|cuda|cpu")
-    if device == "cuda" and not torch.cuda.is_available():
-        LOGGER.warning("CUDA requested but not available; falling back to CPU")
-        return "cpu"
-    return device
+    if args.preprocess:
+        dp = DataPreprocessor(data_dir=args.data_dir, output_dir=args.processed_dir, seed=args.seed)
+        dp.run_pipeline()
 
+    train_path = str(Path(args.processed_dir) / "train_data.jsonl")
+    val_path = str(Path(args.processed_dir) / "val_data.jsonl")
+    test_path = str(Path(args.processed_dir) / "test_data.jsonl")
 
-def _maybe_write_json(path: str, payload: Dict) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+    train_data = _read_jsonl(train_path)
+    val_data = _read_jsonl(val_path)
+    test_data = _read_jsonl(test_path)
 
+    logger.info(f"Loaded data: train={len(train_data)}, val={len(val_data)}, test={len(test_data)}")
 
-def _print_banner(title: str) -> None:
-    LOGGER.info("=" * 80)
-    LOGGER.info(title)
-    LOGGER.info("=" * 80)
+    if args.data_subset and args.data_subset > 0:
+        val_data = val_data[: args.data_subset]
+        test_data = test_data[: args.data_subset]
+        logger.info(f"Using subset: val={len(val_data)}, test={len(test_data)}")
 
-
-def _format_config(args: argparse.Namespace, device: str) -> str:
-    return (
-        "CONFIGURATION:\n"
-        f"  Model: {args.model}\n"
-        f"  Variant: {args.variant}\n"
-        f"  Device: {device}\n"
-        f"  Dtype: {args.dtype}\n"
-        f"  Prompt mode: {args.prompt_mode}\n"
-        f"  Requests per test: {args.num_requests}\n"
-        f"  Concurrency levels: {args.concurrencies}\n"
-        f"  Data subset: {args.data_subset}\n"
-        f"  Output dir: {args.output_dir}\n"
-        f"  SLO calibration disabled: {args.disable_slo_calibration}\n"
-        f"  Skip load test: {args.skip_load_test}\n"
-        f"  Batching enabled: {args.batching_enabled}\n"
-        f"  Max batch size: {args.max_batch_size}\n"
-        f"  Batch wait (ms): {args.batch_wait_ms}\n"
-        f"  Skip accuracy eval: {args.skip_accuracy_eval}"
-    )
-
-
-def _load_examples(data_dir: str, data_subset: int) -> Tuple[List[Dict], List[Dict], List[Dict]]:
-    train_raw, val_raw, test_raw = load_processed_data(data_dir=data_dir)
-
-    def _subset(xs: List[Dict]) -> List[Dict]:
-        if not data_subset or data_subset <= 0:
-            return xs
-        return xs[: min(data_subset, len(xs))]
-
-    train = [format_example_for_evaluation(x) for x in _subset(train_raw)]
-    val = [format_example_for_evaluation(x) for x in _subset(val_raw)]
-    test = [format_example_for_evaluation(x) for x in _subset(test_raw)]
-    return train, val, test
-
-
-def _run_load_tests(
-    *,
-    server: SingleVariantServer,
-    data_pool: List[Dict],
-    output_dir: str,
-    prompt_mode: str,
-    num_requests: int,
-    concurrencies: List[int],
-    max_new_tokens: int,
-    disable_slo_calibration: bool,
-    slo_calibration_percentile: float,
-) -> Dict:
-    """Run load tests and return a summary dict."""
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    all_results = {
-        "variant": server.variant,
-        "prompt_mode": prompt_mode,
-        "num_requests": num_requests,
-        "concurrencies": concurrencies,
-        "runs": {},
-    }
-
-    slo_profiles = None
-
-    for concurrency in concurrencies:
-        LOGGER.info("\n>>> Testing with concurrency=%s", concurrency)
-        gen = ClosedLoopLoadGenerator(
-            server=server,
-            concurrency=concurrency,
-            total_requests=num_requests,
-            data_pool=data_pool,
-            prompt_mode=prompt_mode,
-            max_new_tokens=max_new_tokens,
-        )
-        metrics = gen.run()
-
-        # Save raw request traces.
-        req_path = os.path.join(output_dir, f"requests_concurrency_{concurrency}.jsonl")
-        gen.save_requests(req_path)
-
-        # Calibrate SLOs (optional) using the first concurrency that equals 1.
-        if (
-            not disable_slo_calibration
-            and slo_profiles is None
-            and concurrency == 1
-            and len(metrics) > 0
-        ):
-            LOGGER.info(
-                "Calibrating SLOs from concurrency=1 at p%.1f", slo_calibration_percentile
-            )
-            slo_profiles = calibrate_slos(metrics, percentile=slo_calibration_percentile)
-            LOGGER.info("Calibrated SLOs at p%.1f: %s", slo_calibration_percentile, slo_profiles)
-
-        calc = MetricsCalculator(slo_profiles=slo_profiles)
-        summary = calc.summarize(metrics)
-
-        # Save per-concurrency summary.
-        met_path = os.path.join(output_dir, f"metrics_concurrency_{concurrency}.json")
-        _maybe_write_json(met_path, summary)
-
-        # Print a compact report (matches the style you pasted).
-        calc.pretty_print(summary, title=f"LOAD TEST RESULTS (Concurrency {concurrency})")
-
-        all_results["runs"][str(concurrency)] = summary
-
-    return all_results
-
-
-def _run_accuracy_eval(
-    *,
-    server: SingleVariantServer,
-    examples: List[Dict],
-    output_dir: str,
-    prompt_mode: str,
-    max_new_tokens: int,
-) -> Dict:
-    os.makedirs(output_dir, exist_ok=True)
-
-    evaluator = Evaluator(server)
-
-    summary_path = os.path.join(output_dir, "accuracy_summary.json")
-    logs_path = os.path.join(output_dir, "accuracy_per_example.jsonl")
-
-    summary = evaluator.run(
-        examples,
-        prompt_mode=prompt_mode,
-        max_new_tokens=max_new_tokens,
-        output_json_path=summary_path,
-        per_example_log_jsonl_path=logs_path,
-        description=f"EVALUATING ON {len(examples)} EXAMPLES (prompt_mode={prompt_mode})",
-    )
-
-    # Also write a convenience summary file named after the output directory.
-    try:
-        out_name = Path(output_dir).name.rstrip("/")
-        if out_name:
-            _maybe_write_json(os.path.join(Path(output_dir).parent, f"{out_name}_summary.json"), summary)
-    except Exception:
-        pass
-
-    return summary
-
-
-def main(args: argparse.Namespace) -> None:
-    _setup_logging()
-
-    device = _resolve_device(args.device)
-
-    _print_banner("BASELINE EVALUATION")
-    LOGGER.info("\n%s", _format_config(args, device))
-
-    # ---------------------------------------------------------------------
-    # STEP 1: Load data
-    # ---------------------------------------------------------------------
-    LOGGER.info("\n[STEP 1] LOADING DATA")
-    LOGGER.info("-" * 80)
-    train, val, test = _load_examples(args.data_dir, args.data_subset)
-    LOGGER.info("Loaded data: train=%d, val=%d, test=%d", len(train), len(val), len(test))
-
-    # Use val split by default for both load tests and evaluation (matches your logs).
-    eval_split = val
-
-    # ---------------------------------------------------------------------
-    # STEP 2: Initialize server
-    # ---------------------------------------------------------------------
-    LOGGER.info("\n[STEP 2] INITIALIZING SERVER")
-    LOGGER.info("-" * 80)
+    # ------------------------------------------------------------------
+    # STEP 2: INITIALIZE SERVER
+    # ------------------------------------------------------------------
+    logger.info("\n[STEP 2] INITIALIZING SERVER")
+    logger.info("-" * 80)
 
     server = SingleVariantServer(
         model_name=args.model,
         variant=args.variant,
-        device=device,
+        device=args.device,
         dtype=args.dtype,
-        batching_enabled=args.batching_enabled,
+        enable_batching=effective_enable_batching,
         max_batch_size=args.max_batch_size,
         batch_wait_ms=args.batch_wait_ms,
-        seed=args.seed,
     )
 
-    # ---------------------------------------------------------------------
-    # STEP 3: Load tests
-    # ---------------------------------------------------------------------
-    LOGGER.info("\n[STEP 3] RUNNING LOAD TESTS")
-    LOGGER.info("-" * 80)
+    # ------------------------------------------------------------------
+    # STEP 3: RUN LOAD TESTS
+    # ------------------------------------------------------------------
+    logger.info("\n[STEP 3] RUNNING LOAD TESTS")
+    logger.info("-" * 80)
 
-    load_summary = None
+    slo_thresholds_path = str(out_dir / "slo_thresholds.json")
+    slo_profiles = None if args.disable_slo_calibration else _load_slo_profiles(slo_thresholds_path)
+
+    primary_key = f"p{int(args.slo_primary_percentile)}"
+
     if args.skip_load_test:
-        LOGGER.info("Skipping load tests (--skip_load_test).")
+        logger.info("Skipping load tests (--skip_load_test).")
     else:
-        load_summary = _run_load_tests(
-            server=server,
-            data_pool=eval_split,
-            output_dir=args.output_dir,
-            prompt_mode=args.prompt_mode,
-            num_requests=args.num_requests,
-            concurrencies=args.concurrencies,
-            max_new_tokens=args.max_new_tokens,
-            disable_slo_calibration=args.disable_slo_calibration,
-            slo_calibration_percentile=args.slo_calibration_percentile,
-        )
+        if not val_data:
+            logger.warning("val_data is empty. Load tests will run against a tiny dummy pool.")
+            val_data = [{"dataset": "gsm8k", "prompt": "1+1?", "answer": "2", "difficulty": "easy"}]
 
-    # ---------------------------------------------------------------------
-    # STEP 4: Accuracy eval
-    # ---------------------------------------------------------------------
-    LOGGER.info("\n[STEP 4] EVALUATING ACCURACY")
-    LOGGER.info("-" * 80)
+        for conc in args.concurrencies:
+            conc = int(conc)
+            print(f"\n>>> Testing with concurrency={conc}")
 
-    acc_summary = None
+            lg = ClosedLoopLoadGenerator(
+                inference_func=server.generate,
+                max_concurrency=conc,
+                num_requests=args.num_requests,
+                data_loader=val_data,
+                prompt_mode=args.prompt_mode,
+                seed=args.seed,
+            )
+            req_metrics = lg.run_load_test()
+
+            # Calibrate thresholds from a specific baseline concurrency.
+            if (
+                (not args.disable_slo_calibration)
+                and (slo_profiles is None)
+                and (conc == int(args.slo_calibration_concurrency))
+            ):
+                logger.info(
+                    f"Calibrating SLOs from concurrency={conc} at percentiles {args.slo_calibration_percentiles}"
+                )
+                slo_profiles = calibrate_slo_profiles(req_metrics, percentiles=args.slo_calibration_percentiles)
+                _write_json(
+                    slo_thresholds_path,
+                    {
+                        "definition": "TTFT_OptionA_queue_inclusive",
+                        "calibration_concurrency": conc,
+                        "percentiles": args.slo_calibration_percentiles,
+                        "primary": args.slo_primary_percentile,
+                        "profiles": slo_profiles,
+                    },
+                )
+
+            # Choose SLO dict for reporting
+            slo_for_report = None
+            if args.disable_slo_calibration:
+                slo_for_report = None
+            else:
+                if slo_profiles is not None:
+                    slo_for_report = slo_profiles.get(primary_key) or next(iter(slo_profiles.values()))
+
+            mc = MetricsCalculator(req_metrics, slo_dict=slo_for_report)
+            report = mc.print_report(title=f"LOAD TEST RESULTS (Concurrency {conc})")
+
+            # Sensitivity: report compliance under p90/p95/p99
+            sensitivity: Dict[str, float] = {}
+            if (not args.disable_slo_calibration) and slo_profiles is not None:
+                for k, slo in slo_profiles.items():
+                    sensitivity[k] = float(MetricsCalculator(req_metrics, slo_dict=slo).compute_all_metrics()["summary"]["slo_compliance"])
+
+            report["slo_profile_used"] = primary_key
+            report["slo_sensitivity"] = sensitivity
+
+            metrics_path = str(out_dir / f"metrics_concurrency_{conc}.json")
+            _write_json(metrics_path, report)
+
+            requests_path = str(out_dir / f"requests_concurrency_{conc}.jsonl")
+            lg.save_results(requests_path)
+
+    # ------------------------------------------------------------------
+    # STEP 4: EVALUATE ACCURACY
+    # ------------------------------------------------------------------
+    logger.info("\n[STEP 4] EVALUATING ACCURACY")
+    logger.info("-" * 80)
+
     if args.skip_accuracy_eval:
-        LOGGER.info("Skipping accuracy evaluation.")
+        logger.info("Skipping accuracy evaluation.")
     else:
-        acc_summary = _run_accuracy_eval(
-            server=server,
-            examples=eval_split,
-            output_dir=args.output_dir,
-            prompt_mode=args.prompt_mode,
-            max_new_tokens=args.max_new_tokens,
-        )
+        if not test_data:
+            logger.error("test_data is empty. Did preprocessing run?")
+        else:
+            evaluator = HeldOutEvaluator(server, test_data)
+            results, detailed = evaluator.evaluate(prompt_mode=args.prompt_mode, verbose=False)
 
-    # ---------------------------------------------------------------------
-    # STEP 5: Save top-level summary
-    # ---------------------------------------------------------------------
-    LOGGER.info("\n[STEP 5] SAVING OUTPUTS")
-    LOGGER.info("-" * 80)
+            _write_json(str(out_dir / "accuracy_results.json"), results)
+            _write_jsonl(str(out_dir / "accuracy_detailed.jsonl"), detailed)
 
-    combined = {
-        "config": {
-            "model": args.model,
-            "variant": args.variant,
-            "device": device,
-            "dtype": args.dtype,
-            "prompt_mode": args.prompt_mode,
-            "num_requests": args.num_requests,
-            "concurrencies": args.concurrencies,
-            "data_subset": args.data_subset,
-            "batching_enabled": args.batching_enabled,
-            "max_batch_size": args.max_batch_size,
-            "batch_wait_ms": args.batch_wait_ms,
-            "disable_slo_calibration": args.disable_slo_calibration,
-            "slo_calibration_percentile": args.slo_calibration_percentile,
-        },
-        "accuracy": acc_summary,
-        "load": load_summary,
-    }
+    # ------------------------------------------------------------------
+    # STEP 5: DONE
+    # ------------------------------------------------------------------
+    logger.info("\n[STEP 5] SAVING OUTPUTS")
+    logger.info("-" * 80)
 
-    _maybe_write_json(os.path.join(args.output_dir, "run_summary.json"), combined)
-
-    LOGGER.info("\n" + "=" * 80)
-    LOGGER.info("BASELINE EVALUATION COMPLETE")
-    LOGGER.info("Results saved to: %s", args.output_dir)
-    LOGGER.info("=" * 80)
-
-
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Baseline evaluation for SLO-aware compression")
-
-    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
-    parser.add_argument(
-        "--variant",
-        type=str,
-        default="base",
-        choices=["base", "med", "cheap"],
-        help="base=fp16, med=int8, cheap=int4",
-    )
-
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default="auto",
-        choices=["auto", "float16", "fp16", "bfloat16", "bf16", "float32", "fp32"],
-    )
-
-    parser.add_argument("--prompt_mode", type=str, default="accuracy", choices=["accuracy", "slo"])
-
-    # Accuracy eval
-    parser.add_argument("--data_dir", type=str, default="data/processed")
-    parser.add_argument("--data_subset", type=int, default=0, help="0 means full split")
-    parser.add_argument("--max_new_tokens", type=int, default=256)
-    parser.add_argument("--skip_accuracy_eval", action="store_true")
-
-    # Load tests
-    parser.add_argument("--skip_load_test", action="store_true")
-    parser.add_argument("--num_requests", type=int, default=20)
-    parser.add_argument(
-        "--concurrencies",
-        type=int,
-        nargs="+",
-        default=[1, 2, 4],
-        help="one or more concurrency levels",
-    )
-
-    parser.add_argument("--disable_slo_calibration", action="store_true")
-    parser.add_argument("--slo_calibration_percentile", type=float, default=95.0)
-
-    # Server batching (renamed from the old 'enable_batching' to avoid the crash you hit)
-    parser.add_argument("--batching_enabled", action="store_true")
-    parser.add_argument("--max_batch_size", type=int, default=8)
-    parser.add_argument("--batch_wait_ms", type=int, default=8)
-
-    parser.add_argument("--output_dir", type=str, default="router_logs_smoke")
-    parser.add_argument("--seed", type=int, default=1234)
-
-    return parser.parse_args()
+    logger.info("\n" + "=" * 80)
+    logger.info("BASELINE EVALUATION COMPLETE")
+    logger.info(f"Results saved to: {str(out_dir)}")
+    logger.info("=" * 80)
 
 
 if __name__ == "__main__":
     try:
-        main(_parse_args())
+        main()
     except KeyboardInterrupt:
-        LOGGER.warning("Interrupted")
-        sys.exit(130)
+        logger.error("Interrupted")
+        sys.exit(1)
