@@ -47,7 +47,9 @@ class EvaluationMetrics:
             return ""
 
         matches = re.findall(
-            r"^\s*FINAL_ANSWER\s*[:=\s]*([-+]?\d[\d,]*(?:\.\d+)?)\s*$",
+            # Allow mild punctuation after the number (e.g., "FINAL_ANSWER: 1.")
+            # while still being strict about the numeric capture.
+            r"^\s*FINAL_ANSWER\s*[:=\s]*([-+]?\d[\d,]*(?:\.\d+)?)\s*[\.\)]?\s*$",
             text,
             flags=re.IGNORECASE | re.MULTILINE,
         )

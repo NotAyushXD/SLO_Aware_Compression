@@ -80,6 +80,16 @@ Recommended tables/plots:
 
 When discussing queueing effects, emphasize that **Option A TTFT is service-facing** and intentionally includes queue and tokenization to match user-perceived latency.
 
+## 4b) Queueing and head-of-line blocking
+
+In a single-GPU Transformers `generate()` baseline, decoding is **non-preemptive**: once a long response begins decoding, other requests must wait until that call completes (unless they are included in the same micro-batch). Under mixed workloads (e.g., short MMLU + longer GSM8K), FIFO batching can create **head-of-line blocking** where long-form requests dominate the queue and short requests see very large p95/p99 TTFT due to waiting.
+
+This bundle mitigates that effect in `server.py` by selecting the next batch key using a simple **short-job-first** policy (prioritize smaller `max_tokens`) with a small **anti-starvation** timer so long requests are still served.
+
+Additionally, the scheduler uses an **adaptive batching window** for long jobs (default 50ms) to increase the probability that concurrent requests join the same micro-batch, which reduces lock-wait-driven p95/p99 TTFT under load.
+
+This is not a replacement for production-grade continuous batching (e.g., vLLM), but it makes the baseline more stable and the tail-latency behavior more interpretable for paper experiments.
+
 ## 5) Reproducibility checklist
 
 - Fix `--seed` for preprocessing, load selection, and evaluation.

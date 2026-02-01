@@ -38,9 +38,11 @@ MMLU_MAX_NEW_TOKENS = {
 # SLO mode should still be large enough to reach FINAL_ANSWER on multi-step items.
 GSM8K_MAX_NEW_TOKENS = {
     "slo": {
-        "easy": 160,
-        "medium": 160,
-        "hard": 160,
+        # Keep SLO budgets uniform across difficulty to avoid batching fragmentation.
+        # A slightly higher ceiling reduces truncation-caused format failures.
+        "easy": 192,
+        "medium": 192,
+        "hard": 192,
     },
     "accuracy": {
         "easy": 256,
@@ -172,6 +174,8 @@ def build_gsm8k_prompt(example: Dict[str, Any], prompt_mode: str) -> Tuple[str, 
         "Your LAST line must be exactly:\n"
         "FINAL_ANSWER: <number>\n"
         "Where <number> is the final numeric answer (no units, no extra words).\n"
+        "Use EXACTLY the tag 'FINAL_ANSWER' (with underscore) followed by ':' and the number.\n"
+        "No trailing punctuation after the number.\n"
     )
 
     question = example.get("prompt", "")
@@ -185,16 +189,17 @@ def build_gsm8k_prompt(example: Dict[str, Any], prompt_mode: str) -> Tuple[str, 
             "Solution:"
         )
     else:
-        # SLO mode: do NOT remove reasoning entirely; just discourage verbosity.
-        # The prior "<= 6 lines" constraint was too destructive for GSM8K.
+        # SLO mode: keep compact math (to reduce latency) without destroying correctness.
+        # Use TWO compact exemplars (format + brevity), then ask for short-equation working.
         user = (
             f"{rules}\n"
-            "Keep it compact: aim for <= ~8 short lines.\n"
-            "Do not add explanations unrelated to solving.\n\n"
-            "Example (format only):\n"
-            "Problem: A book has 10 pages and you read 3 pages. How many pages are left?\n"
-            "Solution: 10 - 3 = 7\n"
-            "FINAL_ANSWER: 7\n\n"
+            "Latency mode: keep the solution compact.\n"
+            "- Prefer 1 equation per line.\n"
+            "- Avoid long prose; use short equations.\n"
+            "- Aim for ~6-10 short lines total.\n"
+            "- Do NOT write anything after the FINAL_ANSWER line.\n\n"
+            f"{_GSM8K_FEWSHOT}"
+            "Now solve:\n"
             f"Problem: {question}\n\n"
             "Solution:"
         )

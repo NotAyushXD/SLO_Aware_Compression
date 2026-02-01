@@ -196,6 +196,20 @@ class _BatchingScheduler:
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
+        # Head-of-line blocking can make TTFT explode under load when long-form GSM8K
+        # requests sit ahead of short MMLU requests in FIFO order. We mitigate this
+        # with a simple "short-job-first" selection of the *next* batch key, while
+        # still providing an aging-based escape hatch to avoid starvation.
+        self._starvation_s = 0.25  # seconds
+
+        # Adaptive batching window:
+        # For long generations (e.g., GSM8K), a slightly larger batching window
+        # can dramatically reduce lock-wait-driven TTFT tails by allowing more
+        # requests to join the same micro-batch.
+        # For short generations (e.g., single-token MMLU), keep the window tight.
+        self._long_job_min_wait_s = 0.05  # 50ms
+        self._long_job_token_threshold = 64
+
     def submit(self, req: _PendingRequest) -> None:
         with self._cv:
             self._pending.append(req)
@@ -215,11 +229,33 @@ class _BatchingScheduler:
                 if self._stop and not self._pending:
                     return
 
-                first = self._pending.pop(0)
+                # --------------------------------------------------------------
+                # Choose which request to serve next.
+                # - Default: prioritize smaller max_tokens (short-job-first)
+                # - If anything has waited too long, serve the oldest (anti-starvation)
+                # --------------------------------------------------------------
+                now = time.perf_counter()
+                oldest_idx = min(range(len(self._pending)), key=lambda i: self._pending[i].enqueue_time)
+                if (now - self._pending[oldest_idx].enqueue_time) > self._starvation_s:
+                    chosen_idx = oldest_idx
+                else:
+                    chosen_idx = min(
+                        range(len(self._pending)),
+                        key=lambda i: (int(self._pending[i].max_tokens), self._pending[i].enqueue_time),
+                    )
+
+                first = self._pending.pop(chosen_idx)
                 key = first.batch_key()
                 batch: List[_PendingRequest] = [first]
 
-                deadline = time.perf_counter() + self.batch_wait_s
+                # Use a slightly longer wait window for long jobs to improve
+                # batching and reduce TTFT tails caused by lock contention.
+                if first.max_tokens >= self._long_job_token_threshold:
+                    wait_s = max(self.batch_wait_s, self._long_job_min_wait_s)
+                else:
+                    wait_s = self.batch_wait_s
+
+                deadline = time.perf_counter() + wait_s
                 while len(batch) < self.max_batch_size:
                     idx = next((i for i, r in enumerate(self._pending) if r.batch_key() == key), None)
                     if idx is not None:
