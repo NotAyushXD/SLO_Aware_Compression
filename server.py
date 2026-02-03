@@ -16,6 +16,7 @@ from transformers import (
 )
 
 from prompt_templates import get_max_tokens
+from answer_utils import enforce_strict_gsm8k_final_answer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("server")
@@ -321,6 +322,7 @@ class _BatchingScheduler:
                 r.result_text = ""
                 r.result_metrics = {
                     "success": False,
+                    "backend": "hf",
                     "error": str(e),
                     "scheduler_wait_ms": float(max(0.0, scheduler_wait_ms)),
                     "queue_wait_ms": float(max(0.0, scheduler_wait_ms)),
@@ -607,12 +609,28 @@ class SingleVariantServer:
 
         # Decode outputs (generated tail only)
         texts: List[str] = []
+        raw_texts: List[str] = []
+        postprocessed_flags: List[bool] = []
+        postprocess_candidates: List[Optional[str]] = []
         out_lens: List[int] = []
         for i in range(bsz):
             gen_ids = sequences[i, prompt_len:]
             out_lens.append(int(gen_ids.numel()))
-            text = self.tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+            raw_text = self.tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+            text = raw_text
+            postprocessed = False
+            postprocess_candidate = None
+            if dataset_type == "gsm8k":
+                fixed, cand, did = enforce_strict_gsm8k_final_answer(raw_text)
+                if did:
+                    text = fixed.strip()
+                    postprocessed = True
+                    postprocess_candidate = cand
             texts.append(text)
+            raw_texts.append(raw_text)
+            postprocessed_flags.append(bool(postprocessed))
+            postprocess_candidates.append(postprocess_candidate)
+
 
         # Compute TPOT from generation time excluding the model TTFT phase.
         decode_s = max(0.0, total_gen_time - ttft_model_s)
@@ -623,7 +641,7 @@ class SingleVariantServer:
         tokenize_ms = float(max(0.0, (t_after_inputs - t0_total) * 1000.0))
 
         metrics_list: List[Dict] = []
-        for out_len in out_lens:
+        for out_len, raw_text, postprocessed, postprocess_candidate in zip(out_lens, raw_texts, postprocessed_flags, postprocess_candidates):
             if out_len <= 1:
                 tpot_ms = 0.0
             else:
@@ -634,6 +652,10 @@ class SingleVariantServer:
             metrics_list.append(
                 {
                     "success": True,
+                    "backend": "hf",
+                    "raw_text": raw_text,
+                    "postprocessed": bool(postprocessed),
+                    "postprocess_candidate": postprocess_candidate,
                     # ------------------------------------------------------------------
                     # Paper-facing TTFT definition (Option A) is applied in the scheduler.
                     # Here we report component timings.
@@ -706,6 +728,7 @@ class SingleVariantServer:
             if req.error:
                 return "", {
                     "success": False,
+                    "backend": "hf",
                     "error": req.error,
                     "scheduler_wait_ms": 0.0,
                     "queue_wait_ms": 0.0,

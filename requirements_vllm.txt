@@ -1,0 +1,14 @@
+# Optional: vLLM backend requirements
+#
+# Install this ONLY if you want to use --backend vllm.
+# vLLM has stricter CUDA / Python constraints than the HF backend.
+#
+# Recommended:
+#   - Python 3.10/3.11
+#   - CUDA 11.8+ (matches PyTorch build)
+#
+# Usage:
+#   pip install -r requirements_vllm.txt
+#
+-r requirements_kaggle.txt
+vllm>=0.5.0

@@ -1,18 +1,29 @@
 # evaluation.py
 """Evaluation utilities for MMLU + GSM8K.
 
-Key goals:
-- Strict answer extraction (avoid "grab last number" fallbacks).
+Paper-facing goals:
+- Strict answer extraction as the *primary* metric (reproducible + hard to game).
+- A second "parseable" metric for robustness/sensitivity analysis.
 - Separate "format adherence" from correctness.
-- Save per-example debug info (including inference timing components).
+- Save per-example debug info (including timing components).
+
+Strict vs Parseable (GSM8K):
+- Strict: requires a standalone line: `FINAL_ANSWER: <number>`
+- Parseable: if strict fails, uses conservative recovery rules (see answer_utils.py)
 """
 
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any, Dict, List, Tuple
 
+from answer_utils import (
+    extract_gsm8k_parseable,
+    extract_gsm8k_strict,
+    extract_mmlu_answer,
+    normalize_number_string,
+    numbers_equal,
+)
 from prompt_templates import build_llama_formatted_prompt
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -22,92 +33,89 @@ logger = logging.getLogger(__name__)
 class EvaluationMetrics:
     @staticmethod
     def extract_mmlu_answer(text: str) -> str:
-        if not text:
-            return ""
-        t = text.strip().upper()
-
-        m = re.search(r"(?:FINAL\s*ANSWER|ANSWER|CORRECT\s*ANSWER)\s*[:=\s]*([A-D])\b", t)
-        if m:
-            return m.group(1)
-
-        m = re.fullmatch(r"\s*([A-D])[\.\)]?\s*", t)
-        if m:
-            return m.group(1)
-
-        first = t.splitlines()[0].strip() if t.splitlines() else t.strip()
-        m = re.fullmatch(r"([A-D])[\.\)]?", first)
-        if m:
-            return m.group(1)
-
-        return ""
+        return extract_mmlu_answer(text)
 
     @staticmethod
     def extract_gsm8k_answer(text: str) -> str:
-        if not text:
-            return ""
-
-        matches = re.findall(
-            # Allow mild punctuation after the number (e.g., "FINAL_ANSWER: 1.")
-            # while still being strict about the numeric capture.
-            r"^\s*FINAL_ANSWER\s*[:=\s]*([-+]?\d[\d,]*(?:\.\d+)?)\s*[\.\)]?\s*$",
-            text,
-            flags=re.IGNORECASE | re.MULTILINE,
-        )
-        if not matches:
-            return ""
-        return matches[-1].strip().replace(",", "")
+        # Strict
+        return extract_gsm8k_strict(text)
 
     @staticmethod
-    def _normalize_number_string(s: str) -> str:
-        if s is None:
-            return ""
-        t = str(s).strip()
-        t = t.replace(",", "")
-        t = t.replace("$", "").replace("₹", "").replace("€", "").replace("£", "")
-        return t
+    def extract_gsm8k_answer_parseable(text: str) -> str:
+        return extract_gsm8k_parseable(text)
 
     @staticmethod
     def is_correct(pred_text: str, truth: str, dataset_type: str) -> Tuple[bool, str, bool]:
+        """Strict (paper primary) correctness + format adherence.
+
+        Returns: (is_correct, extracted_answer, format_ok)
+        """
         dataset_type = (dataset_type or "").lower().strip()
-        truth = (truth or "").strip()
 
         if dataset_type == "mmlu":
-            extracted = EvaluationMetrics.extract_mmlu_answer(pred_text)
-            format_ok = extracted != ""
-            return (format_ok and extracted == truth.upper(), extracted, format_ok)
+            extracted = extract_mmlu_answer(pred_text)
+            fmt_ok = bool(extracted)
+            ok = bool(extracted and extracted == (truth or "").strip().upper())
+            return ok, extracted, fmt_ok
 
-        if dataset_type == "gsm8k":
-            extracted = EvaluationMetrics.extract_gsm8k_answer(pred_text)
-            format_ok = extracted != ""
-            if not format_ok:
-                return (False, "", False)
-            try:
-                pred_val = float(EvaluationMetrics._normalize_number_string(extracted))
-                truth_val = float(EvaluationMetrics._normalize_number_string(truth))
-                return (abs(pred_val - truth_val) < 1e-6, extracted, True)
-            except Exception:
-                return (False, extracted, True)
+        # GSM8K
+        extracted = extract_gsm8k_strict(pred_text)
+        fmt_ok = bool(extracted)
+        ok = bool(extracted and numbers_equal(extracted, truth))
+        return ok, extracted, fmt_ok
 
-        return (False, "", False)
+    @staticmethod
+    def is_correct_parseable(pred_text: str, truth: str, dataset_type: str) -> Tuple[bool, str, bool]:
+        """Parseable correctness + format adherence (sensitivity metric)."""
+        dataset_type = (dataset_type or "").lower().strip()
+
+        if dataset_type == "mmlu":
+            # MMLU is already short; treat parseable == strict.
+            extracted = extract_mmlu_answer(pred_text)
+            fmt_ok = bool(extracted)
+            ok = bool(extracted and extracted == (truth or "").strip().upper())
+            return ok, extracted, fmt_ok
+
+        extracted = extract_gsm8k_parseable(pred_text)
+        fmt_ok = bool(extracted)
+        ok = bool(extracted and numbers_equal(extracted, truth))
+        return ok, extracted, fmt_ok
 
     @staticmethod
     def evaluate_group(preds: List[str], truths: List[str], dataset_type: str) -> Dict[str, Any]:
-        correct = 0
-        format_ok = 0
         total = len(preds)
+        correct = 0
+        fmt_ok = 0
+
+        correct_p = 0
+        fmt_ok_p = 0
 
         for p, t in zip(preds, truths):
-            ok, _ex, fmt = EvaluationMetrics.is_correct(p, t, dataset_type)
-            correct += int(ok)
-            format_ok += int(fmt)
+            ok, _ex, f = EvaluationMetrics.is_correct(p, t, dataset_type)
+            if ok:
+                correct += 1
+            if f:
+                fmt_ok += 1
+
+            okp, _exp, fp = EvaluationMetrics.is_correct_parseable(p, t, dataset_type)
+            if okp:
+                correct_p += 1
+            if fp:
+                fmt_ok_p += 1
 
         return {
-            "accuracy": correct / max(total, 1),
-            "correct_count": correct,
             "total_count": total,
-            "format_ok_count": format_ok,
-            "format_ok_rate": format_ok / max(total, 1),
-            "format_fail_count": total - format_ok,
+            # strict
+            "correct_count": correct,
+            "accuracy": (correct / total) if total else 0.0,
+            "format_ok_count": fmt_ok,
+            "format_ok_rate": (fmt_ok / total) if total else 0.0,
+            # parseable
+            "correct_parseable_count": correct_p,
+            "accuracy_parseable": (correct_p / total) if total else 0.0,
+            "format_ok_parseable_count": fmt_ok_p,
+            "format_ok_parseable_rate": (fmt_ok_p / total) if total else 0.0,
+            "strict_to_parseable_accuracy_gain": ((correct_p - correct) / total) if total else 0.0,
         }
 
 
@@ -139,7 +147,11 @@ class HeldOutEvaluator:
             )
 
             truth = ex.get("answer", "")
+            if dataset_type == "gsm8k":
+                truth = normalize_number_string(str(truth))
+
             ok, extracted, fmt_ok = EvaluationMetrics.is_correct(pred_text, truth, dataset_type)
+            ok_p, extracted_p, fmt_ok_p = EvaluationMetrics.is_correct_parseable(pred_text, truth, dataset_type)
 
             preds_by_type.setdefault(dataset_type, []).append(pred_text)
             truths_by_type.setdefault(dataset_type, []).append(truth)
@@ -152,10 +164,17 @@ class HeldOutEvaluator:
                     "prompt": formatted_prompt,
                     "ground_truth": truth,
                     "prediction": pred_text,
+                    "raw_prediction": inf_metrics.get("raw_text", None),  # optional server-side field
+                    # strict
                     "extracted_answer": extracted,
                     "format_ok": fmt_ok,
                     "is_correct": ok,
                     "binary_score": int(ok),
+                    # parseable
+                    "extracted_answer_parseable": extracted_p,
+                    "format_ok_parseable": fmt_ok_p,
+                    "is_correct_parseable": ok_p,
+                    "parseable_score": int(ok_p),
                     # Useful timing components (may be absent depending on server version)
                     "output_length": inf_metrics.get("output_length"),
                     "ttft_ms": inf_metrics.get("ttft_ms"),
@@ -167,6 +186,8 @@ class HeldOutEvaluator:
                     "tokenize_ms": inf_metrics.get("tokenize_ms"),
                     "total_latency_ms": inf_metrics.get("total_latency_ms"),
                     "throughput_tokens_per_sec": inf_metrics.get("throughput_tokens_per_sec"),
+                    "server_backend": inf_metrics.get("backend"),
+                    "server_variant": inf_metrics.get("variant"),
                 }
             )
 
@@ -174,12 +195,15 @@ class HeldOutEvaluator:
                 logger.info("-" * 70)
                 logger.info(f"[{i}] {dataset_type} ({ex.get('difficulty','medium')})")
                 logger.info(f"PRED:\n{pred_text}")
-                logger.info(f"TRUTH: {truth} | EXTRACTED: {extracted} | OK={ok} | FORMAT_OK={fmt_ok}")
+                logger.info(f"TRUTH: {truth} | STRICT: {extracted} OK={ok} FMT={fmt_ok} | PARSE: {extracted_p} OK={ok_p} FMT={fmt_ok_p}")
 
         results: Dict[str, Any] = {}
         total_correct = 0
         total = 0
         total_format_ok = 0
+
+        total_correct_p = 0
+        total_format_ok_p = 0
 
         for dtype in sorted(preds_by_type.keys()):
             group = EvaluationMetrics.evaluate_group(preds_by_type[dtype], truths_by_type[dtype], dtype)
@@ -188,24 +212,49 @@ class HeldOutEvaluator:
             total += group["total_count"]
             total_format_ok += group["format_ok_count"]
 
+            total_correct_p += group["correct_parseable_count"]
+            total_format_ok_p += group["format_ok_parseable_count"]
+
         results["overall"] = {
-            "accuracy": total_correct / max(total, 1),
-            "correct_count": total_correct,
             "total_count": total,
-            "format_ok_rate": total_format_ok / max(total, 1),
+            # strict
+            "correct_count": total_correct,
+            "accuracy": (total_correct / total) if total else 0.0,
+            "format_ok_rate": (total_format_ok / total) if total else 0.0,
+            # parseable
+            "correct_parseable_count": total_correct_p,
+            "accuracy_parseable": (total_correct_p / total) if total else 0.0,
+            "format_ok_parseable_rate": (total_format_ok_p / total) if total else 0.0,
         }
 
-        logger.info("\n" + "=" * 70)
-        for dtype in sorted(preds_by_type.keys()):
-            g = results[dtype]
-            logger.info(f"{dtype.upper()} Results")
-            logger.info(f"  Accuracy: {g['accuracy']*100:.2f}% ({g['correct_count']}/{g['total_count']})")
-            logger.info(f"  Format OK: {g['format_ok_rate']*100:.2f}% ({g['format_ok_count']}/{g['total_count']})")
-        logger.info("=" * 70)
+        # Console-friendly summary (keep strict primary, add parseable if helpful)
+        def _fmt_pct(x: float) -> str:
+            return f"{(x * 100.0):.2f}%"
+
+        if "gsm8k" in results:
+            g = results["gsm8k"]
+            logger.info("\n" + "=" * 70)
+            logger.info("GSM8K Results (strict primary)")
+            logger.info(f"  Accuracy: {_fmt_pct(g['accuracy'])} ({g['correct_count']}/{g['total_count']})")
+            logger.info(f"  Format OK: {_fmt_pct(g['format_ok_rate'])} ({g['format_ok_count']}/{g['total_count']})")
+            logger.info("GSM8K Results (parseable sensitivity)")
+            logger.info(f"  Accuracy: {_fmt_pct(g['accuracy_parseable'])} ({g['correct_parseable_count']}/{g['total_count']})")
+            logger.info(f"  Format OK: {_fmt_pct(g['format_ok_parseable_rate'])} ({g['format_ok_parseable_count']}/{g['total_count']})")
+
+        if "mmlu" in results:
+            m = results["mmlu"]
+            logger.info("MMLU Results")
+            logger.info(f"  Accuracy: {_fmt_pct(m['accuracy'])} ({m['correct_count']}/{m['total_count']})")
+            logger.info(f"  Format OK: {_fmt_pct(m['format_ok_rate'])} ({m['format_ok_count']}/{m['total_count']})")
+
         o = results["overall"]
-        logger.info("OVERALL RESULTS")
-        logger.info(f"  Accuracy: {o['accuracy']*100:.2f}% ({o['correct_count']}/{o['total_count']})")
-        logger.info(f"  Format OK: {o['format_ok_rate']*100:.2f}%")
+        logger.info("=" * 70)
+        logger.info("OVERALL RESULTS (strict primary)")
+        logger.info(f"  Accuracy: {_fmt_pct(o['accuracy'])} ({o['correct_count']}/{o['total_count']})")
+        logger.info(f"  Format OK: {_fmt_pct(o['format_ok_rate'])}")
+        logger.info("OVERALL RESULTS (parseable sensitivity)")
+        logger.info(f"  Accuracy: {_fmt_pct(o['accuracy_parseable'])} ({o['correct_parseable_count']}/{o['total_count']})")
+        logger.info(f"  Format OK: {_fmt_pct(o['format_ok_parseable_rate'])}")
         logger.info("=" * 70)
 
         return results, detailed

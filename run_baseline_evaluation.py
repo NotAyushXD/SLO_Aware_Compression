@@ -124,6 +124,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     p.add_argument("--dtype", type=str, default="auto", choices=["auto", "float16", "bfloat16"])
 
+    p.add_argument(
+        "--backend",
+        type=str,
+        default="hf",
+        choices=["hf", "vllm"],
+        help="Inference backend. 'hf' uses Transformers; 'vllm' uses optional vLLM async backend.",
+    )
+    # vLLM-specific options (only used when --backend vllm)
+    p.add_argument("--vllm_model_override", type=str, default=None,
+                   help="Optional model path/name override for vLLM (REQUIRED for --backend vllm --variant med).")
+    p.add_argument("--vllm_quantization", type=str, default=None,
+                   help="vLLM quantization mode for pre-quantized checkpoints (e.g., awq, gptq, bitsandbytes).")
+    p.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.90)
+    p.add_argument("--vllm_max_model_len", type=int, default=4096)
+    p.add_argument("--vllm_max_num_seqs", type=int, default=128)
+    p.add_argument("--vllm_enforce_eager", action="store_true",
+                   help="Best-effort flag for vLLM to disable CUDA graphs (may help debugging).")
     p.add_argument("--prompt_mode", type=str, default="accuracy", choices=["accuracy", "slo"])
 
     p.add_argument("--preprocess", action="store_true", help="Run dataset preprocessing")
@@ -172,10 +189,19 @@ def main() -> None:
     # ------------------------------------------------------------------
     effective_device = "cuda" if (args.device == "auto" and torch.cuda.is_available()) else args.device
     effective_enable_batching = _effective_enable_batching(args.prompt_mode, args.enable_batching)
+    if args.backend == "vllm":
+        # vLLM does its own internal (continuous) batching; the HF micro-batching scheduler is not used.
+        if effective_enable_batching:
+            logger.info("NOTE: --backend vllm ignores HF micro-batching flags; vLLM uses internal continuous batching.")
+        effective_enable_batching = False
 
     logger.info("=" * 80)
     logger.info("CONFIGURATION:")
     logger.info(f"  Model: {args.model}")
+    logger.info(f"  Backend: {args.backend}")
+    if args.backend == "vllm":
+        logger.info(f"  vLLM model override: {args.vllm_model_override}")
+        logger.info(f"  vLLM quantization: {args.vllm_quantization}")
     logger.info(f"  Variant: {args.variant}")
     logger.info(f"  Device: {args.device}")
     logger.info(f"  Prompt mode: {args.prompt_mode}")
@@ -195,6 +221,13 @@ def main() -> None:
         str(out_dir / "config.json"),
         {
             "model": args.model,
+            "backend": args.backend,
+            "vllm_model_override": args.vllm_model_override,
+            "vllm_quantization": args.vllm_quantization,
+            "vllm_gpu_memory_utilization": args.vllm_gpu_memory_utilization,
+            "vllm_max_model_len": args.vllm_max_model_len,
+            "vllm_max_num_seqs": args.vllm_max_num_seqs,
+            "vllm_enforce_eager": bool(args.vllm_enforce_eager),
             "variant": args.variant,
             "device_arg": args.device,
             "device_effective": effective_device,
@@ -250,15 +283,34 @@ def main() -> None:
     logger.info("\n[STEP 2] INITIALIZING SERVER")
     logger.info("-" * 80)
 
-    server = SingleVariantServer(
-        model_name=args.model,
-        variant=args.variant,
-        device=args.device,
-        dtype=args.dtype,
-        enable_batching=effective_enable_batching,
-        max_batch_size=args.max_batch_size,
-        batch_wait_ms=args.batch_wait_ms,
-    )
+    if args.backend == "hf":
+        server = SingleVariantServer(
+            model_name=args.model,
+            variant=args.variant,
+            device=effective_device,
+            dtype=args.dtype,
+            enable_batching=effective_enable_batching,
+            max_batch_size=args.max_batch_size,
+            batch_wait_ms=args.batch_wait_ms,
+        )
+    else:
+        from vllm_server import VLLMConfig, VLLMVariantServer
+        vllm_model = args.vllm_model_override or args.model
+        if args.variant == "med" and not args.vllm_model_override:
+            raise ValueError(
+                "For --backend vllm --variant med, please pass --vllm_model_override pointing to a pre-quantized checkpoint."
+            )
+        vllm_dtype = "float16" if args.dtype in ["auto", "float16"] else args.dtype
+        vcfg = VLLMConfig(
+            model=vllm_model,
+            dtype=vllm_dtype,
+            quantization=args.vllm_quantization,
+            gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+            max_model_len=args.vllm_max_model_len,
+            max_num_seqs=args.vllm_max_num_seqs,
+            enforce_eager=bool(args.vllm_enforce_eager),
+        )
+        server = VLLMVariantServer(model_name=vllm_model, variant=args.variant, config=vcfg)
 
     # ------------------------------------------------------------------
     # STEP 3: RUN LOAD TESTS
