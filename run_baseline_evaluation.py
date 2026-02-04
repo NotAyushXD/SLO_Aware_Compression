@@ -46,7 +46,7 @@ from evaluation import HeldOutEvaluator
 from load_generator import ClosedLoopLoadGenerator
 from metrics import MetricsCalculator, calibrate_slo_profiles
 from preprocessing import DataPreprocessor
-from server import SingleVariantServer
+from server import SingleVariantServer, MultiVariantService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -123,6 +123,70 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--variant", type=str, default="med", choices=["base", "med", "cheap"])
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     p.add_argument("--dtype", type=str, default="auto", choices=["auto", "float16", "bfloat16"])
+
+
+    # Serving mode
+    p.add_argument(
+        "--service",
+        type=str,
+        default="single",
+        choices=["single", "multi"],
+        help="Inference service type: single-variant or multi-variant (task-adaptive routing).",
+    )
+
+    # Router knobs (used when --service multi)
+    p.add_argument(
+        "--router_mode",
+        type=str,
+        default="difficulty",
+        choices=["difficulty", "slo_aware", "fixed", "always_cheap", "always_base"],
+        help="Routing policy for multi-variant serving.",
+    )
+    p.add_argument(
+        "--router_fixed_variant",
+        type=str,
+        default=None,
+        choices=["cheap", "med", "base"],
+        help="If --router_mode fixed, always route to this variant.",
+    )
+    p.add_argument(
+        "--router_max_retries",
+        type=int,
+        default=1,
+        help="Max escalation retries on format/error (0 disables retries).",
+    )
+    p.add_argument(
+        "--router_ema_alpha",
+        type=float,
+        default=0.2,
+        help="EWMA smoothing for per-variant latency tracking (0<alpha<=1).",
+    )
+    p.add_argument(
+        "--router_calibration_mode",
+        type=str,
+        default="base",
+        choices=["base", "router"],
+        help="When calibrating SLO thresholds under multi-variant serving, calibrate on the base model only (recommended) or on router outputs.",
+    )
+
+    p.add_argument(
+        "--multi_variants",
+        type=str,
+        nargs="+",
+        default=["cheap", "med", "base"],
+        choices=["cheap", "med", "base"],
+        help="Variants to load when --service multi. Use fewer variants if you are memory constrained.",
+    )
+    p.add_argument(
+        "--router_lazy_load_base",
+        action="store_true",
+        help="Lazy-load the base (fp16) variant on first use. Useful to avoid initial GPU OOM.",
+    )
+    p.add_argument(
+        "--router_allow_quality_downgrade_for_slo",
+        action="store_true",
+        help="In --router_mode slo_aware, allow routing to cheaper variants than the difficulty-based minimum to try to meet latency SLOs.",
+    )
 
     p.add_argument(
         "--backend",
@@ -284,16 +348,35 @@ def main() -> None:
     logger.info("-" * 80)
 
     if args.backend == "hf":
-        server = SingleVariantServer(
-            model_name=args.model,
-            variant=args.variant,
-            device=effective_device,
-            dtype=args.dtype,
-            enable_batching=effective_enable_batching,
-            max_batch_size=args.max_batch_size,
-            batch_wait_ms=args.batch_wait_ms,
-        )
+        if args.service == "multi":
+            server = MultiVariantService(
+                model_name=args.model,
+                variants=tuple(args.multi_variants),
+                router_mode=args.router_mode,
+                fixed_variant=args.router_fixed_variant,
+                allow_quality_downgrade_for_slo=bool(args.router_allow_quality_downgrade_for_slo),
+                device=effective_device,
+                dtype=args.dtype,
+                enable_batching=effective_enable_batching,
+                max_batch_size=args.max_batch_size,
+                batch_wait_ms=args.batch_wait_ms,
+                ema_alpha=args.router_ema_alpha,
+                max_retries=args.router_max_retries,
+                lazy_load_base=bool(args.router_lazy_load_base),
+            )
+        else:
+            server = SingleVariantServer(
+                model_name=args.model,
+                variant=args.variant,
+                device=effective_device,
+                dtype=args.dtype,
+                enable_batching=effective_enable_batching,
+                max_batch_size=args.max_batch_size,
+                batch_wait_ms=args.batch_wait_ms,
+            )
     else:
+        if args.service == "multi":
+            raise ValueError("--service multi is currently supported only for --backend hf")
         from vllm_server import VLLMConfig, VLLMVariantServer
         vllm_model = args.vllm_model_override or args.model
         if args.variant == "med" and not args.vllm_model_override:
@@ -322,6 +405,46 @@ def main() -> None:
     slo_profiles = None if args.disable_slo_calibration else _load_slo_profiles(slo_thresholds_path)
 
     primary_key = f"p{int(args.slo_primary_percentile)}"
+
+
+    # ------------------------------------------------------------------
+    # Multi-variant: optional base-only SLO calibration
+    # ------------------------------------------------------------------
+    if (
+        (not args.skip_load_test)
+        and (not args.disable_slo_calibration)
+        and (slo_profiles is None)
+        and isinstance(server, MultiVariantService)
+        and (args.router_calibration_mode == "base")
+    ):
+        calib_conc = int(args.slo_calibration_concurrency)
+        logger.info(
+            f"[CALIBRATION] Multi-variant service: calibrating SLO profiles using BASE variant only at concurrency={calib_conc}"
+        )
+        base_server = server.get_variant_server("base")
+        lg_calib = ClosedLoopLoadGenerator(
+            inference_func=base_server.generate,
+            max_concurrency=calib_conc,
+            num_requests=args.num_requests,
+            data_loader=val_data,
+            prompt_mode=args.prompt_mode,
+            seed=args.seed,
+        )
+        req_metrics_calib = lg_calib.run_load_test()
+        slo_profiles = calibrate_slo_profiles(req_metrics_calib, percentiles=args.slo_calibration_percentiles)
+        _write_json(
+            slo_thresholds_path,
+            {
+                "definition": "TTFT_OptionA_queue_inclusive",
+                "calibration_concurrency": calib_conc,
+                "percentiles": args.slo_calibration_percentiles,
+                "primary": args.slo_primary_percentile,
+                "profiles": slo_profiles,
+                "calibration_mode": "base_only",
+            },
+        )
+        # Save calibration request traces for debugging / appendix.
+        lg_calib.save_results(str(out_dir / f"requests_calibration_base_concurrency_{calib_conc}.jsonl"))
 
     if args.skip_load_test:
         logger.info("Skipping load tests (--skip_load_test).")
@@ -372,6 +495,11 @@ def main() -> None:
             else:
                 if slo_profiles is not None:
                     slo_for_report = slo_profiles.get(primary_key) or next(iter(slo_profiles.values()))
+
+
+            # If using multi-variant routing, update the router's SLO targets.
+            if isinstance(server, MultiVariantService) and slo_for_report is not None:
+                server.set_slo_dict(slo_for_report)
 
             mc = MetricsCalculator(req_metrics, slo_dict=slo_for_report)
             report = mc.print_report(title=f"LOAD TEST RESULTS (Concurrency {conc})")

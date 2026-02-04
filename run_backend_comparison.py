@@ -90,19 +90,25 @@ def _collect_metrics(run_dir: str, backend: str, batching_mode: str) -> List[Dic
             "concurrency": int(conc),
             "run_dir": run_dir,
         }
-        # Common metrics blocks
-        for metric_key in ["ttft", "tpot", "total_latency", "throughput_toks_per_s"]:
-            if metric_key not in m:
+
+        # Percentile blocks produced by MetricsCalculator
+        for metric_key in ["ttft", "tpot", "e2e_latency", "queue_wait"]:
+            blk = m.get(metric_key)
+            if not isinstance(blk, dict):
                 continue
-            blk = m[metric_key]
             for k in ["p50", "p90", "p95", "p99", "mean"]:
                 if k in blk:
                     row[f"{metric_key}_{k}"] = blk[k]
-        # SLO pass rates (if present)
-        if "slo" in m:
-            for k, v in m["slo"].items():
-                row[f"slo_{k}"] = v
+
+        # Summary (throughput + SLO compliance)
+        summ = m.get("summary", {}) if isinstance(m, dict) else {}
+        if isinstance(summ, dict):
+            for k in ["success_rate", "throughput_tokens_per_sec", "slo_compliance", "escalation_rate"]:
+                if k in summ:
+                    row[k] = summ[k]
+
         rows.append(row)
+
     return rows
 
 

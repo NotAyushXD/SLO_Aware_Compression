@@ -40,6 +40,31 @@ This bundle contains patched versions of the baseline scripts to produce paper-g
 - Replaces strict FIFO batching selection with a simple **short-job-first** policy (by `max_tokens`) plus an **anti-starvation** fallback.
 - This improves tail TTFT for short requests (e.g., MMLU) when mixed with long-form GSM8K.
 
+
+### 6) Multi-variant serving wrapper (server.py)
+- Adds `MultiVariantService`, a single-process wrapper that can load `cheap`/`med`/`base` variants and route per-request.
+- Supports routing modes: `difficulty` (easy→cheap, medium→med, hard→base), `slo_aware`, and fixed routing.
+- Includes a paper-friendly *escalation* mechanism: if the chosen (cheaper) variant returns an unparsable answer format, it retries on a stronger variant (bounded by `--router_max_retries`).
+- **GPU-memory aware loading (default):** the service automatically chooses a safe loading plan based on detected GPU memory.
+  - Large GPUs: eager-load all variants.
+  - Mid GPUs: preload `cheap+med`, lazy-load `base` on first use.
+  - Small GPUs: keep only 1 variant resident and swap variants on demand.
+  - You can still override manually via `--multi_variants ...` and `--router_lazy_load_base`.
+
+Example (multi-variant, difficulty routing):
+```bash
+python run_baseline_evaluation.py \
+  --backend hf \
+  --service multi \
+  --router_mode difficulty \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --prompt_mode slo \
+  --num_requests 200 \
+  --concurrencies 1 4 \
+  --seed 42 \
+  --output_dir ./runs/multi_variant_smoke
+```
+
 ## How to run
 
 ### Quick smoke suite

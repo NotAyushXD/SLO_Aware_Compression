@@ -21,7 +21,7 @@ pip install -r requirements.txt
 # Login to HuggingFace (for model access)
 huggingface-cli login
 # Paste your token from https://huggingface.co/settings/tokens
-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
+<PASTE_YOUR_TOKEN_HERE>  # never commit tokens into a repo
 ```
 
 ## 2. Run Full Baseline (Option A: Complete)
@@ -36,7 +36,7 @@ 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
 
 python run_baseline_evaluation.py \
   --preprocess \
-  --model_name meta-llama/Llama-2-7b-chat-hf \
+  --model meta-llama/Llama-2-7b-chat-hf \
   --num_requests 5000 \
   --concurrencies 1 2 4 8 16 32 \
   --device cuda \
@@ -53,7 +53,7 @@ If you've already downloaded datasets:
 ```bash
 # Just run load tests + evaluation (skip preprocessing)
 python run_baseline_evaluation.py \
-  --model_name meta-llama/Llama-2-7b-chat-hf \
+  --model meta-llama/Llama-2-7b-chat-hf \
   --num_requests 5000 \
   --concurrencies 1 4 8 16 \
   --device cuda \
@@ -70,7 +70,7 @@ Test everything with small datasets before full run:
 # Test with 100 examples, GPT-2, CPU
 python run_baseline_evaluation.py \
   --preprocess \
-  --model_name gpt2 \
+  --model gpt2 \
   --num_requests 100 \
   --concurrencies 1 2 \
   --device cpu \
@@ -88,7 +88,7 @@ python run_baseline_evaluation.py \
 cat results/baseline_med/summary.json | python -m json.tool
 
 # View accuracy
-cat results/baseline_med/eval_results.json | python -m json.tool
+cat results/baseline_med/accuracy_results.json | python -m json.tool
 
 # View specific concurrency metrics
 cat results/baseline_med/metrics_concurrency_16.json | python -m json.tool
@@ -103,7 +103,7 @@ results/baseline_med/
 ├── summary.json
 │   └── Complete summary: load tests across all concurrencies + eval results
 │
-├── eval_results.json
+├── accuracy_results.json
 │   └── Accuracy breakdown:
 │       - MMLU: exact match on multiple choice
 │       - GSM8K: exact match on math problems
@@ -177,7 +177,7 @@ Test only specific concurrency levels:
 
 ```bash
 python run_baseline_evaluation.py \
-  --model_name meta-llama/Llama-2-7b-chat-hf \
+  --model meta-llama/Llama-2-7b-chat-hf \
   --num_requests 5000 \
   --concurrencies 1 8 16  # Only test these three
   --output_dir results/baseline_med
@@ -188,7 +188,7 @@ python run_baseline_evaluation.py \
 ```bash
 # Use only first 500 examples from each split
 python run_baseline_evaluation.py \
-  --model_name meta-llama/Llama-2-7b-chat-hf \
+  --model meta-llama/Llama-2-7b-chat-hf \
   --num_requests 500  # Fewer requests
   --data_subset 500   # Smaller dataset
   --concurrencies 1 8  # Fewer concurrency levels
@@ -211,8 +211,8 @@ python run_baseline_evaluation.py \
 # Ensure HuggingFace login and model access
 huggingface-cli login
 # Or try a smaller model:
---model_name gpt2
---model_name distilgpt2
+--model gpt2
+--model distilgpt2
 ```
 
 ### Error: Data not found
@@ -229,7 +229,7 @@ python preprocessing.py
 
 ## 12. Next Steps After Baseline
 
-1. **Analyze results**: Review summary.json and eval_results.json
+1. **Analyze results**: Review summary.json and accuracy_results.json
 2. **Optimize concurrency**: Find sweet spot between throughput and latency
 3. **Reduce cost**: Test 4-bit (CHEAP) or FP16 (BASE) variants
 4. **Build router**: Classify tasks by difficulty for variant selection

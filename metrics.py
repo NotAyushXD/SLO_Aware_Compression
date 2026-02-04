@@ -149,7 +149,16 @@ class MetricsCalculator:
             total_duration = 0.0
             throughput = 0.0
 
-        # SLO compliance
+        
+        # Escalation rate (for MultiVariantService): fraction of successful requests that escalated.
+        escalations = sum(
+            1
+            for m in self.metrics
+            if getattr(m, 'success', False)
+            and bool(getattr(m, 'inference_metrics', {}).get('router_escalated', False))
+        )
+        escalation_rate = float(escalations) / max(successful, 1)
+# SLO compliance
         slo_ok = 0
         slo_viol = 0
         viol_details = []
@@ -196,7 +205,7 @@ class MetricsCalculator:
                 "slo_compliant": slo_ok,
                 "slo_violations": slo_viol,
                 "slo_compliance": slo_compliance,
-                "escalation_rate": 0.0,
+                "escalation_rate": float(escalation_rate),
                 "total_duration_sec": float(total_duration),
                 "throughput_tokens_per_sec": float(throughput),
             },
