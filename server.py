@@ -178,6 +178,7 @@ class _PendingRequest:
     temperature: float
     top_p: float
     enqueue_time: float
+    queue_depth_at_submit: int = 0
     event: threading.Event
     result_text: Optional[str] = None
     result_metrics: Optional[Dict] = None
@@ -311,6 +312,7 @@ class _BatchingScheduler:
 
                 # queue_wait_ms is used by load_generator to compute total queueing.
                 m["queue_wait_ms"] = float(max(0.0, scheduler_wait_ms + float(lock_wait_ms)))
+                m["queue_depth_at_submit"] = int(getattr(req, "queue_depth_at_submit", 0))
 
                 # ------------------------------------------------------------------
                 # Option A (paper definition): queue-inclusive TTFT
@@ -446,6 +448,11 @@ class SingleVariantServer:
         elif self.variant == "cheap":
             if self.device != "cuda":
                 logger.warning("CHEAP (int4) requested on non-CUDA device; falling back to fp16.")
+                self.variant_effective = "base"
+                self.quantization = f"{self.dtype}"
+                quant_config = None
+            elif cc_major is not None and cc_major < 7:
+                logger.warning(f"CHEAP (int4) requested on compute capability {cc_major}.x (<7.0); falling back to fp16.")
                 self.variant_effective = "base"
                 self.quantization = f"{self.dtype}"
                 quant_config = None
@@ -792,6 +799,11 @@ class SingleVariantServer:
                 event=threading.Event(),
             )
             assert self._scheduler is not None
+            # Capture queue depth just before enqueuing (best-effort; used for learned routing features)
+            try:
+                req.queue_depth_at_submit = int(self._scheduler.get_queue_depth())
+            except Exception:
+                req.queue_depth_at_submit = 0
             self._scheduler.submit(req)
             req.event.wait()
 
@@ -945,6 +957,10 @@ class _MVRequest:
     path: List[str]
     event: threading.Event
 
+    # Routing context
+    router_queue_depths: Dict[str, int] = field(default_factory=dict)
+    router_meta: Dict[str, Any] = field(default_factory=dict)
+
     attempt_idx: int = 0
     attempts: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -980,18 +996,26 @@ class MultiVariantService:
         device: str = "cuda",
         dtype: str = "float16",
         router_mode: str = "difficulty",
+        router_fixed_variant: Optional[str] = None,
         fixed_variant: Optional[str] = None,
+        learned_router_dir: Optional[str] = None,
         enable_batching: bool = True,
         max_batch_size: int = 8,
-        batch_timeout_s: float = 0.01,
+        batch_wait_ms: int = 8,
+        batch_timeout_s: Optional[float] = None,
+        ema_alpha: float = 0.2,
+        lazy_load_base: int = 0,
+        router_max_retries: Optional[int] = None,
+        max_retries: int = 1,
+        router_calibration_mode: Optional[str] = None,
+        calibration_mode: str = "base",
         # Swap / residency
         load_strategy: str = "auto",
         max_loaded_variants: Optional[int] = None,
         preload_variants: Optional[List[str]] = None,
+        warmup: bool = False,
         # Router policy
         allow_quality_downgrade_for_slo: bool = False,
-        max_retries: int = 1,
-        calibration_mode: str = "base",
         # Dispatcher policy
         dispatcher_batch_wait_s: float = 0.002,
         dispatcher_max_sticky_batches: int = 4,
@@ -1002,15 +1026,41 @@ class MultiVariantService:
         self.dtype = dtype
 
         self.router_mode = (router_mode or "difficulty").lower()
+
+        # Alias support
+        if fixed_variant is None and router_fixed_variant is not None:
+            fixed_variant = router_fixed_variant
+        if router_max_retries is not None:
+            max_retries = router_max_retries
+        if router_calibration_mode is not None:
+            calibration_mode = router_calibration_mode
+        if batch_timeout_s is not None and (batch_wait_ms is None or batch_wait_ms == 8):
+            try:
+                batch_wait_ms = int(max(0.0, float(batch_timeout_s)) * 1000)
+            except Exception:
+                pass
+
         self.fixed_variant = _normalize_variant(fixed_variant) if fixed_variant else None
 
         self.enable_batching = enable_batching
         self.max_batch_size = int(max(1, max_batch_size))
-        self.batch_timeout_s = float(max(0.0, batch_timeout_s))
+        self.batch_wait_ms = int(max(0, batch_wait_ms or 0))
 
         self.allow_quality_downgrade_for_slo = bool(allow_quality_downgrade_for_slo)
         self.max_retries = int(max(0, max_retries))
         self.calibration_mode = (calibration_mode or "base").lower()
+
+        self.ema_alpha = float(max(0.0, min(1.0, ema_alpha)))
+        self.lazy_load_base = bool(lazy_load_base)
+
+        self.learned_router_dir = learned_router_dir
+        self._learned_router = None
+        if self.router_mode in {"learned_ttft", "learned_total"}:
+            if not learned_router_dir:
+                raise ValueError("--learned_router_dir is required when router_mode is learned_*.")
+            from learned_router import LearnedRouter
+            artifacts_dir = self._resolve_learned_router_path(learned_router_dir, self.router_mode)
+            self._learned_router = LearnedRouter.load(artifacts_dir)
 
         self.dispatcher_batch_wait_s = float(max(0.0, dispatcher_batch_wait_s))
         self.dispatcher_max_sticky_batches = int(max(1, dispatcher_max_sticky_batches))
@@ -1019,12 +1069,10 @@ class MultiVariantService:
         requested_variants = variants or ["cheap", "med", "base"]
         requested_variants = [_normalize_variant(v) for v in requested_variants]
 
-        # Filter unsupported variants (esp. bnb int8 on older GPUs).
         supported = [v for v in requested_variants if self._is_variant_supported(v)]
         if "base" not in supported:
             supported.append("base")
-        # Stable order
-        self.variants: List[str] = [v for v in self.VARIANT_ORDER if v in supported]
+        self.variants = [v for v in self.VARIANT_ORDER if v in supported]
 
         if self.fixed_variant and self.fixed_variant not in self.variants:
             logger.warning(
@@ -1032,33 +1080,34 @@ class MultiVariantService:
             )
             self.fixed_variant = "base"
 
-        # Latency stats (EMA per variant)
-        self._stats: Dict[str, _VariantStats] = {v: _VariantStats() for v in self.variants}
-        self.slo_dict: Dict[str, Dict[str, float]] = {}
+        self._stats = {v: _VariantStats() for v in self.variants}
+        self.slo_dict = {}
 
-        # Residency / swapping
         self.load_strategy = (load_strategy or "auto").lower()
         self.max_loaded_variants = max_loaded_variants
         self.preload_variants = [_normalize_variant(v) for v in (preload_variants or [])]
 
-        # Loaded servers + LRU bookkeeping
-        self._servers: Dict[str, SingleVariantServer] = {}
-        self._lru: List[str] = []
-        self._pins: Dict[str, int] = {v: 0 for v in self.variants}
-        self._load_events: Dict[str, threading.Event] = {}
+        self._servers = {}
+        self._lru = []
+        self._pins = {v: 0 for v in self.variants}
+        self._load_events = {}
 
-        # Request queues + dispatcher thread
         self._lock = threading.RLock()
         self._cv = threading.Condition(self._lock)
-        self._queues: Dict[str, Deque[_MVRequest]] = {v: deque() for v in self.variants}
+        self._queues = {v: deque() for v in self.variants}
         self._shutdown = False
-        self._active_variant: Optional[str] = None
-        self._active_batches_run: int = 0
+        self._active_variant = None
+        self._active_batches_run = 0
 
-        # Decide capacity + preload (auto) BEFORE starting dispatcher.
         self._configure_capacity_and_preload()
 
-        # Start dispatcher
+        if warmup:
+            for v in list(self._servers.keys()):
+                try:
+                    self._warmup_variant(v)
+                except Exception:
+                    pass
+
         self._dispatcher = threading.Thread(target=self._dispatcher_loop, name="mv-dispatcher", daemon=True)
         self._dispatcher.start()
 
@@ -1133,6 +1182,18 @@ class MultiVariantService:
         self.max_loaded_variants = len(picked)
         self.preload_variants = picked
 
+        # Optionally avoid preloading base to reduce startup VRAM pressure.
+        if self.lazy_load_base and len(picked) > 1 and "base" in picked:
+            plan = [v for v in picked if v != "base"]
+            if plan:
+                self.preload_variants = plan
+                self.max_loaded_variants = len(plan)
+                # Re-load only the reduced preload plan. This is safe because it uses <= selected plan.
+                self._cleanup_servers()
+                for v in plan:
+                    self._ensure_loaded(v)
+
+
     def _try_preload_plan(self, plan: List[str], safety_free_gb: float = 1.0) -> bool:
         """Try to load a set of variants; if OOM or too little free VRAM, undo."""
         # Clear any existing servers (startup only)
@@ -1145,7 +1206,7 @@ class MultiVariantService:
                 self._ensure_loaded(v)
             # Optional headroom check
             info = GPUMonitor.get_gpu_info()
-            free_gb = info.get("free_gb")
+            free_gb = info.get("free")
             if free_gb is not None and free_gb < safety_free_gb:
                 logger.warning(
                     f"AUTO strategy: plan {plan} leaves low free VRAM ({free_gb:.2f}GB < {safety_free_gb}GB)."
@@ -1184,6 +1245,58 @@ class MultiVariantService:
         For normal serving, always use MultiVariantService.generate().
         """
         return self._ensure_loaded(_normalize_variant(variant))
+
+    def _resolve_learned_router_path(self, learned_router_dir: str, router_mode: str) -> str:
+        """Resolve learned router artifacts path.
+
+        Supports BOTH patterns:
+          1) root folder: <dir>/learned_ttft and <dir>/learned_total
+          2) mode folder: <dir> itself is one of {learned_ttft, learned_total}
+        """
+        import os
+        base = os.path.abspath(os.path.expanduser(learned_router_dir))
+        # If this folder already looks like a mode folder, use it.
+        sentinels = [
+            'weights.json',
+            'quality_models.pkl',
+            'latency_models.pkl',
+            'ttft_models.pkl',
+            'tpot_models.pkl',
+        ]
+        if any(os.path.isfile(os.path.join(base, s)) for s in sentinels):
+            return base
+
+        # Otherwise, treat as root and look for a subdirectory.
+        cand = os.path.join(base, router_mode)
+        if os.path.isdir(cand):
+            return cand
+
+        # If user passed a mode folder name but it's missing files, return it for clearer error later.
+        if os.path.basename(base) == router_mode:
+            return base
+
+        raise FileNotFoundError(
+            f"Could not resolve learned router artifacts for mode '{router_mode}'. "
+            f"Expected either a mode folder with weights/models, or a root folder containing '{router_mode}/'. "
+            f"Got: {learned_router_dir}"
+        )
+
+    def _warmup_variant(self, variant: str) -> None:
+        """Warmup a variant once to catch obvious load issues early."""
+        try:
+            srv = self.get_variant_server(variant)
+            _ = srv.generate(
+                prompt='Warmup.',
+                max_tokens=1,
+                temperature=0.0,
+                top_p=1.0,
+                dataset_type='mmlu',
+                difficulty='easy',
+                prompt_mode='slo',
+                use_batching=True,
+            )
+        except Exception:
+            return
 
     def cleanup(self) -> None:
         with self._cv:
@@ -1231,91 +1344,92 @@ class MultiVariantService:
                 self._lru.remove(v)
                 return srv
         return None
-
     def _ensure_loaded(self, variant: str) -> SingleVariantServer:
+        """Ensure a SingleVariantServer for `variant` exists.
+
+        Uses an event-based ...
+        """
         variant = _normalize_variant(variant)
         if variant not in self.variants:
             raise ValueError(f"Variant '{variant}' not in enabled variants {self.variants}")
 
-        # Fast path
-        with self._lock:
-            existing = self._servers.get(variant)
-            if existing is not None:
-                self._touch_lru_locked(variant)
-                return existing
-            if variant in self._load_events:
-                ev = self._load_events[variant]
-                # Wait without holding the lock
-                pass
-            else:
-                ev = threading.Event()
-                self._load_events[variant] = ev
-                # Evict down to capacity
-                victims: List[SingleVariantServer] = []
-                cap = int(self.max_loaded_variants or 1)
-                while len(self._servers) >= cap:
-                    victim = self._evict_one_locked()
-                    if victim is None:
-                        # Can't evict anything (everything pinned)
-                        del self._load_events[variant]
-                        raise RuntimeError(
-                            f"Cannot load '{variant}': all loaded variants are pinned (loaded={list(self._servers.keys())})."
-                        )
-                    victims.append(victim)
-                # We'll cleanup victims outside the lock
-                cleanup_victims = victims
-                need_load = True
-
-        # If we got here via waiting branch, do the wait then return.
-        if variant in self._load_events and not need_load:
-            self._load_events[variant].wait()
+        while True:
+            # Fast path / coordination
             with self._lock:
-                srv = self._servers.get(variant)
-                if srv is None:
-                    raise RuntimeError(f"Load for '{variant}' signaled but server not present.")
-                self._touch_lru_locked(variant)
-                return srv
+                existing = self._servers.get(variant)
+                if existing is not None:
+                    self._touch_lru_locked(variant)
+                    return existing
 
-        # Cleanup evicted servers
-        for s in cleanup_victims:
-            try:
-                s.cleanup()
-            except Exception:
-                pass
-        if self.device == "cuda":
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
+                ev = self._load_events.get(variant)
+                if ev is not None:
+                    wait_ev = ev
+                else:
+                    # This thread becomes the loader for this variant
+                    ev = threading.Event()
+                    self._load_events[variant] = ev
+                    wait_ev = None
 
-        # Actually load variant (no global lock held)
-        try:
-            srv = SingleVariantServer(
-                model_name=self.model_name,
-                variant=variant,
-                device=self.device,
-                dtype=self.dtype,
-                enable_batching=self.enable_batching,
-                max_batch_size=self.max_batch_size,
-                batch_timeout_s=self.batch_timeout_s,
-            )
-        except Exception as e:
+                    # Evict to capacity (pin-safe)
+                    victims = []
+                    cap = int(self.max_loaded_variants or 1)
+                    while len(self._servers) >= cap:
+                        victim = self._evict_one_locked()
+                        if victim is None:
+                            # Cannot evict anything (everything pinned)
+                            self._load_events.pop(variant, None)
+                            ev.set()
+                            raise RuntimeError(
+                                f"Cannot load '{variant}': all loaded variants are pinned (loaded={list(self._servers.keys())})."
+                            )
+                        victims.append(victim)
+
+            if wait_ev is not None:
+                # Another loader is working; wait and retry
+                wait_ev.wait()
+                continue
+
+            # Loader branch: clean up victims outside the lock
+            for s in victims:
+                try:
+                    s.cleanup()
+                except Exception:
+                    pass
+            if self.device == "cuda":
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+            # Actually load variant (no global lock held)
+            try:
+                srv = SingleVariantServer(
+                    model_name=self.model_name,
+                    variant=variant,
+                    device=self.device,
+                    dtype=self.dtype,
+                    enable_batching=self.enable_batching,
+                    max_batch_size=self.max_batch_size,
+                    batch_wait_ms=self.batch_wait_ms,
+                )
+            except Exception:
+                with self._lock:
+                    ev = self._load_events.pop(variant, None)
+                    if ev:
+                        ev.set()
+                raise
+
             with self._lock:
+                self._servers[variant] = srv
+                self._touch_lru_locked(variant)
                 ev = self._load_events.pop(variant, None)
                 if ev:
                     ev.set()
-            raise
-
-        with self._lock:
-            self._servers[variant] = srv
-            self._touch_lru_locked(variant)
-            ev = self._load_events.pop(variant, None)
-            if ev:
-                ev.set()
-            return srv
+                return srv
 
     # -------------------------
     # Routing
+
     # -------------------------
 
     def _queue_depth_locked(self, variant: str) -> int:
@@ -1340,25 +1454,55 @@ class MultiVariantService:
         difficulty: str,
         prompt_mode: str,
         max_tokens: int,
-    ) -> Tuple[str, str]:
-        """Return (variant, reason)."""
-        dataset_type = dataset_type.lower()
+        estimated_tokens: int,
+        queue_depths: Dict[str, int],
+    ) -> Tuple[str, str, Dict[str, Any]]:
+        # Returns (variant, reason, router_meta)
+        dataset_type = (dataset_type or "gsm8k").lower()
         difficulty = (difficulty or "easy").lower()
         prompt_mode = (prompt_mode or "slo").lower()
 
+        # Explicit fixed behaviors
+        if self.router_mode == "fixed" and self.fixed_variant:
+            return self.fixed_variant, "fixed", {}
+        if self.router_mode == "always_cheap":
+            v = "cheap" if "cheap" in self.variants else ("med" if "med" in self.variants else "base")
+            return v, "always_cheap", {}
+        if self.router_mode == "always_base":
+            return "base", "always_base", {}
+
         if self.fixed_variant:
-            return self.fixed_variant, "fixed"
+            return self.fixed_variant, "fixed", {}
 
         # Difficulty router: cheap for easy, med for medium, base for hard.
         if self.router_mode == "difficulty":
             if difficulty in {"hard", "difficult"}:
                 v = "base" if "base" in self.variants else self.variants[-1]
-                return v, "difficulty=hard"
+                return v, "difficulty=hard", {}
             if difficulty in {"medium", "med"}:
                 v = "med" if "med" in self.variants else ("cheap" if "cheap" in self.variants else "base")
-                return v, "difficulty=medium"
+                return v, "difficulty=medium", {}
             v = "cheap" if "cheap" in self.variants else ("med" if "med" in self.variants else "base")
-            return v, "difficulty=easy"
+            return v, "difficulty=easy", {}
+
+        # Learned routers
+        if self.router_mode in {"learned_ttft", "learned_total"}:
+            if self._learned_router is None:
+                raise RuntimeError("Learned router requested but artifacts were not loaded.")
+            mode = "ttft" if self.router_mode == "learned_ttft" else "total"
+            decision = self._learned_router.route(
+                dataset_type=dataset_type,
+                difficulty=difficulty,
+                max_tokens=int(max_tokens),
+                estimated_tokens=int(estimated_tokens),
+                queue_depths=queue_depths,
+                slo_dict=self.slo_dict,
+                mode=mode,
+                allowed_variants=self.variants,
+            )
+            meta = decision.to_dict()
+            meta["router_mode_label"] = "Learned-TTFT" if self.router_mode == "learned_ttft" else "Learned-Total (Derived)"
+            return decision.variant, meta["router_mode_label"], meta
 
         # SLO-aware: choose cheapest predicted to meet SLO.
         if self.router_mode == "slo_aware" and self.slo_dict:
@@ -1366,25 +1510,38 @@ class MultiVariantService:
             if slo:
                 ttft_slo = float(slo.get("ttft_ms", 1e9))
                 tpot_slo = float(slo.get("tpot_ms", 1e9))
-                # Our predictor only gives total, but we can map to ttft/tpot using EMA components.
                 for v in self.VARIANT_ORDER:
                     if v not in self.variants:
                         continue
                     st = self._stats.get(v) or _VariantStats()
                     pred_ttft = st.ema_ttft_ms or (0.6 * (st.ema_total_ms or 1000.0))
-                    pred_tpot = st.ema_tpot_ms or (st.ema_tpot_ms or 5.0)
+                    pred_tpot = st.ema_tpot_ms or 5.0
                     if pred_ttft <= ttft_slo and pred_tpot <= tpot_slo:
-                        return v, f"slo_meet({difficulty})"
-                # None meets -> pick strongest
-                return "base", f"slo_miss({difficulty})"
+                        return v, f"slo_meet({difficulty})", {}
+                return "base", f"slo_miss({difficulty})", {}
 
-        # Default
-        return "base", "default"
+        return "base", "default", {}
 
-    def plan_path(self, dataset_type: str, difficulty: str, prompt_mode: str, max_tokens: int) -> Tuple[List[str], str]:
-        """Return (path, reason) where path is the list of variants to try."""
+
+    def plan_path(
+        self,
+        dataset_type: str,
+        difficulty: str,
+        prompt_mode: str,
+        max_tokens: int,
+        estimated_tokens: Optional[int] = None,
+    ) -> Tuple[List[str], str, Dict[str, Any], Dict[str, int]]:
+        # Snapshot queue depths at routing time
         with self._lock:
-            chosen, reason = self.choose_variant(dataset_type, difficulty, prompt_mode, max_tokens)
+            queue_depths = {v: len(self._queues.get(v, deque())) for v in self.variants}
+            chosen, reason, meta = self.choose_variant(
+                dataset_type=dataset_type,
+                difficulty=difficulty,
+                prompt_mode=prompt_mode,
+                max_tokens=max_tokens,
+                estimated_tokens=estimated_tokens,
+                queue_depths=queue_depths,
+            )
 
         path = [chosen]
         if self.max_retries > 0 and chosen != "base" and "base" in self.variants:
@@ -1393,16 +1550,17 @@ class MultiVariantService:
             if len(path) < (self.max_retries + 1):
                 path.append("base")
 
-        return path[: self.max_retries + 1], reason
+        return path[: self.max_retries + 1], reason, meta, queue_depths
+
 
     def _should_retry(self, dataset_type: str, text: str) -> bool:
         dataset_type = dataset_type.lower()
         if dataset_type == "gsm8k":
-            ok, _ = extract_gsm8k_strict(text)
-            return not ok
+            ans = extract_gsm8k_strict(text)
+            return not bool(ans)
         if dataset_type == "mmlu":
-            ok, _ = extract_mmlu_answer(text)
-            return not ok
+            ans = extract_mmlu_answer(text)
+            return ans is None
         return False
 
     # -------------------------
@@ -1434,7 +1592,8 @@ class MultiVariantService:
             else:
                 max_tokens = 256
 
-        path, reason = self.plan_path(dataset_type, difficulty, prompt_mode, int(max_tokens))
+        est_tokens = len(prompt.split())
+        path, reason, router_meta, qdepths = self.plan_path(dataset_type, difficulty, prompt_mode, int(max_tokens), estimated_tokens=est_tokens)
 
         req = _MVRequest(
             prompt=prompt,
@@ -1447,6 +1606,8 @@ class MultiVariantService:
             enqueue_t=time.perf_counter(),
             path=path,
             event=threading.Event(),
+            router_queue_depths=qdepths,
+            router_meta=router_meta,
         )
 
         # Queue request for its first variant
@@ -1489,6 +1650,8 @@ class MultiVariantService:
         req.output_metrics["router_escalated"] = len(req.attempts) > 1
         req.output_metrics["router_final_variant"] = req.output_metrics.get("variant")
         req.output_metrics["router_num_attempts"] = len(req.attempts)
+        req.output_metrics["router_queue_depths"] = getattr(req, "router_queue_depths", {})
+        req.output_metrics["router_meta"] = getattr(req, "router_meta", {})
 
         return req.output_text or "", req.output_metrics
 
@@ -1628,11 +1791,15 @@ class MultiVariantService:
                     with self._lock:
                         st = self._stats.get(variant)
                         if st and m.get("success"):
-                            st.update(
-                                ttft_ms=float(m.get("ttft_infer_ms", m.get("ttft_ms", 0.0))) or None,
-                                tpot_ms=float(m.get("tpot_ms", 0.0)) or None,
-                                total_ms=float(m.get("total_latency_ms", 0.0)) - sched_wait_ms,
-                            )
+                            try:
+                                ttft_infer = float(m.get("ttft_infer_ms", 0.0) or 0.0)
+                                tpot = float(m.get("tpot_ms", 0.0) or 0.0)
+                                total = float(m.get("total_latency_ms", 0.0) or 0.0) - sched_wait_ms
+                                n_out = int(m.get("output_tokens", m.get("n_output_tokens", 0)) or 0)
+                                q_wait = float(m.get("queue_wait_ms", 0.0) or 0.0)
+                                st.update(ttft_infer, tpot, total, n_out, q_wait, alpha=self.ema_alpha)
+                            except Exception:
+                                pass
 
                     # Retry on format failure
                     if m.get("success") and self._should_retry(r.dataset_type, out):

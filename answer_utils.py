@@ -113,6 +113,11 @@ _ANSWER_LINE_RE = re.compile(
     flags=re.IGNORECASE | re.MULTILINE,
 )
 
+
+_ANSWER_IS_RE = re.compile(
+    rf"(?:final\s+answer|answer)\s*(?:is|:)\s*({_NUM_RE})",
+    flags=re.IGNORECASE,
+)
 _LAST_LINE_NUMBER_RE = re.compile(
     rf"^\s*({_NUM_RE})\s*[\.\)]?\s*$",
     flags=re.IGNORECASE,
@@ -151,6 +156,11 @@ def extract_gsm8k_parseable(text: str) -> str:
 
     # 3) Explicit Answer:/Final Answer: line
     m = _ANSWER_LINE_RE.findall(text)
+    if m:
+        return normalize_number_string(m[-1])
+
+    # 3b) "answer is 42" patterns
+    m = _ANSWER_IS_RE.findall(text)
     if m:
         return normalize_number_string(m[-1])
 

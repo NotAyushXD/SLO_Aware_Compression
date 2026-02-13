@@ -139,7 +139,7 @@ def parse_args() -> argparse.Namespace:
         "--router_mode",
         type=str,
         default="difficulty",
-        choices=["difficulty", "slo_aware", "fixed", "always_cheap", "always_base"],
+        choices=["difficulty", "slo_aware", "fixed", "always_cheap", "always_base", "learned_ttft", "learned_total"],
         help="Routing policy for multi-variant serving.",
     )
     p.add_argument(
@@ -149,6 +149,13 @@ def parse_args() -> argparse.Namespace:
         choices=["cheap", "med", "base"],
         help="If --router_mode fixed, always route to this variant.",
     )
+    p.add_argument(
+        "--learned_router_dir",
+        type=str,
+        default=None,
+        help="Path to learned-router artifacts. For learned_* modes, this is REQUIRED. You may pass either a root folder containing subfolders learned_ttft/learned_total, or a mode-specific folder.",
+    )
+
     p.add_argument(
         "--router_max_retries",
         type=int,
@@ -242,6 +249,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    # learned router artifacts are required for learned_* modes
+    if args.router_mode in {"learned_ttft", "learned_total"}:
+        if args.service != "multi":
+            raise ValueError("learned_* router modes require --service multi.")
+        if args.learned_router_dir is None:
+            raise ValueError("--learned_router_dir is required for learned router modes.")
+
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -353,6 +368,7 @@ def main() -> None:
                 model_name=args.model,
                 variants=tuple(args.multi_variants),
                 router_mode=args.router_mode,
+                learned_router_dir=args.learned_router_dir,
                 fixed_variant=args.router_fixed_variant,
                 allow_quality_downgrade_for_slo=bool(args.router_allow_quality_downgrade_for_slo),
                 device=effective_device,
