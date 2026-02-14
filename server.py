@@ -178,8 +178,8 @@ class _PendingRequest:
     temperature: float
     top_p: float
     enqueue_time: float
-    queue_depth_at_submit: int = 0
     event: threading.Event
+    queue_depth_at_submit: int = 0
     result_text: Optional[str] = None
     result_metrics: Optional[Dict] = None
     error: Optional[str] = None
