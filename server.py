@@ -178,8 +178,10 @@ class _PendingRequest:
     temperature: float
     top_p: float
     enqueue_time: float
+    # NOTE: In dataclasses, non-default fields must come before default fields.
+    # This event is created by the scheduler for each request.
+    event: threading.Event = field(default_factory=threading.Event)
     queue_depth_at_submit: int = 0
-    event: threading.Event
     result_text: Optional[str] = None
     result_metrics: Optional[Dict] = None
     error: Optional[str] = None
