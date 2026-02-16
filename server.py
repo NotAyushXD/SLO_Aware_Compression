@@ -178,8 +178,8 @@ class _PendingRequest:
     temperature: float
     top_p: float
     enqueue_time: float
-    event: threading.Event
     queue_depth_at_submit: int = 0
+    event: threading.Event
     result_text: Optional[str] = None
     result_metrics: Optional[Dict] = None
     error: Optional[str] = None
@@ -312,7 +312,7 @@ class _BatchingScheduler:
 
                 # queue_wait_ms is used by load_generator to compute total queueing.
                 m["queue_wait_ms"] = float(max(0.0, scheduler_wait_ms + float(lock_wait_ms)))
-                m["queue_depth_at_submit"] = int(getattr(req, "queue_depth_at_submit", 0))
+                m["queue_depth_at_submit"] = int(getattr(r, "queue_depth_at_submit", 0))
 
                 # ------------------------------------------------------------------
                 # Option A (paper definition): queue-inclusive TTFT
