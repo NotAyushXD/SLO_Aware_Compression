@@ -37,6 +37,7 @@ import logging
 import os
 import sys
 import time
+import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -103,6 +104,82 @@ def _effective_enable_batching(prompt_mode: str, enable_batching_flag: Optional[
     if enable_batching_flag is None:
         return prompt_mode == "slo"
     return bool(enable_batching_flag)
+
+
+
+def _build_stratified_pool(
+    examples: List[Dict[str, Any]],
+    k: int,
+    seed: int,
+) -> List[Dict[str, Any]]:
+    """Return a deterministic, stratified subset of size k.
+
+    Stratification key: (dataset, difficulty). This prevents calibration/load-test runs
+    from accidentally selecting only one bucket when processed val_data.jsonl is ordered.
+    """
+    if k <= 0 or (not examples):
+        return list(examples)
+
+    # If k >= pool size, nothing to sample.
+    if k >= len(examples):
+        return list(examples)
+
+    # Group by (dataset, difficulty)
+    buckets: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for ex in examples:
+        ds = (ex.get("dataset") or "unknown").lower().strip()
+        diff = (ex.get("difficulty") or "medium").lower().strip()
+        key = (ds, diff)
+        buckets.setdefault(key, []).append(ex)
+
+    # Deterministic shuffle inside each bucket
+    rng = random.Random(int(seed))
+    for key in buckets:
+        rng.shuffle(buckets[key])
+
+    # Prefer a stable bucket ordering: dataset asc, then difficulty in easy/medium/hard/other.
+    diff_order = {"easy": 0, "medium": 1, "hard": 2}
+    ordered_keys = sorted(buckets.keys(), key=lambda t: (t[0], diff_order.get(t[1], 99), t[1]))
+
+    # Equal allocation across buckets, then top-up from remaining.
+    num_buckets = max(1, len(ordered_keys))
+    base = k // num_buckets
+    rem = k % num_buckets
+
+    targets: Dict[Tuple[str, str], int] = {}
+    for i, key in enumerate(ordered_keys):
+        targets[key] = base + (1 if i < rem else 0)
+
+    selected: List[Dict[str, Any]] = []
+    for key in ordered_keys:
+        take = min(targets[key], len(buckets[key]))
+        if take > 0:
+            selected.extend(buckets[key][:take])
+            buckets[key] = buckets[key][take:]
+
+    # Top up if any buckets were short.
+    need = k - len(selected)
+    if need > 0:
+        remaining: List[Dict[str, Any]] = []
+        for key in ordered_keys:
+            remaining.extend(buckets[key])
+        rng.shuffle(remaining)
+        selected.extend(remaining[:need])
+
+    # Final deterministic shuffle so ordering doesn't bias selection.
+    rng.shuffle(selected)
+    return selected[:k]
+
+
+def _log_strata_counts(tag: str, examples: List[Dict[str, Any]]) -> None:
+    counts: Dict[str, int] = {}
+    for ex in examples:
+        ds = (ex.get("dataset") or "unknown").lower().strip()
+        diff = (ex.get("difficulty") or "medium").lower().strip()
+        key = f"{ds}:{diff}"
+        counts[key] = counts.get(key, 0) + 1
+    parts = ", ".join([f"{k}={v}" for k, v in sorted(counts.items())])
+    logger.info(f"{tag} strata counts: {parts}")
 
 
 def _log_env() -> None:
@@ -220,6 +297,13 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--data_subset", type=int, default=0, help="If >0, truncate val+test to N examples")
     p.add_argument("--seed", type=int, default=0)
+
+    p.add_argument(
+        "--stratify_difficulty",
+        action="store_true",
+        help="If set, load-test/calibration request sampling is stratified by (dataset, difficulty) so that each bucket is represented (avoids skew if val_data is ordered).",
+    )
+
 
     p.add_argument("--output_dir", type=str, default="outputs")
 
@@ -422,6 +506,12 @@ def main() -> None:
 
     primary_key = f"p{int(args.slo_primary_percentile)}"
 
+    # Optionally build a stratified load-test/calibration pool from val_data.
+    val_pool = val_data
+    if args.stratify_difficulty:
+        val_pool = _build_stratified_pool(val_data, k=int(args.num_requests), seed=int(args.seed))
+        _log_strata_counts("[STRATIFIED] val_pool", val_pool)
+
 
     # ------------------------------------------------------------------
     # Multi-variant: optional base-only SLO calibration
@@ -442,7 +532,7 @@ def main() -> None:
             inference_func=base_server.generate,
             max_concurrency=calib_conc,
             num_requests=args.num_requests,
-            data_loader=val_data,
+            data_loader=val_pool,
             prompt_mode=args.prompt_mode,
             seed=args.seed,
         )
@@ -468,6 +558,7 @@ def main() -> None:
         if not val_data:
             logger.warning("val_data is empty. Load tests will run against a tiny dummy pool.")
             val_data = [{"dataset": "gsm8k", "prompt": "1+1?", "answer": "2", "difficulty": "easy"}]
+            val_pool = val_data
 
         for conc in args.concurrencies:
             conc = int(conc)
@@ -477,7 +568,7 @@ def main() -> None:
                 inference_func=server.generate,
                 max_concurrency=conc,
                 num_requests=args.num_requests,
-                data_loader=val_data,
+                data_loader=val_pool,
                 prompt_mode=args.prompt_mode,
                 seed=args.seed,
             )
