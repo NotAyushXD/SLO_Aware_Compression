@@ -211,7 +211,7 @@ class LearnedRouter:
         assert best is not None
         return best
 
-    def save(self, out_dir: str) -> None:
+    def save(self, out_dir: str, extra_metadata: Optional[Dict[str, Any]] = None) -> None:
         os.makedirs(out_dir, exist_ok=True)
         with open(os.path.join(out_dir, "quality_models.pkl"), "wb") as f:
             pickle.dump(self.quality_models, f)
@@ -221,8 +221,11 @@ class LearnedRouter:
             pickle.dump(self.tpot_models, f)
         with open(os.path.join(out_dir, "weights.json"), "w") as f:
             json.dump({"lambda_slo": self.lambda_slo, "mu_quality": self.mu_quality}, f, indent=2)
+        meta: Dict[str, Any] = {"feature_dim": 18, "variants": ["cheap", "med", "base"]}
+        if extra_metadata:
+            meta["extra_metadata"] = extra_metadata
         with open(os.path.join(out_dir, "metadata.json"), "w") as f:
-            json.dump({"feature_dim": 18, "variants": ["cheap", "med", "base"]}, f, indent=2)
+            json.dump(meta, f, indent=2)
 
     @classmethod
     def load(cls, in_dir: str) -> "LearnedRouter":

@@ -1,10 +1,29 @@
 #!/usr/bin/env python
+"""Train learned router predictors (quality + latency) and tune routing weights.
+
+Protocol (paper-facing, per problem statement):
+  1) Collect training traces by running *all 3 variants* (cheap/med/base) per example.
+  2) Split examples across concurrencies (default: 1,2,4,8) so predictors learn queue regimes.
+     Each example appears under exactly one concurrency.
+  3) Train predictors on Train+Val.
+  4) Tune (lambda_slo, mu_quality) on Val only.
+  5) Save two router modes:
+       - router_models/learned_ttft/
+       - router_models/learned_total/
+
+Notes:
+  - We intentionally disable router escalation during trace collection (max_retries=0)
+    so each variant is measured independently.
+  - This script uses the HF-based MultiVariantService dispatcher for concurrency-safe
+    multi-variant execution and realistic queue-depth snapshots.
+"""
+
+from __future__ import annotations
+
 import argparse
 import json
 import os
 import random
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,59 +32,86 @@ from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-# Local imports (repo-root)
-from server import SingleVariantServer
-from prompt_templates import build_llama_formatted_prompt
 from evaluation import EvaluationMetrics
 from learned_router import LearnedRouter
+from prompt_templates import build_llama_formatted_prompt
+from server import MultiVariantService
 
 
-def load_jsonl(path: str) -> List[Dict[str, Any]]:
-    items: List[Dict[str, Any]] = []
+def _read_jsonl(path: str) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if not os.path.exists(path):
+        return rows
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            items.append(json.loads(line))
-    return items
+            rows.append(json.loads(line))
+    return rows
 
 
-def load_slo_dict(slo_path: Optional[str]) -> Dict[str, Dict[str, float]]:
-    # Default fallbacks (used only if you don't pass a calibrated SLO file)
+def _write_json(path: str, obj: Any) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+
+
+def _write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+
+
+def _load_slo_dict(slo_path: Optional[str], profile_key: Optional[str] = None) -> Dict[str, Dict[str, float]]:
+    """Load a difficulty->(ttft_ms,tpot_ms) dict.
+
+    Accepts either:
+      - the calibration JSON written by run_baseline_evaluation.py (with "profiles")
+      - a direct dict with keys easy/medium/hard
+    """
+
     default = {
         "easy": {"ttft_ms": 168.0, "tpot_ms": 10.0},
         "medium": {"ttft_ms": 251.0, "tpot_ms": 12.0},
         "hard": {"ttft_ms": 341.0, "tpot_ms": 15.0},
     }
+
     if not slo_path:
         return default
+
+    if not os.path.exists(slo_path):
+        raise FileNotFoundError(f"SLO thresholds file not found: {slo_path}")
 
     with open(slo_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # Accept either a direct slo_dict OR the full calibration JSON written by run_baseline_evaluation
-    if "profiles" in data:
-        primary = data.get("primary")
-        profiles = data.get("profiles") or {}
+    if isinstance(data, dict) and "profiles" in data and isinstance(data.get("profiles"), dict):
+        profiles: Dict[str, Any] = data.get("profiles") or {}
+        primary = profile_key or data.get("primary")
         if primary and primary in profiles:
             return profiles[primary]
-        # Otherwise return first profile
         if profiles:
             return next(iter(profiles.values()))
         return default
 
-    # Direct dict
-    if isinstance(data, dict) and all(isinstance(v, dict) for v in data.values()):
-        return data
+    if isinstance(data, dict) and any(k in data for k in ("easy", "medium", "hard")):
+        # Direct slo dict.
+        return data  # type: ignore[return-value]
 
     return default
 
 
-def split_across_concurrencies(examples: List[Dict[str, Any]], concurrencies: List[int], seed: int) -> Dict[int, List[Dict[str, Any]]]:
-    rng = random.Random(seed)
+def _split_across_concurrencies(
+    examples: List[Dict[str, Any]],
+    concurrencies: List[int],
+    seed: int,
+) -> Dict[int, List[Dict[str, Any]]]:
+    rng = random.Random(int(seed))
     exs = list(examples)
     rng.shuffle(exs)
+
     parts = np.array_split(np.array(exs, dtype=object), len(concurrencies))
     out: Dict[int, List[Dict[str, Any]]] = {}
     for c, p in zip(concurrencies, parts):
@@ -73,65 +119,81 @@ def split_across_concurrencies(examples: List[Dict[str, Any]], concurrencies: Li
     return out
 
 
-def run_variant_workload(
-    server: SingleVariantServer,
-    variant: str,
+def _extract_queue_depths(metrics: Dict[str, Any], variants: List[str]) -> Dict[str, int]:
+    qd = metrics.get("router_queue_depths")
+    if isinstance(qd, dict):
+        out = {k: int(v or 0) for k, v in qd.items()}
+    else:
+        out = {}
+    for v in variants:
+        out.setdefault(v, 0)
+    return out
+
+
+def _collect_traces_for_concurrency(
+    service: MultiVariantService,
     examples: List[Dict[str, Any]],
     concurrency: int,
+    variants: List[str],
     prompt_mode: str,
-) -> Dict[int, Dict[str, Any]]:
-    """Run a fixed-variant workload and return records keyed by example index."""
+    seed: int,
+) -> List[Dict[str, Any]]:
+    """Run all (example, variant) pairs under a fixed concurrency."""
 
-    # We'll key by index within this examples list.
-    lock = None
-    idx_counter = {"i": 0}
+    tasks: List[Tuple[int, str, Dict[str, Any]]] = []
+    for i, ex in enumerate(examples):
+        for v in variants:
+            tasks.append((i, v, ex))
 
-    def get_next() -> Optional[Tuple[int, Dict[str, Any]]]:
-        i = idx_counter["i"]
-        if i >= len(examples):
-            return None
-        idx_counter["i"] = i + 1
-        return i, examples[i]
+    rng = random.Random(int(seed) + int(concurrency) * 1009)
+    rng.shuffle(tasks)
 
-    results: Dict[int, Dict[str, Any]] = {}
+    records: List[Dict[str, Any]] = []
+
+    # We avoid concurrent list writes by collecting per-thread and merging.
+    import queue
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    task_q: "queue.Queue[Tuple[int, str, Dict[str, Any]]]" = queue.Queue()
+    for t in tasks:
+        task_q.put(t)
+
+    rec_lock = threading.Lock()
 
     def worker() -> None:
+        local: List[Dict[str, Any]] = []
         while True:
-            nxt = get_next()
-            if nxt is None:
-                return
-            i, ex = nxt
-            dataset_type = ex.get("dataset")
-            difficulty = ex.get("difficulty") or "easy"
-            raw_prompt = ex.get("prompt")
-            ref_answer = ex.get("answer")
+            try:
+                ex_idx, variant, ex = task_q.get_nowait()
+            except queue.Empty:
+                break
+            dataset_type = (ex.get("dataset") or "gsm8k").lower().strip()
+            difficulty = (ex.get("difficulty") or "medium").lower().strip()
 
-            formatted_prompt, max_new_tokens = build_llama_formatted_prompt(
-                raw_prompt=raw_prompt,
-                dataset_type=dataset_type,
-                prompt_mode=prompt_mode,
-                max_new_tokens_override=None,
+            formatted_prompt, max_new_tokens, _stops = build_llama_formatted_prompt(
+                ex, dataset_type=dataset_type, prompt_mode=prompt_mode
             )
 
-            require_all_final_answers = dataset_type == "gsm8k"
-            out_text, metrics = server.generate(
+            pred_text, metrics = service.generate(
                 prompt=formatted_prompt,
-                max_tokens=max_new_tokens,
+                max_tokens=int(max_new_tokens),
                 temperature=0.0,
                 top_p=1.0,
                 dataset_type=dataset_type,
                 difficulty=difficulty,
                 prompt_mode=prompt_mode,
-                require_all_final_answers=require_all_final_answers,
+                force_variant=variant,
             )
 
-            correct = EvaluationMetrics.is_correct(out_text, ref_answer, dataset_type)
-            fmt_ok = EvaluationMetrics.format_ok(out_text, dataset_type)
+            truth = ex.get("answer", "")
+            ok, extracted, fmt_ok = EvaluationMetrics.is_correct(pred_text, str(truth), dataset_type)
+            ok_p, extracted_p, fmt_ok_p = EvaluationMetrics.is_correct_parseable(pred_text, str(truth), dataset_type)
+
+            qdepths = _extract_queue_depths(metrics, variants)
 
             rec = {
-                "idx": i,
-                # Persistent IDs for grouping + Option-1 tuning (VAL only)
-                "global_example_idx": int(ex.get("_global_index", i)),
+                "global_example_idx": int(ex.get("_global_index", ex_idx)),
                 "split": str(ex.get("_split", "")),
                 "dataset": dataset_type,
                 "difficulty": difficulty,
@@ -139,42 +201,72 @@ def run_variant_workload(
                 "max_tokens": int(max_new_tokens),
                 "estimated_tokens": int(len(formatted_prompt.split())),
                 "variant": variant,
+                "variant_effective": metrics.get("variant_effective", metrics.get("variant")),
                 "concurrency": int(concurrency),
-                "queue_depth_at_submit": int(metrics.get("queue_depth_at_submit", 0) or 0),
-                "correct": int(bool(correct)),
+                "queue_depths": qdepths,
+                # outputs
+                "success": int(bool(metrics.get("success", False))),
+                "ground_truth": str(truth),
+                "prediction": pred_text,
+                # strict
+                "correct": int(bool(ok)),
                 "format_ok": int(bool(fmt_ok)),
+                "extracted": extracted,
+                # parseable
+                "correct_parseable": int(bool(ok_p)),
+                "format_ok_parseable": int(bool(fmt_ok_p)),
+                "extracted_parseable": extracted_p,
+                # timing
                 "ttft_ms": float(metrics.get("ttft_ms", 0.0) or 0.0),
                 "tpot_ms": float(metrics.get("tpot_ms", 0.0) or 0.0),
                 "total_latency_ms": float(metrics.get("total_latency_ms", 0.0) or 0.0),
+                "queue_wait_ms": float(metrics.get("queue_wait_ms", 0.0) or 0.0),
             }
-            results[i] = rec
+            local.append(rec)
 
-    # Run threads
-    with ThreadPoolExecutor(max_workers=int(concurrency)) as ex:
-        futs = [ex.submit(worker) for _ in range(int(concurrency))]
+            try:
+                task_q.task_done()
+            except Exception:
+                pass
+
+        with rec_lock:
+            records.extend(local)
+
+    with ThreadPoolExecutor(max_workers=int(max(1, concurrency))) as ex:
+        futs = [ex.submit(worker) for _ in range(int(max(1, concurrency)))]
         for f in as_completed(futs):
             _ = f.result()
 
-    return results
+    return records
 
 
-def train_models(
+def _train_predictors(
     records: List[Dict[str, Any]],
     variants: List[str],
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
-    # Build per-variant datasets
+    """Train per-variant quality, TTFT, and TPOT predictors."""
+
     X_by_v: Dict[str, List[List[float]]] = {v: [] for v in variants}
     yq_by_v: Dict[str, List[int]] = {v: [] for v in variants}
     yttft_by_v: Dict[str, List[float]] = {v: [] for v in variants}
     ytpot_by_v: Dict[str, List[float]] = {v: [] for v in variants}
 
     for r in records:
+        if not r.get("success", 1):
+            continue
         v = r["variant"]
-        feats = r["features"]
+        qds = r.get("queue_depths") or {}
+        feats = LearnedRouter.extract_features(
+            dataset_type=r["dataset"],
+            difficulty=r["difficulty"],
+            max_tokens=int(r["max_tokens"]),
+            estimated_tokens=int(r["estimated_tokens"]),
+            queue_depths=qds,
+        )[0].tolist()
         X_by_v[v].append(feats)
-        yq_by_v[v].append(int(r["correct"]))
-        yttft_by_v[v].append(float(r["ttft_ms"]))
-        ytpot_by_v[v].append(float(r["tpot_ms"]))
+        yq_by_v[v].append(int(r.get("correct", 0)))
+        yttft_by_v[v].append(float(r.get("ttft_ms", 0.0) or 0.0))
+        ytpot_by_v[v].append(float(r.get("tpot_ms", 0.0) or 0.0))
 
     quality_models: Dict[str, Any] = {}
     ttft_models: Dict[str, Any] = {}
@@ -186,6 +278,9 @@ def train_models(
         yttft = np.array(yttft_by_v[v], dtype=float)
         ytpot = np.array(ytpot_by_v[v], dtype=float)
 
+        if len(X) == 0:
+            raise RuntimeError(f"No training rows collected for variant '{v}'.")
+
         q_model = Pipeline(
             steps=[
                 ("scaler", StandardScaler()),
@@ -194,7 +289,7 @@ def train_models(
                     LogisticRegression(
                         penalty="l2",
                         C=1.0,
-                        max_iter=1000,
+                        max_iter=2000,
                         class_weight="balanced",
                         random_state=42,
                     ),
@@ -215,23 +310,41 @@ def train_models(
     return quality_models, ttft_models, tpot_models
 
 
-def tune_weights(
+def _group_by_example(records: List[Dict[str, Any]], variants: List[str]) -> Dict[int, Dict[str, Dict[str, Any]]]:
+    grouped: Dict[int, Dict[str, Dict[str, Any]]] = {}
+    for r in records:
+        gid = int(r.get("global_example_idx", -1))
+        if gid < 0:
+            continue
+        grouped.setdefault(gid, {})[r["variant"]] = r
+
+    # Keep only complete triplets.
+    keep: Dict[int, Dict[str, Dict[str, Any]]] = {}
+    for gid, d in grouped.items():
+        if all(v in d for v in variants):
+            keep[gid] = d
+    return keep
+
+
+def _tune_lambda_mu(
     mode: str,
     router: LearnedRouter,
     val_grouped: Dict[int, Dict[str, Dict[str, Any]]],
     slo_dict: Dict[str, Dict[str, float]],
     variants: List[str],
 ) -> Tuple[float, float, Dict[str, Any]]:
+    """Grid-search lambda/mu on VAL only."""
+
     lambdas = [0.1, 0.3, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0]
     mus = [0.1, 0.3, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0]
 
-    best = None
+    best_loss: Optional[float] = None
     best_stats: Dict[str, Any] = {}
 
     for lam in lambdas:
         for mu in mus:
-            router.lambda_slo = lam
-            router.mu_quality = mu
+            router.lambda_slo = float(lam)
+            router.mu_quality = float(mu)
 
             total_loss = 0.0
             n = 0
@@ -239,19 +352,18 @@ def tune_weights(
             slo_ok = 0
             cost_sum = 0.0
 
-            for idx, by_v in val_grouped.items():
-                # Build queue depths dict and a representative example metadata from any variant
-                any_rec = next(iter(by_v.values()))
-                qds = {vv: int(by_v[vv]["queue_depth_at_submit"]) for vv in variants if vv in by_v}
-                # Fill missing with 0
+            for _gid, by_v in val_grouped.items():
+                # Use BASE record as the representative system snapshot for queue depths.
+                state = by_v.get("base") or next(iter(by_v.values()))
+                qds = dict(state.get("queue_depths") or {})
                 for vv in variants:
                     qds.setdefault(vv, 0)
 
                 dec = router.route(
-                    dataset_type=any_rec["dataset"],
-                    difficulty=any_rec["difficulty"],
-                    max_tokens=int(any_rec["max_tokens"]),
-                    estimated_tokens=int(any_rec["estimated_tokens"]),
+                    dataset_type=state["dataset"],
+                    difficulty=state["difficulty"],
+                    max_tokens=int(state["max_tokens"]),
+                    estimated_tokens=int(state["estimated_tokens"]),
                     queue_depths=qds,
                     slo_dict=slo_dict,
                     mode=mode,
@@ -259,31 +371,29 @@ def tune_weights(
                 )
 
                 chosen = dec.variant
-                true = by_v.get(chosen)
-                if true is None:
-                    # fallback if missing
-                    true = by_v.get("base") or any_rec
+                true = by_v.get(chosen) or state
 
-                # True SLO check
-                slo = slo_dict.get(any_rec["difficulty"], {})
+                slo = slo_dict.get(state["difficulty"], {})
                 ttft_slo = float(slo.get("ttft_ms", 1e9))
                 tpot_slo = float(slo.get("tpot_ms", 1e9))
 
                 if mode == "ttft":
-                    violation = float(true["ttft_ms"]) > ttft_slo
+                    violation = float(true.get("ttft_ms", 0.0) or 0.0) > ttft_slo
                 else:
-                    total_slo = ttft_slo + tpot_slo * float(any_rec["max_tokens"])
-                    total_true = float(true["ttft_ms"]) + float(true["tpot_ms"]) * float(any_rec["max_tokens"])
+                    total_slo = ttft_slo + tpot_slo * float(state["max_tokens"])
+                    total_true = float(true.get("ttft_ms", 0.0) or 0.0) + float(true.get("tpot_ms", 0.0) or 0.0) * float(
+                        state["max_tokens"]
+                    )
                     violation = total_true > total_slo
 
-                is_correct = bool(true["correct"])
+                is_correct = bool(true.get("correct", 0))
                 cost = float(router.VARIANT_COSTS.get(chosen, 1.0))
 
-                # Loss: prioritize SLO, then correctness, then cost
+                # Loss: prioritize meeting SLO, then correctness, then cost.
                 loss = (1.0 if violation else 0.0) + 0.5 * (0.0 if is_correct else 1.0) + 0.1 * cost
+
                 total_loss += loss
                 n += 1
-
                 correct += int(is_correct)
                 slo_ok += int(not violation)
                 cost_sum += cost
@@ -292,44 +402,83 @@ def tune_weights(
                 continue
 
             avg_loss = total_loss / n
-            if best is None or avg_loss < best:
-                best = avg_loss
+            if best_loss is None or avg_loss < best_loss:
+                best_loss = avg_loss
                 best_stats = {
-                    "avg_loss": avg_loss,
-                    "accuracy": correct / n,
-                    "slo_compliance": slo_ok / n,
-                    "avg_cost": cost_sum / n,
-                    "lambda": lam,
-                    "mu": mu,
+                    "avg_loss": float(avg_loss),
+                    "accuracy": float(correct / n),
+                    "slo_compliance": float(slo_ok / n),
+                    "avg_cost": float(cost_sum / n),
+                    "lambda": float(lam),
+                    "mu": float(mu),
                 }
 
+    if best_loss is None:
+        raise RuntimeError("No validation examples available for tuning.")
     return float(best_stats["lambda"]), float(best_stats["mu"]), best_stats
 
 
-def main() -> None:
+def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", dest="model_name", required=True)
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--dtype", default="float16")
+    ap.add_argument("--dtype", default="auto")
     ap.add_argument("--processed_dir", default="data/processed")
-    ap.add_argument("--prompt_mode", default="slo")
+    ap.add_argument("--prompt_mode", default="slo", choices=["slo", "accuracy"])
     ap.add_argument("--output_root", default="router_models")
-    ap.add_argument("--slo_dict_path", default=None)
+    ap.add_argument("--slo_thresholds_path", default=None)
+    ap.add_argument(
+        "--slo_profile",
+        default=None,
+        help="Optional key for SLO profile (e.g., p95). If omitted, uses file's 'primary'.",
+    )
     ap.add_argument("--concurrencies", nargs="+", type=int, default=[1, 2, 4, 8])
     ap.add_argument("--seed", type=int, default=42)
+
     ap.add_argument("--max_batch_size", type=int, default=8)
     ap.add_argument("--batch_wait_ms", type=int, default=8)
-    ap.add_argument("--max_examples", type=int, default=0, help="Debug: limit Train+Val examples (0 = full)")
-    args = ap.parse_args()
+    ap.add_argument("--load_strategy", type=str, default="auto")
+    ap.add_argument("--max_loaded_variants", type=int, default=None)
+    ap.add_argument("--preload_variants", nargs="*", default=None)
+    ap.add_argument("--warmup", action="store_true")
+
+    ap.add_argument(
+        "--max_examples",
+        type=int,
+        default=0,
+        help="Debug: limit Train+Val examples (0 = full).",
+    )
+    ap.add_argument(
+        "--reuse_traces",
+        action="store_true",
+        help="If set and cached trace JSONL exists under output_root/, reuse it.",
+    )
+    ap.add_argument(
+        "--eval_on_test",
+        action="store_true",
+        help="If set, run a quick held-out accuracy eval on TEST for each learned mode (no load/concurrency sweep).",
+    )
+    return ap.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
 
     processed = Path(args.processed_dir)
     train_path = processed / "train_data.jsonl"
     val_path = processed / "val_data.jsonl"
+    test_path = processed / "test_data.jsonl"
 
-    train = load_jsonl(str(train_path))
-    val = load_jsonl(str(val_path))
+    if not train_path.exists() or not val_path.exists():
+        raise FileNotFoundError(
+            f"Missing processed data. Expected at least: {train_path} and {val_path}. "
+            "Run preprocessing first (see run_baseline_evaluation.py --preprocess)."
+        )
 
-    # Tag examples so we can tune λ/μ on VAL only (paper Option-1)
+    train = _read_jsonl(str(train_path))
+    val = _read_jsonl(str(val_path))
+
+    # Tag examples so we can tune weights on VAL only.
     for i, ex in enumerate(train):
         ex["_global_index"] = int(i)
         ex["_split"] = "train"
@@ -338,117 +487,167 @@ def main() -> None:
         ex["_split"] = "val"
 
     trainval = train + val
-    if args.max_examples and args.max_examples > 0:
+    if args.max_examples and int(args.max_examples) > 0:
         trainval = trainval[: int(args.max_examples)]
 
-    slo_dict = load_slo_dict(args.slo_dict_path)
-
     concs = [int(c) for c in args.concurrencies]
-    split_map = split_across_concurrencies(trainval, concs, seed=int(args.seed))
-
-    # Start servers (one per variant) and reuse
-    variants = ["cheap", "med", "base"]
-    servers: Dict[str, SingleVariantServer] = {}
-    for v in variants:
-        servers[v] = SingleVariantServer(
-            model_name=args.model_name,
-            variant=v,
-            device=args.device,
-            dtype=args.dtype,
-            enable_batching=True,
-            max_batch_size=int(args.max_batch_size),
-            batch_wait_ms=int(args.batch_wait_ms),
-        )
-
-    all_records: List[Dict[str, Any]] = []
-
-    try:
-        for conc, exs in split_map.items():
-            if not exs:
-                continue
-            print(f"\n[collect] concurrency={conc} examples={len(exs)}")
-
-            per_variant: Dict[str, Dict[int, Dict[str, Any]]] = {}
-            for v in variants:
-                print(f"  - running variant={v}")
-                per_variant[v] = run_variant_workload(
-                    server=servers[v],
-                    variant=v,
-                    examples=exs,
-                    concurrency=conc,
-                    prompt_mode=args.prompt_mode,
-                )
-
-            # Merge queue depths (one qd per variant) into features for all records
-            for idx in range(len(exs)):
-                qds = {v: int(per_variant[v][idx]["queue_depth_at_submit"]) for v in variants}
-                for v in variants:
-                    rec = per_variant[v][idx]
-                    feats = LearnedRouter.extract_features(
-                        dataset_type=rec["dataset"],
-                        difficulty=rec["difficulty"],
-                        max_tokens=rec["max_tokens"],
-                        estimated_tokens=rec["estimated_tokens"],
-                        queue_depths=qds,
-                    )[0].tolist()
-                    rec["features"] = feats
-                    all_records.append(rec)
-
-    finally:
-        for s in servers.values():
-            try:
-                s.cleanup()
-            except Exception:
-                pass
-
-    print(f"\n[train] total training rows={len(all_records)} (examples x variants)")
-
-    quality_models, ttft_models, tpot_models = train_models(all_records, variants)
-
-    # Paper Option-1: tune λ/μ on the TRUE VAL split.
-    grouped: Dict[int, Dict[str, Dict[str, Any]]] = {}
-    for r in all_records:
-        gid = int(r.get("global_example_idx", -1))
-        if gid < 0:
-            continue
-        grouped.setdefault(gid, {})[r["variant"]] = r
-
-    val_grouped: Dict[int, Dict[str, Dict[str, Any]]] = {}
-    for gid, d in grouped.items():
-        if any(v not in d for v in variants):
-            continue
-        split = str(next(iter(d.values())).get("split", ""))
-        if split == "val":
-            val_grouped[gid] = d
-
-    print(f"[tune] validation examples={len(val_grouped)} (each with {len(variants)} variants)")
-
-    router = LearnedRouter(quality_models, ttft_models, tpot_models, lambda_slo=1.5, mu_quality=1.5)
-
-    lam_ttft, mu_ttft, stats_ttft = tune_weights("ttft", router, val_grouped, slo_dict, variants)
-    lam_total, mu_total, stats_total = tune_weights("total", router, val_grouped, slo_dict, variants)
+    if not concs:
+        raise ValueError("--concurrencies must be non-empty")
 
     out_root = Path(args.output_root)
     out_root.mkdir(parents=True, exist_ok=True)
+    trace_path = out_root / "trainval_traces.jsonl"
 
-    # Save TTFT router
+    slo_dict = _load_slo_dict(args.slo_thresholds_path, profile_key=args.slo_profile)
+
+    variants = ["cheap", "med", "base"]
+
+    # -----------------------------
+    # 1) Collect traces (train+val)
+    # -----------------------------
+    records: List[Dict[str, Any]] = []
+    if args.reuse_traces and trace_path.exists():
+        records = _read_jsonl(str(trace_path))
+        print(f"[reuse] Loaded cached traces: {trace_path} (rows={len(records)})")
+    else:
+        split_map = _split_across_concurrencies(trainval, concs, seed=int(args.seed))
+
+        service = MultiVariantService(
+            model_name=args.model_name,
+            variants=variants,
+            device=args.device,
+            dtype=args.dtype,
+            router_mode="always_base",  # ignored during collection (we force variants)
+            max_retries=0,  # IMPORTANT: no escalation when collecting per-variant ground truth
+            enable_batching=True,
+            max_batch_size=int(args.max_batch_size),
+            batch_wait_ms=int(args.batch_wait_ms),
+            load_strategy=str(args.load_strategy),
+            max_loaded_variants=args.max_loaded_variants,
+            preload_variants=args.preload_variants,
+            warmup=bool(args.warmup),
+        )
+
+        try:
+            for conc, exs in split_map.items():
+                if not exs:
+                    continue
+                print(f"\n[collect] concurrency={conc} examples={len(exs)}")
+                recs = _collect_traces_for_concurrency(
+                    service=service,
+                    examples=exs,
+                    concurrency=int(conc),
+                    variants=variants,
+                    prompt_mode=str(args.prompt_mode),
+                    seed=int(args.seed),
+                )
+                records.extend(recs)
+        finally:
+            try:
+                service.cleanup()
+            except Exception:
+                pass
+
+        _write_jsonl(str(trace_path), records)
+        print(f"\n[saved] traces -> {trace_path} (rows={len(records)})")
+
+    # Sanity: expect ~3 rows per example (one per variant).
+    grouped_all = _group_by_example(records, variants)
+    print(f"[sanity] complete triplets={len(grouped_all)} examples")
+    if len(grouped_all) == 0:
+        raise RuntimeError("No complete (cheap,med,base) triplets found in collected traces.")
+
+    # -----------------------------
+    # 2) Train predictors on Train+Val
+    # -----------------------------
+    quality_models, ttft_models, tpot_models = _train_predictors(records, variants)
+    router = LearnedRouter(quality_models, ttft_models, tpot_models, lambda_slo=1.5, mu_quality=1.5)
+
+    # -----------------------------
+    # 3) Tune weights on VAL only
+    # -----------------------------
+    val_records = [r for r in records if str(r.get("split")) == "val"]
+    val_grouped = _group_by_example(val_records, variants)
+    print(f"[tune] validation examples={len(val_grouped)}")
+    if len(val_grouped) == 0:
+        raise RuntimeError("No validation examples found; cannot tune lambda/mu.")
+
+    lam_ttft, mu_ttft, stats_ttft = _tune_lambda_mu("ttft", router, val_grouped, slo_dict, variants)
+    lam_total, mu_total, stats_total = _tune_lambda_mu("total", router, val_grouped, slo_dict, variants)
+
+    # -----------------------------
+    # 4) Save artifacts
+    # -----------------------------
+    meta_common = {
+        "model": args.model_name,
+        "device": args.device,
+        "dtype": args.dtype,
+        "prompt_mode": args.prompt_mode,
+        "concurrencies": concs,
+        "seed": int(args.seed),
+        "slo_thresholds_path": args.slo_thresholds_path,
+        "slo_profile": args.slo_profile,
+    }
+
     out_ttft = out_root / "learned_ttft"
-    router.lambda_slo = lam_ttft
-    router.mu_quality = mu_ttft
-    router.save(str(out_ttft), extra_metadata={"tuned": stats_ttft, "mode": "ttft"})
-
-    # Save TOTAL router
     out_total = out_root / "learned_total"
-    router.lambda_slo = lam_total
-    router.mu_quality = mu_total
-    router.save(str(out_total), extra_metadata={"tuned": stats_total, "mode": "total"})
+    out_ttft.mkdir(parents=True, exist_ok=True)
+    out_total.mkdir(parents=True, exist_ok=True)
 
-    print("\n[saved]")
-    print(f"  {out_ttft}")
-    print(f"  {out_total}")
-    print("\n[tuning summary]")
-    print(f"  learned_ttft:  lambda={lam_ttft} mu={mu_ttft} stats={stats_ttft}")
-    print(f"  learned_total: lambda={lam_total} mu={mu_total} stats={stats_total}")
+    router.lambda_slo = float(lam_ttft)
+    router.mu_quality = float(mu_ttft)
+    router.save(str(out_ttft), extra_metadata={"mode": "ttft", "tuned": stats_ttft, **meta_common})
+    _write_json(str(out_ttft / "tuning.json"), {"mode": "ttft", "tuned": stats_ttft, **meta_common})
+
+    router.lambda_slo = float(lam_total)
+    router.mu_quality = float(mu_total)
+    router.save(str(out_total), extra_metadata={"mode": "total", "tuned": stats_total, **meta_common})
+    _write_json(str(out_total / "tuning.json"), {"mode": "total", "tuned": stats_total, **meta_common})
+
+    _write_json(str(out_root / "train_summary.json"), {"num_trace_rows": len(records), "num_examples": len(grouped_all)})
+
+    print("\n[saved routers]")
+    print(f"  Learned-TTFT            -> {out_ttft} (lambda={lam_ttft}, mu={mu_ttft})")
+    print(f"  Learned-Total (Derived) -> {out_total} (lambda={lam_total}, mu={mu_total})")
+
+    # -----------------------------
+    # 5) Optional: quick held-out accuracy eval on TEST
+    # -----------------------------
+    if args.eval_on_test:
+        if not test_path.exists():
+            raise FileNotFoundError(f"Missing test split: {test_path}")
+        test = _read_jsonl(str(test_path))
+        from evaluation import HeldOutEvaluator
+
+        for mode in ["learned_ttft", "learned_total"]:
+            service = MultiVariantService(
+                model_name=args.model_name,
+                variants=variants,
+                device=args.device,
+                dtype=args.dtype,
+                router_mode=mode,
+                learned_router_dir=str(out_root),
+                max_retries=1,
+                enable_batching=True,
+                max_batch_size=int(args.max_batch_size),
+                batch_wait_ms=int(args.batch_wait_ms),
+                load_strategy=str(args.load_strategy),
+                max_loaded_variants=args.max_loaded_variants,
+                preload_variants=args.preload_variants,
+                warmup=bool(args.warmup),
+            )
+            try:
+                service.set_slo_dict(slo_dict)
+                ev = HeldOutEvaluator(service, test, batch_size=1)
+                summary, _detailed = ev.evaluate(prompt_mode=str(args.prompt_mode), verbose=False)
+                out = out_root / f"test_eval_{mode}.json"
+                _write_json(str(out), summary)
+                print(f"[test-eval] {mode} -> {out}")
+            finally:
+                try:
+                    service.cleanup()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":

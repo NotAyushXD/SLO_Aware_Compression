@@ -1562,7 +1562,9 @@ class MultiVariantService:
             return not bool(ans)
         if dataset_type == "mmlu":
             ans = extract_mmlu_answer(text)
-            return ans is None
+            # Format-only escalation: MMLU must be one of {A,B,C,D}.
+            # Our extractor returns "" on failure, never None.
+            return not bool(ans)
         return False
 
     # -------------------------
@@ -1594,8 +1596,21 @@ class MultiVariantService:
             else:
                 max_tokens = 256
 
+        # Optional per-request override used by learned-router training data collection.
+        # If set, we bypass routing and send this request directly to the specified variant.
+        force_variant = kwargs.pop("force_variant", None) or kwargs.pop("router_fixed_variant", None)
+        force_variant = _normalize_variant(force_variant) if force_variant else None
+
         est_tokens = len(prompt.split())
-        path, reason, router_meta, qdepths = self.plan_path(dataset_type, difficulty, prompt_mode, int(max_tokens), estimated_tokens=est_tokens)
+        if force_variant:
+            with self._lock:
+                qdepths = {v: len(self._queues.get(v, deque())) for v in self.variants}
+            chosen = force_variant if force_variant in self.variants else "base"
+            path, reason, router_meta = [chosen], f"forced:{chosen}", {"forced_variant": chosen}
+        else:
+            path, reason, router_meta, qdepths = self.plan_path(
+                dataset_type, difficulty, prompt_mode, int(max_tokens), estimated_tokens=est_tokens
+            )
 
         req = _MVRequest(
             prompt=prompt,
