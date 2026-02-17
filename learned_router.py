@@ -211,18 +211,7 @@ class LearnedRouter:
         assert best is not None
         return best
 
-    def save(self, out_dir: str, extra_metadata: Optional[Dict[str, Any]] = None) -> None:
-        """Save router artifacts to a directory.
-
-        Parameters
-        ----------
-        out_dir:
-            Output directory to create/write.
-        extra_metadata:
-            Optional dictionary merged into metadata.json. Useful for storing tuning stats,
-            router mode labels, and training protocol details.
-        """
-
+    def save(self, out_dir: str) -> None:
         os.makedirs(out_dir, exist_ok=True)
         with open(os.path.join(out_dir, "quality_models.pkl"), "wb") as f:
             pickle.dump(self.quality_models, f)
@@ -232,12 +221,8 @@ class LearnedRouter:
             pickle.dump(self.tpot_models, f)
         with open(os.path.join(out_dir, "weights.json"), "w") as f:
             json.dump({"lambda_slo": self.lambda_slo, "mu_quality": self.mu_quality}, f, indent=2)
-
-        metadata: Dict[str, Any] = {"feature_dim": 18, "variants": ["cheap", "med", "base"]}
-        if isinstance(extra_metadata, dict):
-            metadata.update(extra_metadata)
         with open(os.path.join(out_dir, "metadata.json"), "w") as f:
-            json.dump(metadata, f, indent=2)
+            json.dump({"feature_dim": 18, "variants": ["cheap", "med", "base"]}, f, indent=2)
 
     @classmethod
     def load(cls, in_dir: str) -> "LearnedRouter":
