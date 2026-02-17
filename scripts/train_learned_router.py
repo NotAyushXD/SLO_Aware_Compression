@@ -20,6 +20,13 @@ Notes:
 
 from __future__ import annotations
 
+# Allow running as a script from the scripts/ directory (Kaggle notebooks often do this).
+import sys
+from pathlib import Path as _Path
+_ROOT = _Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 import argparse
 import json
 import os
@@ -454,6 +461,11 @@ def parse_args() -> argparse.Namespace:
         help="If set and cached trace JSONL exists under output_root/, reuse it.",
     )
     ap.add_argument(
+        "--collect_only",
+        action="store_true",
+        help="If set, only collect (or reuse) traces and exit before training predictors.",
+    )
+    ap.add_argument(
         "--eval_on_test",
         action="store_true",
         help="If set, run a quick held-out accuracy eval on TEST for each learned mode (no load/concurrency sweep).",
@@ -556,6 +568,11 @@ def main() -> None:
     print(f"[sanity] complete triplets={len(grouped_all)} examples")
     if len(grouped_all) == 0:
         raise RuntimeError("No complete (cheap,med,base) triplets found in collected traces.")
+
+    # Useful for long/expensive trace collection runs: allow exiting right after saving traces.
+    if args.collect_only:
+        print(f"[collect-only] Done. Traces at: {trace_path}")
+        return
 
     # -----------------------------
     # 2) Train predictors on Train+Val
