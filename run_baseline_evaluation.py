@@ -236,7 +236,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--router_max_retries",
         type=int,
-        default=1,
+        default=2,
         help="Max escalation retries on format/error (0 disables retries).",
     )
     p.add_argument(

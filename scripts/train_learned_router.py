@@ -1,10 +1,30 @@
 #!/usr/bin/env python
+"""Train learned router predictors + tune lambda/mu on Val only.
+
+Paper protocol (as required):
+  - Train predictors on Train + Val
+  - Tune (lambda, mu) on Val only
+  - Evaluate on Test (done via run_baseline_evaluation.py)
+
+Data collection protocol:
+  - Run all 3 variants per example
+  - Split examples across concurrencies (1,2,4,8) so the predictors learn queue regimes
+    (each example appears under exactly one concurrency).
+
+Outputs:
+  router_models/learned_ttft/
+  router_models/learned_total/
+"""
+
+from __future__ import annotations
+
 import argparse
+import hashlib
 import json
 import os
 import random
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,11 +33,15 @@ from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-# Local imports (repo-root)
-from server import SingleVariantServer
-from prompt_templates import build_llama_formatted_prompt
-from evaluation import EvaluationMetrics
-from learned_router import LearnedRouter
+# Ensure repo-root imports work when running `python scripts/train_learned_router.py`
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from evaluation import EvaluationMetrics  # noqa: E402
+from learned_router import LearnedRouter  # noqa: E402
+from prompt_templates import build_llama_formatted_prompt  # noqa: E402
+from server import SingleVariantServer  # noqa: E402
 
 
 def load_jsonl(path: str) -> List[Dict[str, Any]]:
@@ -45,25 +69,88 @@ def load_slo_dict(slo_path: Optional[str]) -> Dict[str, Dict[str, float]]:
         data = json.load(f)
 
     # Accept either a direct slo_dict OR the full calibration JSON written by run_baseline_evaluation
-    if "profiles" in data:
+    if isinstance(data, dict) and "profiles" in data:
         primary = data.get("primary")
         profiles = data.get("profiles") or {}
         if primary and primary in profiles:
             return profiles[primary]
-        # Otherwise return first profile
         if profiles:
             return next(iter(profiles.values()))
         return default
 
-    # Direct dict
     if isinstance(data, dict) and all(isinstance(v, dict) for v in data.values()):
         return data
 
     return default
 
 
-def split_across_concurrencies(examples: List[Dict[str, Any]], concurrencies: List[int], seed: int) -> Dict[int, List[Dict[str, Any]]]:
-    rng = random.Random(seed)
+def stable_example_id(ex: Dict[str, Any]) -> str:
+    """Stable ID so we can enforce Val-only tuning with no leakage."""
+    key = {
+        "dataset": ex.get("dataset"),
+        "source_split": ex.get("source_split"),
+        "prompt": ex.get("prompt"),
+        "answer": ex.get("answer"),
+    }
+    s = json.dumps(key, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
+
+
+def annotate_examples(examples: List[Dict[str, Any]], split_name: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for ex in examples:
+        ex = dict(ex)
+        ex["_split"] = split_name  # internal split: train/val
+        ex["_ex_id"] = stable_example_id(ex)
+        out.append(ex)
+    return out
+
+
+def limit_train_val(
+    train: List[Dict[str, Any]],
+    val: List[Dict[str, Any]],
+    max_examples: int,
+    seed: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Downsample Train+Val without accidentally dropping Val entirely."""
+    max_examples = int(max_examples or 0)
+    if max_examples <= 0:
+        return train, val
+
+    rng = random.Random(int(seed))
+    train_shuf = list(train)
+    val_shuf = list(val)
+    rng.shuffle(train_shuf)
+    rng.shuffle(val_shuf)
+
+    total_avail = len(train_shuf) + len(val_shuf)
+    if total_avail == 0:
+        return [], []
+
+    desired_val = int(round((len(val_shuf) / total_avail) * max_examples)) if len(val_shuf) > 0 else 0
+    if len(val_shuf) > 0 and max_examples >= 2:
+        desired_val = max(1, desired_val)
+    desired_val = min(len(val_shuf), desired_val)
+
+    desired_train = max_examples - desired_val
+    desired_train = min(len(train_shuf), desired_train)
+
+    remaining = max_examples - (desired_train + desired_val)
+    if remaining > 0:
+        add_train = min(remaining, len(train_shuf) - desired_train)
+        desired_train += add_train
+        remaining -= add_train
+    if remaining > 0:
+        add_val = min(remaining, len(val_shuf) - desired_val)
+        desired_val += add_val
+
+    return train_shuf[:desired_train], val_shuf[:desired_val]
+
+
+def split_across_concurrencies(
+    examples: List[Dict[str, Any]], concurrencies: List[int], seed: int
+) -> Dict[int, List[Dict[str, Any]]]:
+    rng = random.Random(int(seed))
     exs = list(examples)
     rng.shuffle(exs)
     parts = np.array_split(np.array(exs, dtype=object), len(concurrencies))
@@ -80,10 +167,8 @@ def run_variant_workload(
     concurrency: int,
     prompt_mode: str,
 ) -> Dict[int, Dict[str, Any]]:
-    """Run a fixed-variant workload and return records keyed by example index."""
+    """Run a fixed-variant workload and return records keyed by local example index."""
 
-    # We'll key by index within this examples list.
-    lock = None
     idx_counter = {"i": 0}
 
     def get_next() -> Optional[Tuple[int, Dict[str, Any]]]:
@@ -101,36 +186,35 @@ def run_variant_workload(
             if nxt is None:
                 return
             i, ex = nxt
-            dataset_type = ex.get("dataset")
-            difficulty = ex.get("difficulty") or "easy"
-            raw_prompt = ex.get("prompt")
-            ref_answer = ex.get("answer")
 
-            formatted_prompt, max_new_tokens = build_llama_formatted_prompt(
-                raw_prompt=raw_prompt,
+            dataset_type = (ex.get("dataset") or "").lower()
+            difficulty = (ex.get("difficulty") or "easy").lower()
+            ref_answer = ex.get("answer", "")
+
+            formatted_prompt, max_new_tokens, _stops = build_llama_formatted_prompt(
+                example=ex,
                 dataset_type=dataset_type,
                 prompt_mode=prompt_mode,
-                max_new_tokens_override=None,
             )
 
-            require_all_final_answers = dataset_type == "gsm8k"
             out_text, metrics = server.generate(
                 prompt=formatted_prompt,
-                max_tokens=max_new_tokens,
+                max_tokens=int(max_new_tokens),
                 temperature=0.0,
                 top_p=1.0,
                 dataset_type=dataset_type,
                 difficulty=difficulty,
                 prompt_mode=prompt_mode,
-                require_all_final_answers=require_all_final_answers,
             )
 
-            correct = EvaluationMetrics.is_correct(out_text, ref_answer, dataset_type)
-            fmt_ok = EvaluationMetrics.format_ok(out_text, dataset_type)
+            ok, _extracted, fmt_ok = EvaluationMetrics.is_correct(out_text, ref_answer, dataset_type)
 
-            rec = {
-                "idx": i,
+            rec: Dict[str, Any] = {
+                "idx": int(i),
+                "ex_id": ex.get("_ex_id"),
+                "split": ex.get("_split"),
                 "dataset": dataset_type,
+                "source_split": ex.get("source_split"),
                 "difficulty": difficulty,
                 "prompt_mode": prompt_mode,
                 "max_tokens": int(max_new_tokens),
@@ -138,7 +222,7 @@ def run_variant_workload(
                 "variant": variant,
                 "concurrency": int(concurrency),
                 "queue_depth_at_submit": int(metrics.get("queue_depth_at_submit", 0) or 0),
-                "correct": int(bool(correct)),
+                "correct": int(bool(ok)),
                 "format_ok": int(bool(fmt_ok)),
                 "ttft_ms": float(metrics.get("ttft_ms", 0.0) or 0.0),
                 "tpot_ms": float(metrics.get("tpot_ms", 0.0) or 0.0),
@@ -146,7 +230,6 @@ def run_variant_workload(
             }
             results[i] = rec
 
-    # Run threads
     with ThreadPoolExecutor(max_workers=int(concurrency)) as ex:
         futs = [ex.submit(worker) for _ in range(int(concurrency))]
         for f in as_completed(futs):
@@ -159,7 +242,6 @@ def train_models(
     records: List[Dict[str, Any]],
     variants: List[str],
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
-    # Build per-variant datasets
     X_by_v: Dict[str, List[List[float]]] = {v: [] for v in variants}
     yq_by_v: Dict[str, List[int]] = {v: [] for v in variants}
     yttft_by_v: Dict[str, List[float]] = {v: [] for v in variants}
@@ -236,11 +318,9 @@ def tune_weights(
             slo_ok = 0
             cost_sum = 0.0
 
-            for idx, by_v in val_grouped.items():
-                # Build queue depths dict and a representative example metadata from any variant
+            for _, by_v in val_grouped.items():
                 any_rec = next(iter(by_v.values()))
                 qds = {vv: int(by_v[vv]["queue_depth_at_submit"]) for vv in variants if vv in by_v}
-                # Fill missing with 0
                 for vv in variants:
                     qds.setdefault(vv, 0)
 
@@ -258,10 +338,8 @@ def tune_weights(
                 chosen = dec.variant
                 true = by_v.get(chosen)
                 if true is None:
-                    # fallback if missing
                     true = by_v.get("base") or any_rec
 
-                # True SLO check
                 slo = slo_dict.get(any_rec["difficulty"], {})
                 ttft_slo = float(slo.get("ttft_ms", 1e9))
                 tpot_slo = float(slo.get("tpot_ms", 1e9))
@@ -292,12 +370,13 @@ def tune_weights(
             if best is None or avg_loss < best:
                 best = avg_loss
                 best_stats = {
-                    "avg_loss": avg_loss,
-                    "accuracy": correct / n,
-                    "slo_compliance": slo_ok / n,
-                    "avg_cost": cost_sum / n,
-                    "lambda": lam,
-                    "mu": mu,
+                    "avg_loss": float(avg_loss),
+                    "accuracy": float(correct / n),
+                    "slo_compliance": float(slo_ok / n),
+                    "avg_cost": float(cost_sum / n),
+                    "lambda": float(lam),
+                    "mu": float(mu),
+                    "n_val": int(n),
                 }
 
     return float(best_stats["lambda"]), float(best_stats["mu"]), best_stats
@@ -316,26 +395,46 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max_batch_size", type=int, default=8)
     ap.add_argument("--batch_wait_ms", type=int, default=8)
-    ap.add_argument("--max_examples", type=int, default=0, help="Debug: limit Train+Val examples (0 = full)")
+
+    ap.add_argument(
+        "--max_examples",
+        type=int,
+        default=0,
+        help=(
+            "Optional: cap total Train+Val examples used for collection (0 = full). "
+            "This downsampling preserves a usable Val set for lambda/mu tuning."
+        ),
+    )
+    ap.add_argument(
+        "--tune_max_examples",
+        type=int,
+        default=0,
+        help="Optional: cap number of Val examples used for lambda/mu tuning (0 = full Val).",
+    )
+
     args = ap.parse_args()
 
     processed = Path(args.processed_dir)
     train_path = processed / "train_data.jsonl"
     val_path = processed / "val_data.jsonl"
 
-    train = load_jsonl(str(train_path))
-    val = load_jsonl(str(val_path))
+    train_raw = load_jsonl(str(train_path))
+    val_raw = load_jsonl(str(val_path))
+
+    train = annotate_examples(train_raw, "train")
+    val = annotate_examples(val_raw, "val")
+
+    if args.max_examples and args.max_examples > 0:
+        train, val = limit_train_val(train, val, int(args.max_examples), int(args.seed))
 
     trainval = train + val
-    if args.max_examples and args.max_examples > 0:
-        trainval = trainval[: int(args.max_examples)]
+    print(f"[data] train_examples={len(train)} val_examples={len(val)} train+val={len(trainval)}")
 
     slo_dict = load_slo_dict(args.slo_dict_path)
 
     concs = [int(c) for c in args.concurrencies]
     split_map = split_across_concurrencies(trainval, concs, seed=int(args.seed))
 
-    # Start servers (one per variant) and reuse
     variants = ["cheap", "med", "base"]
     servers: Dict[str, SingleVariantServer] = {}
     for v in variants:
@@ -370,14 +469,21 @@ def main() -> None:
 
             # Merge queue depths (one qd per variant) into features for all records
             for idx in range(len(exs)):
-                qds = {v: int(per_variant[v][idx]["queue_depth_at_submit"]) for v in variants}
+                qds: Dict[str, int] = {}
                 for v in variants:
-                    rec = per_variant[v][idx]
+                    rec_v = per_variant.get(v, {}).get(idx)
+                    qds[v] = int(rec_v.get("queue_depth_at_submit", 0)) if rec_v is not None else 0
+
+                for v in variants:
+                    rec = per_variant.get(v, {}).get(idx)
+                    if rec is None:
+                        continue
+
                     feats = LearnedRouter.extract_features(
                         dataset_type=rec["dataset"],
                         difficulty=rec["difficulty"],
-                        max_tokens=rec["max_tokens"],
-                        estimated_tokens=rec["estimated_tokens"],
+                        max_tokens=int(rec["max_tokens"]),
+                        estimated_tokens=int(rec["estimated_tokens"]),
                         queue_depths=qds,
                     )[0].tolist()
                     rec["features"] = feats
@@ -394,39 +500,26 @@ def main() -> None:
 
     quality_models, ttft_models, tpot_models = train_models(all_records, variants)
 
-    # Group validation records (only those that correspond to val split indices)
-    # We locate val examples by taking the tail of trainval list.
-    val_indices = set(range(len(train), len(train) + len(val)))
-    # But our per-partition idx is local. We'll tune using prompt text? Instead, tune using a slice of all_records:
-    # We'll approximate by taking last len(val) examples from trainval *within each partition* is tricky.
-    # Simpler: build a grouped set by using a random sample of records that correspond to val prompts.
-    val_prompts = set((x.get("dataset"), x.get("prompt"), x.get("answer")) for x in val)
-
-    val_grouped: Dict[int, Dict[str, Dict[str, Any]]] = {}
-    next_id = 0
-    # Group by (dataset,prompt,answer) to consolidate across partitions
-    tmp: Dict[Tuple[str, str, str], Dict[str, Dict[str, Any]]] = {}
+    # ---------------------------
+    # Val-only tuning (NO leakage)
+    # ---------------------------
+    grouped_val: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for r in all_records:
-        key = (r["dataset"], r.get("prompt", ""), str(r.get("answer", "")))
-        # NOTE: we didn't store raw prompt/answer in rec; add it now if missing
-    # Better: rebuild keys from trainval (we kept only formatted prompt length). We'll tune on all validation examples by matching idx within each partition isn't stable.
+        if r.get("split") != "val":
+            continue
+        ex_id = r.get("ex_id")
+        if not ex_id:
+            continue
+        grouped_val.setdefault(str(ex_id), {})[r["variant"]] = r
 
-    # Practical fallback: tune on a random 10% subsample of collected records grouped by idx (within partition).
-    # This is deterministic and avoids heavy bookkeeping.
-    # For strict Option-1, users can pass --max_examples=0 and accept this.
+    val_keys = sorted(grouped_val.keys())
+    if args.tune_max_examples and args.tune_max_examples > 0 and len(val_keys) > int(args.tune_max_examples):
+        rng = random.Random(int(args.seed))
+        rng.shuffle(val_keys)
+        val_keys = val_keys[: int(args.tune_max_examples)]
 
-    grouped_by_conc_and_idx: Dict[Tuple[int, int], Dict[str, Dict[str, Any]]] = {}
-    for r in all_records:
-        k = (int(r["concurrency"]), int(r["idx"]))
-        grouped_by_conc_and_idx.setdefault(k, {})[r["variant"]] = r
-
-    keys = sorted(grouped_by_conc_and_idx.keys())
-    rng = random.Random(int(args.seed))
-    rng.shuffle(keys)
-    take = max(1, int(0.1 * len(keys)))
-    keys = keys[:take]
-    for i, k in enumerate(keys):
-        val_grouped[i] = grouped_by_conc_and_idx[k]
+    val_grouped: Dict[int, Dict[str, Dict[str, Any]]] = {i: grouped_val[k] for i, k in enumerate(val_keys)}
+    print(f"[tune] val_examples_for_tuning={len(val_grouped)} (val-only)")
 
     router = LearnedRouter(quality_models, ttft_models, tpot_models, lambda_slo=1.5, mu_quality=1.5)
 
@@ -436,17 +529,48 @@ def main() -> None:
     out_root = Path(args.output_root)
     out_root.mkdir(parents=True, exist_ok=True)
 
+    protocol_meta = {
+        "predictors_fit": "train+val",
+        "lambda_mu_tuned": "val_only",
+        "eval_split": "test",
+        "split_across_concurrencies": True,
+        "concurrencies": concs,
+        "prompt_mode": args.prompt_mode,
+        "seed": int(args.seed),
+        "train_examples_used": int(len(train)),
+        "val_examples_used": int(len(val)),
+        "tune_val_examples_used": int(len(val_grouped)),
+        "max_examples": int(args.max_examples or 0),
+        "tune_max_examples": int(args.tune_max_examples or 0),
+    }
+
     # Save TTFT router
     out_ttft = out_root / "learned_ttft"
     router.lambda_slo = lam_ttft
     router.mu_quality = mu_ttft
-    router.save(str(out_ttft), extra_metadata={"tuned": stats_ttft, "mode": "ttft"})
+    router.save(
+        str(out_ttft),
+        extra_metadata={
+            "mode": "ttft",
+            "label": "Learned-TTFT",
+            "tuned": stats_ttft,
+            "training_protocol": protocol_meta,
+        },
+    )
 
     # Save TOTAL router
     out_total = out_root / "learned_total"
     router.lambda_slo = lam_total
     router.mu_quality = mu_total
-    router.save(str(out_total), extra_metadata={"tuned": stats_total, "mode": "total"})
+    router.save(
+        str(out_total),
+        extra_metadata={
+            "mode": "total",
+            "label": "Learned-Total (Derived)",
+            "tuned": stats_total,
+            "training_protocol": protocol_meta,
+        },
+    )
 
     print("\n[saved]")
     print(f"  {out_ttft}")
