@@ -31,6 +31,7 @@ import argparse
 import json
 import os
 import random
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -54,7 +55,11 @@ def _read_jsonl(path: str) -> List[Dict[str, Any]]:
             line = line.strip()
             if not line:
                 continue
-            rows.append(json.loads(line))
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                # Can happen if a run was interrupted mid-line.
+                continue
     return rows
 
 
@@ -67,6 +72,13 @@ def _write_json(path: str, obj: Any) -> None:
 def _write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+
+
+def _append_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")
 
@@ -126,6 +138,74 @@ def _split_across_concurrencies(
     return out
 
 
+def _save_split_map(path: Path, *, seed: int, concurrencies: List[int], assignments: Dict[int, int], example_ids: List[int]) -> None:
+    obj = {
+        "seed": int(seed),
+        "concurrencies": [int(c) for c in concurrencies],
+        "num_examples": int(len(example_ids)),
+        "example_ids": [int(x) for x in example_ids],
+        "assignments": {str(int(k)): int(v) for k, v in assignments.items()},
+    }
+    _write_json(str(path), obj)
+
+
+def _load_split_map(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _build_split_map_stable(
+    *,
+    trainval: List[Dict[str, Any]],
+    concurrencies: List[int],
+    seed: int,
+    out_root: Path,
+) -> Dict[int, List[Dict[str, Any]]]:
+    """Create (or reuse) a deterministic example->concurrency assignment.
+
+    We persist the assignment so you can resume long trace-collection runs safely
+    across Kaggle sessions without changing the queue-regime labels.
+    """
+
+    split_map_path = out_root / "split_map.json"
+    example_ids = [int(ex.get("_global_index", i)) for i, ex in enumerate(trainval)]
+
+    existing = _load_split_map(split_map_path)
+    if existing:
+        # Verify compatibility to avoid mixing regimes.
+        if int(existing.get("seed", -1)) != int(seed) or [int(c) for c in existing.get("concurrencies", [])] != [int(c) for c in concurrencies]:
+            raise RuntimeError(
+                "split_map.json exists but was created with different --seed/--concurrencies. "
+                "Use the same flags to resume, or delete router_models/split_map.json and trainval_traces.jsonl to restart."
+            )
+        if [int(x) for x in existing.get("example_ids", [])] != [int(x) for x in example_ids]:
+            raise RuntimeError(
+                "split_map.json exists but the Train+Val example set differs (maybe different --max_examples or processed data). "
+                "Use the same data/flags to resume, or delete router_models/split_map.json and trainval_traces.jsonl to restart."
+            )
+
+        assignments = {int(k): int(v) for k, v in (existing.get("assignments") or {}).items()}
+    else:
+        # Create a new split map.
+        parts = _split_across_concurrencies(trainval, concurrencies, seed=seed)
+        assignments = {}
+        for c, exs in parts.items():
+            for ex in exs:
+                gid = int(ex.get("_global_index"))
+                assignments[gid] = int(c)
+        _save_split_map(split_map_path, seed=seed, concurrencies=concurrencies, assignments=assignments, example_ids=example_ids)
+
+    # Materialize split_map from persisted assignments.
+    out: Dict[int, List[Dict[str, Any]]] = {int(c): [] for c in concurrencies}
+    for ex in trainval:
+        gid = int(ex.get("_global_index"))
+        c = int(assignments[gid])
+        out.setdefault(c, []).append(ex)
+    return out
+
+
 def _extract_queue_depths(metrics: Dict[str, Any], variants: List[str]) -> Dict[str, int]:
     qd = metrics.get("router_queue_depths")
     if isinstance(qd, dict):
@@ -144,12 +224,21 @@ def _collect_traces_for_concurrency(
     variants: List[str],
     prompt_mode: str,
     seed: int,
+    skip_keys: Optional[set] = None,
+    time_budget_s: float = 0.0,
+    append_path: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Run all (example, variant) pairs under a fixed concurrency."""
+
+    skip_keys = skip_keys or set()
+    start_t = time.time()
 
     tasks: List[Tuple[int, str, Dict[str, Any]]] = []
     for i, ex in enumerate(examples):
         for v in variants:
+            gid = int(ex.get("_global_index", i))
+            if (gid, v) in skip_keys:
+                continue
             tasks.append((i, v, ex))
 
     rng = random.Random(int(seed) + int(concurrency) * 1009)
@@ -168,9 +257,33 @@ def _collect_traces_for_concurrency(
 
     rec_lock = threading.Lock()
 
+    # Optional append-to-disk for long-running collection jobs.
+    write_lock = threading.Lock()
+    trace_f = None
+    if append_path:
+        Path(append_path).parent.mkdir(parents=True, exist_ok=True)
+        trace_f = open(append_path, "a", encoding="utf-8")
+
+    stop_event = threading.Event()
+
+    def _budget_exhausted() -> bool:
+        if not time_budget_s or time_budget_s <= 0:
+            return False
+        return (time.time() - start_t) >= float(time_budget_s)
+
+    def _append_one(rec: Dict[str, Any]) -> None:
+        if trace_f is None:
+            return
+        with write_lock:
+            trace_f.write(json.dumps(rec) + "\n")
+            trace_f.flush()
+
     def worker() -> None:
         local: List[Dict[str, Any]] = []
         while True:
+            if stop_event.is_set() or _budget_exhausted():
+                stop_event.set()
+                break
             try:
                 ex_idx, variant, ex = task_q.get_nowait()
             except queue.Empty:
@@ -230,6 +343,7 @@ def _collect_traces_for_concurrency(
                 "queue_wait_ms": float(metrics.get("queue_wait_ms", 0.0) or 0.0),
             }
             local.append(rec)
+            _append_one(rec)
 
             try:
                 task_q.task_done()
@@ -239,10 +353,17 @@ def _collect_traces_for_concurrency(
         with rec_lock:
             records.extend(local)
 
-    with ThreadPoolExecutor(max_workers=int(max(1, concurrency))) as ex:
-        futs = [ex.submit(worker) for _ in range(int(max(1, concurrency)))]
-        for f in as_completed(futs):
-            _ = f.result()
+    try:
+        with ThreadPoolExecutor(max_workers=int(max(1, concurrency))) as ex:
+            futs = [ex.submit(worker) for _ in range(int(max(1, concurrency)))]
+            for f in as_completed(futs):
+                _ = f.result()
+    finally:
+        if trace_f is not None:
+            try:
+                trace_f.close()
+            except Exception:
+                pass
 
     return records
 
@@ -466,6 +587,17 @@ def parse_args() -> argparse.Namespace:
         help="If set, only collect (or reuse) traces and exit before training predictors.",
     )
     ap.add_argument(
+        "--time_budget_hours",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional wall-clock budget for trace collection. "
+            "If > 0, the script will stop collecting when the budget is reached, "
+            "save partial progress to trainval_traces.jsonl, and exit. "
+            "Re-run the same command to resume."
+        ),
+    )
+    ap.add_argument(
         "--eval_on_test",
         action="store_true",
         help="If set, run a quick held-out accuracy eval on TEST for each learned mode (no load/concurrency sweep).",
@@ -518,11 +650,23 @@ def main() -> None:
     # 1) Collect traces (train+val)
     # -----------------------------
     records: List[Dict[str, Any]] = []
-    if args.reuse_traces and trace_path.exists():
+
+    # Always load any existing traces so we can resume safely.
+    if trace_path.exists():
         records = _read_jsonl(str(trace_path))
-        print(f"[reuse] Loaded cached traces: {trace_path} (rows={len(records)})")
+        print(f"[resume] Found existing traces: {trace_path} (rows={len(records)})")
+
+    if args.reuse_traces and trace_path.exists():
+        print("[reuse] Skipping trace collection (will train from cached traces).")
     else:
-        split_map = _split_across_concurrencies(trainval, concs, seed=int(args.seed))
+        split_map = _build_split_map_stable(trainval=trainval, concurrencies=concs, seed=int(args.seed), out_root=out_root)
+
+        done_keys = {(int(r.get("global_example_idx", -1)), str(r.get("variant"))) for r in records}
+        expected = len(trainval) * len(variants)
+        print(f"[resume] already_done={len(done_keys)}/{expected} (example-variant pairs)")
+
+        time_budget_s = float(args.time_budget_hours or 0.0) * 3600.0
+        start_time = time.time()
 
         service = MultiVariantService(
             model_name=args.model_name,
@@ -544,6 +688,9 @@ def main() -> None:
             for conc, exs in split_map.items():
                 if not exs:
                     continue
+                if time_budget_s and (time.time() - start_time) >= time_budget_s:
+                    print("[budget] Time budget reached before next concurrency bucket; stopping collection.")
+                    break
                 print(f"\n[collect] concurrency={conc} examples={len(exs)}")
                 recs = _collect_traces_for_concurrency(
                     service=service,
@@ -552,16 +699,30 @@ def main() -> None:
                     variants=variants,
                     prompt_mode=str(args.prompt_mode),
                     seed=int(args.seed),
+                    skip_keys=done_keys,
+                    time_budget_s=max(0.0, time_budget_s - (time.time() - start_time)) if time_budget_s else 0.0,
+                    append_path=str(trace_path),
                 )
-                records.extend(recs)
+                if recs:
+                    records.extend(recs)
+                    done_keys.update({(int(r.get("global_example_idx", -1)), str(r.get("variant"))) for r in recs})
         finally:
             try:
                 service.cleanup()
             except Exception:
                 pass
 
-        _write_jsonl(str(trace_path), records)
+        # We appended during collection; re-load to ensure file is consistent.
+        records = _read_jsonl(str(trace_path))
         print(f"\n[saved] traces -> {trace_path} (rows={len(records)})")
+
+        # If we were running under a wall-clock budget, exit so the user can resume later.
+        if time_budget_s and (time.time() - start_time) >= time_budget_s:
+            print(
+                f"[budget] Collection stopped at wall-clock budget (~{args.time_budget_hours}h). "
+                f"Re-run the same command to resume. Current rows={len(records)}"
+            )
+            return
 
     # Sanity: expect ~3 rows per example (one per variant).
     grouped_all = _group_by_example(records, variants)
