@@ -1,4 +1,5 @@
 import gc
+import hashlib
 import logging
 import re
 import threading
@@ -161,6 +162,61 @@ class StopOnFinalAnswer(StoppingCriteria):
                 self._done[i] = True
 
         return all(self._done) if self.require_all else any(self._done)
+
+
+class StopOnDegenerateGibberish(StoppingCriteria):
+    """Stop generation early if output collapses into obvious gibberish.
+
+    Motivation:
+    - Some 4-bit quantized stacks (bnb nf4) can enter repetitive token loops on
+      long-form generations (notably GSM8K) under greedy decoding.
+    - When this happens, continuing to generate to max_new_tokens wastes time and
+      guarantees a format failure.
+
+    This criterion is intentionally conservative and is only enabled for
+    CHEAP+GSM8K.
+    """
+
+    def __init__(self, tokenizer, prompt_len: int, tail_tokens: int = 128):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.prompt_len = int(prompt_len)
+        self.tail_tokens = int(max(32, tail_tokens))
+
+    def _looks_degenerate(self, text: str) -> bool:
+        if not text:
+            return False
+        tail = text[-256:]
+        if len(tail) < 64:
+            return False
+
+        # High ratio of these chars is a strong signal of token-decode collapse.
+        bad_chars = set("<>_?")
+        bad_ratio = sum((c in bad_chars) for c in tail) / float(len(tail))
+        if bad_ratio < 0.85:
+            return False
+
+        # If almost all characters come from a tiny alphabet, it's a loop.
+        if len(set(tail)) <= 6:
+            return True
+        return False
+
+    def __call__(self, input_ids, scores, **kwargs) -> bool:
+        if input_ids.ndim == 1:
+            seq = input_ids
+            start = max(self.prompt_len, int(seq.shape[0]) - self.tail_tokens)
+            text = self.tokenizer.decode(seq[start:], skip_special_tokens=True)
+            return self._looks_degenerate(text)
+
+        # Batch: stop if any row looks degenerate.
+        bsz = int(input_ids.shape[0])
+        for i in range(bsz):
+            seq = input_ids[i]
+            start = max(self.prompt_len, int(seq.shape[0]) - self.tail_tokens)
+            text = self.tokenizer.decode(seq[start:], skip_special_tokens=True)
+            if self._looks_degenerate(text):
+                return True
+        return False
 
 
 # -------------------------------
@@ -463,8 +519,14 @@ class SingleVariantServer:
                 quant_config = BitsAndBytesConfig(
                     load_in_4bit=True,
                     bnb_4bit_quant_type="nf4",
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_compute_dtype=model_dtype if model_dtype != "auto" else torch.float16,
+                    # NOTE:
+                    # - Double-quant can save memory, but it is also one of the main knobs that can
+                    #   increase output degeneracy for some instruct models (esp. long-form GSM8K).
+                    # - For "cheap" we prefer *stability/quality* over the last bit of VRAM.
+                    bnb_4bit_use_double_quant=False,
+                    # Use fp16 compute for stability across common Kaggle/Colab GPUs.
+                    # (bf16 compute can be unstable for some bnb 4-bit stacks; fp16 is the safest.)
+                    bnb_4bit_compute_dtype=torch.float16,
                 )
         else:
             logger.warning(f"Unknown variant '{self.variant}', defaulting to base (fp16)")
@@ -550,6 +612,55 @@ class SingleVariantServer:
             return f"SYSTEM: {system}\nUSER: {user}\nASSISTANT:"
         return f"USER: {user}\nASSISTANT:"
 
+    # -------------------------------
+    # Cheap/med quality guardrails (accuracy mode only)
+    # -------------------------------
+
+    @staticmethod
+    def _stable_u32_seed(*parts: str) -> int:
+        """Deterministic 32-bit seed derived from text (stable across runs)."""
+
+        s = "|".join([p or "" for p in parts])
+        h = hashlib.md5(s.encode("utf-8")).hexdigest()
+        return int(h[:8], 16)
+
+    @staticmethod
+    def _extract_gsm8k_question_from_prompt(formatted_prompt: str) -> str:
+        """Best-effort extraction of the GSM8K question from our prompt template."""
+
+        if not formatted_prompt:
+            return ""
+        # Common template: ... "Now solve:\nProblem: {question}\n\nSolution:"
+        m = re.search(r"Problem:\s*(.*?)\n\s*\nSolution:\s*$", formatted_prompt, flags=re.DOTALL)
+        if m:
+            return (m.group(1) or "").strip()
+        # Fallback: grab the last occurrence of 'Problem:' and take remainder.
+        idx = formatted_prompt.rfind("Problem:")
+        if idx >= 0:
+            tail = formatted_prompt[idx + len("Problem:") :]
+            # Cut off anything after 'Solution:' if present.
+            tail = tail.split("Solution:", 1)[0]
+            return tail.strip()
+        return ""
+
+    @classmethod
+    def _build_gsm8k_answer_only_prompt(cls, formatted_prompt: str) -> str:
+        """A short, format-focused GSM8K prompt used as an *accuracy-mode* retry.
+
+        This is intentionally brief to reduce long-form degeneration (common in 4-bit)
+        and to improve strict-format compliance.
+        """
+
+        q = cls._extract_gsm8k_question_from_prompt(formatted_prompt)
+        system = "You are a careful math problem solver."
+        user = (
+            "Return ONLY the final numeric answer in the exact format:\n"
+            "FINAL_ANSWER: <number>\n"
+            "No other text. No units. No punctuation.\n\n"
+            f"Problem: {q}\n"
+        )
+        return f"{system}\n\n{user}".strip()
+
     def _warmup(self) -> None:
         logger.info("Warming up server (3 iterations, deterministic)...")
         warm_prompt = "You are a helpful assistant. Reply with a single letter: A."
@@ -627,7 +738,10 @@ class SingleVariantServer:
                 prompt_len=prompt_len,
                 require_all=bool(require_all_final_answers and bsz > 1),
             )
-            stopping_criteria = StoppingCriteriaList([stopper])
+            criteria = [stopper]
+            if getattr(self, "variant_effective", self.variant) == "cheap":
+                criteria.append(StopOnDegenerateGibberish(tokenizer=self.tokenizer, prompt_len=prompt_len))
+            stopping_criteria = StoppingCriteriaList(criteria)
 
         # MMLU restriction
         prefix_allowed_tokens_fn = None
@@ -652,6 +766,17 @@ class SingleVariantServer:
         if prefix_allowed_tokens_fn is not None:
             gen_kwargs["prefix_allowed_tokens_fn"] = prefix_allowed_tokens_fn
 
+        # ------------------------------------------------------------------
+        # Variant-specific decoding guardrails
+        # ------------------------------------------------------------------
+        # In practice, some 4-bit (bnb nf4) stacks can fall into repetitive / token-gibberish
+        # loops on longer GSM8K generations under greedy decoding. These light-weight
+        # constraints are deterministic and typically improve both format adherence and
+        # correctness for CHEAP without materially harming latency.
+        if dataset_type == "gsm8k" and getattr(self, "variant_effective", self.variant) == "cheap":
+            gen_kwargs.setdefault("repetition_penalty", 1.08)
+            gen_kwargs.setdefault("no_repeat_ngram_size", 3)
+
         streamer = TimingStreamer(self._synchronize_device)
 
         t_lock_req = time.perf_counter()
@@ -663,6 +788,22 @@ class SingleVariantServer:
             t0_gen = time.perf_counter()
 
             with torch.inference_mode():
+                # Deterministic sampling (used only when do_sample=True).
+                # We avoid relying on Python's randomized hash; md5 is stable.
+                if do_sample and bsz == 1:
+                    seed = self._stable_u32_seed(
+                        "sample",
+                        getattr(self, "variant_effective", self.variant),
+                        dataset_type,
+                        prompts[0],
+                        str(max_tokens),
+                    )
+                    try:
+                        torch.manual_seed(seed)
+                        if self.device == "cuda":
+                            torch.cuda.manual_seed_all(seed)
+                    except Exception:
+                        pass
                 sequences = self.model.generate(
                     input_ids=inputs["input_ids"],
                     attention_mask=inputs.get("attention_mask"),
@@ -846,8 +987,74 @@ class SingleVariantServer:
         metrics["scheduler_wait_ms"] = 0.0
         metrics["lock_wait_ms"] = float(max(0.0, lock_wait_ms))
         metrics["queue_wait_ms"] = float(max(0.0, lock_wait_ms))
+
+        text = texts[0]
+
+        # ------------------------------------------------------------------
+        # Accuracy-mode GSM8K retry (format-only, same variant)
+        # ------------------------------------------------------------------
+        # Goal: avoid "all-format-fail" runs in CHEAP (4-bit) and recover
+        # occasional truncation-driven format failures in MED.
+        # This is ONLY enabled for prompt_mode=accuracy and ONLY triggered on
+        # strict+parseable format failure (no quality-based retry).
+        variant_eff = getattr(self, "variant_effective", self.variant)
+        if (
+            dataset_type == "gsm8k"
+            and prompt_mode == "accuracy"
+            and variant_eff in ("cheap", "med")
+        ):
+            try:
+                strict = extract_gsm8k_strict(text)
+                parseable = strict or extract_gsm8k_parseable(text)
+            except Exception:
+                strict, parseable = "", ""
+
+            if not parseable:
+                retry_prompt = self._build_gsm8k_answer_only_prompt(prompt)
+                # A small amount of sampling can help break repetition loops in 4-bit.
+                # Keep MED deterministic (greedy) by default.
+                retry_temp = 0.25 if variant_eff == "cheap" else 0.0
+                retry_top_p = 0.9 if variant_eff == "cheap" else 1.0
+                retry_max_tokens = 48
+
+                try:
+                    r_texts, r_metrics_list, r_lock_wait_ms = self._generate_hf_batch(
+                        prompts=[retry_prompt],
+                        dataset_type=dataset_type,
+                        max_tokens=int(retry_max_tokens),
+                        prompt_mode=prompt_mode,
+                        temperature=float(retry_temp),
+                        top_p=float(retry_top_p),
+                        require_all_final_answers=False,
+                    )
+
+                    r_text = r_texts[0]
+                    try:
+                        r_ok = bool(extract_gsm8k_parseable(r_text) or extract_gsm8k_strict(r_text))
+                    except Exception:
+                        r_ok = False
+
+                    if r_ok:
+                        r_metrics = r_metrics_list[0]
+                        r_metrics["scheduler_wait_ms"] = 0.0
+                        r_metrics["lock_wait_ms"] = float(max(0.0, r_lock_wait_ms))
+                        r_metrics["queue_wait_ms"] = float(max(0.0, r_lock_wait_ms))
+
+                        # Lightweight provenance for debugging/paper appendix.
+                        r_metrics["format_retry"] = {
+                            "enabled": True,
+                            "reason": "gsm8k_format_failure",
+                            "first_attempt_output_len": int(metrics.get("output_length") or 0),
+                            "first_attempt_tpot_ms": float(metrics.get("tpot_ms") or 0.0),
+                            "first_attempt_total_ms": float(metrics.get("total_latency_ms") or 0.0),
+                        }
+                        return r_text, r_metrics
+                except Exception:
+                    # If the retry fails for any reason, fall back to the original output.
+                    pass
+
         # Option A: ttft_ms already equals ttft_infer_ms for direct calls.
-        return texts[0], metrics
+        return text, metrics
 
     def cleanup(self) -> None:
         """Free GPU memory."""
@@ -1814,7 +2021,7 @@ class MultiVariantService:
                                 total = float(m.get("total_latency_ms", 0.0) or 0.0) - sched_wait_ms
                                 n_out = int(m.get("output_tokens", m.get("n_output_tokens", 0)) or 0)
                                 q_wait = float(m.get("queue_wait_ms", 0.0) or 0.0)
-                                st.update(ttft_infer, tpot, total, n_out, q_wait, alpha=self.ema_alpha)
+                                st.update(ttft_infer, tpot, total, alpha=self.ema_alpha)
                             except Exception:
                                 pass
 
