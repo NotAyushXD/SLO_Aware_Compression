@@ -626,22 +626,62 @@ class SingleVariantServer:
 
     @staticmethod
     def _extract_gsm8k_question_from_prompt(formatted_prompt: str) -> str:
-        """Best-effort extraction of the GSM8K question from our prompt template."""
+        """Best-effort extraction of the GSM8K question from our GSM8K prompt templates.
+
+        We *must* handle multiple exemplars, each containing "Problem:", and we want the
+        final "Now solve:" block's question. This function is used for format-only retries
+        and cheap-variant compact prompting, so it should be robust.
+        """
 
         if not formatted_prompt:
             return ""
-        # Common template: ... "Now solve:\nProblem: {question}\n\nSolution:"
-        m = re.search(r"Problem:\s*(.*?)\n\s*\nSolution:\s*$", formatted_prompt, flags=re.DOTALL)
-        if m:
-            return (m.group(1) or "").strip()
-        # Fallback: grab the last occurrence of 'Problem:' and take remainder.
-        idx = formatted_prompt.rfind("Problem:")
-        if idx >= 0:
-            tail = formatted_prompt[idx + len("Problem:") :]
-            # Cut off anything after 'Solution:' if present.
-            tail = tail.split("Solution:", 1)[0]
-            return tail.strip()
-        return ""
+
+        # First split our legacy format: "system\n\nuser".
+        try:
+            _sys, user = split_system_user(formatted_prompt)
+        except Exception:
+            user = formatted_prompt
+
+        user = user or ""
+
+        # Prefer the final "Now solve:" section if present.
+        tail = user
+        idx_now = tail.rfind("Now solve:")
+        if idx_now >= 0:
+            tail = tail[idx_now:]
+
+        # Find the last occurrence of "Problem:" after the last Now solve.
+        matches = list(re.finditer(r"\bProblem:\s*", tail))
+        if matches:
+            start = matches[-1].end()
+            q_tail = tail[start:]
+
+            # Cut off at the first blank-line + Solution, or at a standalone "Solution:".
+            # (Our templates typically have "\n\nSolution:" right after the question.)
+            cut_patterns = [r"\n\s*\n\s*Solution:\s*", r"\n\s*Solution:\s*"]
+            cut = None
+            for pat in cut_patterns:
+                m = re.search(pat, q_tail)
+                if m:
+                    cut = m.start()
+                    break
+            if cut is not None:
+                q = q_tail[:cut]
+            else:
+                q = q_tail
+
+            q = (q or "").strip()
+            # GSM8K questions are usually single-paragraph; collapse excessive whitespace.
+            q = re.sub(r"\s+", " ", q).strip()
+            return q
+
+        # Fallback: if there is no "Problem:", return the last non-empty line.
+        lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
+        if not lines:
+            return ""
+        q = lines[-1]
+        q = re.sub(r"\s+", " ", q).strip()
+        return q
 
     @classmethod
     def _build_gsm8k_answer_only_prompt(cls, formatted_prompt: str) -> str:
@@ -658,6 +698,49 @@ class SingleVariantServer:
             "FINAL_ANSWER: <number>\n"
             "No other text. No units. No punctuation.\n\n"
             f"Problem: {q}\n"
+        )
+        return f"{system}\n\n{user}".strip()
+
+    
+    @classmethod
+    def _build_gsm8k_compact_prompt(cls, formatted_prompt: str) -> str:
+        """Compact GSM8K prompt for CHEAP (4-bit) stability.
+
+        Removes few-shot exemplars and uses a single short worked example to
+        strongly anchor the required output format without bloating the prompt.
+        """
+        q = cls._extract_gsm8k_question_from_prompt(formatted_prompt)
+        system = "You are a careful math problem solver."
+        exemplar = (
+            "Example:\n"
+            "Problem: Lisa has 6 candies and gives 2 away. How many candies does she have left?\n"
+            "Solution:\n"
+            "6 - 2 = 4\n"
+            "FINAL_ANSWER: 4\n"
+        )
+        user = (
+            "You will solve a grade-school math word problem.\n"
+            "Show your working as short equations (not long prose).\n"
+            "Your LAST line must be exactly:\n"
+            "FINAL_ANSWER: <number>\n"
+            "Where <number> is the final numeric answer (no units, no extra words).\n"
+            "Do NOT write anything after the FINAL_ANSWER line.\n\n"
+            f"{exemplar}\n"
+            f"Now solve:\nProblem: {q}\n\nSolution:"
+        )
+        return f"{system}\n\n{user}".strip()
+
+    @classmethod
+    def _build_gsm8k_fill_blank_prompt(cls, formatted_prompt: str) -> str:
+        """Ultra-short 'fill the blank' GSM8K retry prompt (format-only)."""
+        q = cls._extract_gsm8k_question_from_prompt(formatted_prompt)
+        system = "You are a careful math problem solver."
+        user = (
+            "Compute the final numeric answer.\n"
+            "Respond by completing the last line with ONLY the number.\n"
+            "Do not add any other text.\n\n"
+            f"Problem: {q}\n"
+            "FINAL_ANSWER: "
         )
         return f"{system}\n\n{user}".strip()
 
@@ -973,8 +1056,24 @@ class SingleVariantServer:
             return req.result_text or "", req.result_metrics or {}
 
         # Direct (non-batched) generation.
+
+        # Cheap (4-bit) GSM8K accuracy tends to collapse under long few-shot prompts + greedy decoding.
+        # For CHEAP+GSM8K+accuracy, we use a compact single-example prompt and enable light,
+        # deterministic sampling (seeded inside _generate_hf_batch) to prevent repetition loops.
+        prompt_use = prompt
+        variant_eff = getattr(self, "variant_effective", self.variant)
+        if dataset_type == "gsm8k" and prompt_mode == "accuracy" and variant_eff == "cheap":
+            try:
+                prompt_use = self._build_gsm8k_compact_prompt(prompt)
+            except Exception:
+                prompt_use = prompt
+            if float(temperature or 0.0) <= 0.0:
+                temperature = 0.20
+            if float(top_p or 1.0) >= 1.0:
+                top_p = 0.90
+
         texts, metrics_list, lock_wait_ms = self._generate_hf_batch(
-            prompts=[prompt],
+            prompts=[prompt_use],
             dataset_type=dataset_type,
             max_tokens=int(max_tokens),
             prompt_mode=prompt_mode,
@@ -1010,48 +1109,60 @@ class SingleVariantServer:
                 strict, parseable = "", ""
 
             if not parseable:
-                retry_prompt = self._build_gsm8k_answer_only_prompt(prompt)
-                # A small amount of sampling can help break repetition loops in 4-bit.
-                # Keep MED deterministic (greedy) by default.
-                retry_temp = 0.25 if variant_eff == "cheap" else 0.0
-                retry_top_p = 0.9 if variant_eff == "cheap" else 1.0
-                retry_max_tokens = 48
+                # Format-only rescue ladder:
+                #  - MED: single answer-only retry (greedy) to recover occasional format drift.
+                #  - CHEAP: two short retries with deterministic sampling:
+                #      (1) answer-only, (2) fill-the-blank ending with 'FINAL_ANSWER: '.
+                attempts = []
+                if variant_eff == "cheap":
+                    attempts = [
+                        ("answer_only", self._build_gsm8k_answer_only_prompt, 0.35, 0.90, 32),
+                        ("fill_blank", self._build_gsm8k_fill_blank_prompt, 0.35, 0.90, 12),
+                    ]
+                else:
+                    attempts = [
+                        ("answer_only", self._build_gsm8k_answer_only_prompt, 0.0, 1.0, 48),
+                    ]
 
-                try:
-                    r_texts, r_metrics_list, r_lock_wait_ms = self._generate_hf_batch(
-                        prompts=[retry_prompt],
-                        dataset_type=dataset_type,
-                        max_tokens=int(retry_max_tokens),
-                        prompt_mode=prompt_mode,
-                        temperature=float(retry_temp),
-                        top_p=float(retry_top_p),
-                        require_all_final_answers=False,
-                    )
-
-                    r_text = r_texts[0]
+                for (tag, builder, r_temp, r_top_p, r_max_tokens) in attempts:
                     try:
-                        r_ok = bool(extract_gsm8k_parseable(r_text) or extract_gsm8k_strict(r_text))
+                        retry_prompt = builder(prompt)
+                        r_texts, r_metrics_list, r_lock_wait_ms = self._generate_hf_batch(
+                            prompts=[retry_prompt],
+                            dataset_type=dataset_type,
+                            max_tokens=int(r_max_tokens),
+                            prompt_mode=prompt_mode,
+                            temperature=float(r_temp),
+                            top_p=float(r_top_p),
+                            require_all_final_answers=False,
+                        )
+
+                        r_text = r_texts[0]
+                        try:
+                            r_ok = bool(extract_gsm8k_parseable(r_text) or extract_gsm8k_strict(r_text))
+                        except Exception:
+                            r_ok = False
+
+                        if r_ok:
+                            r_metrics = r_metrics_list[0]
+                            r_metrics["scheduler_wait_ms"] = 0.0
+                            r_metrics["lock_wait_ms"] = float(max(0.0, r_lock_wait_ms))
+                            r_metrics["queue_wait_ms"] = float(max(0.0, r_lock_wait_ms))
+
+                            r_metrics["format_retry"] = {
+                                "enabled": True,
+                                "reason": "gsm8k_format_failure",
+                                "variant_effective": variant_eff,
+                                "attempt": tag,
+                                "first_attempt_output_len": int(metrics.get("output_length") or 0),
+                                "first_attempt_tpot_ms": float(metrics.get("tpot_ms") or 0.0),
+                                "first_attempt_total_ms": float(metrics.get("total_latency_ms") or 0.0),
+                            }
+                            return r_text, r_metrics
                     except Exception:
-                        r_ok = False
+                        # If a retry fails for any reason, try the next attempt.
+                        continue
 
-                    if r_ok:
-                        r_metrics = r_metrics_list[0]
-                        r_metrics["scheduler_wait_ms"] = 0.0
-                        r_metrics["lock_wait_ms"] = float(max(0.0, r_lock_wait_ms))
-                        r_metrics["queue_wait_ms"] = float(max(0.0, r_lock_wait_ms))
-
-                        # Lightweight provenance for debugging/paper appendix.
-                        r_metrics["format_retry"] = {
-                            "enabled": True,
-                            "reason": "gsm8k_format_failure",
-                            "first_attempt_output_len": int(metrics.get("output_length") or 0),
-                            "first_attempt_tpot_ms": float(metrics.get("tpot_ms") or 0.0),
-                            "first_attempt_total_ms": float(metrics.get("total_latency_ms") or 0.0),
-                        }
-                        return r_text, r_metrics
-                except Exception:
-                    # If the retry fails for any reason, fall back to the original output.
-                    pass
 
         # Option A: ttft_ms already equals ttft_infer_ms for direct calls.
         return text, metrics
