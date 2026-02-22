@@ -12,10 +12,12 @@ Models:
   - Quality: per-variant logistic regression (P(correct | features))
   - Latency: per-variant ridge regression for TTFT and TPOT
 
-Features (18D):
+Features (22D):
   - dataset one-hot (gsm8k, mmlu) => 2
   - difficulty one-hot (easy, medium, hard) => 3
-  - max_tokens, sqrt(max_tokens), log1p(max_tokens), estimated_tokens => 4
+  - max_tokens, sqrt(max_tokens), log1p(max_tokens), max_tokens transforms => 3
+  - prompt_tokens: raw, sqrt, log1p => 3
+  - concurrency: raw, log1p => 2
   - queue_depth per variant (cheap, med, base): raw, sqrt, log1p => 9
 """
 
@@ -82,7 +84,8 @@ class LearnedRouter:
         dataset_type: str,
         difficulty: str,
         max_tokens: int,
-        estimated_tokens: int,
+        prompt_tokens: int,
+        concurrency: int,
         queue_depths: Dict[str, int],
     ) -> np.ndarray:
         dataset_type = (dataset_type or "").lower()
@@ -97,11 +100,19 @@ class LearnedRouter:
         diff_medium = 1.0 if difficulty == "medium" else 0.0
         diff_hard = 1.0 if difficulty == "hard" else 0.0
 
-        # input features (4)
+        # max_tokens transforms (3)
         max_tok = float(max_tokens)
         sqrt_max_tok = float(np.sqrt(max_tok))
         log_max_tok = float(np.log1p(max_tok))
-        est_tok = float(estimated_tokens)
+
+        # prompt_tokens transforms (3)
+        ptok = float(prompt_tokens)
+        sqrt_ptok = float(np.sqrt(ptok))
+        log_ptok = float(np.log1p(ptok))
+
+        # concurrency transforms (2)
+        conc = float(concurrency)
+        log_conc = float(np.log1p(conc))
 
         feats: List[float] = [
             dataset_gsm8k,
@@ -112,7 +123,11 @@ class LearnedRouter:
             max_tok,
             sqrt_max_tok,
             log_max_tok,
-            est_tok,
+            ptok,
+            sqrt_ptok,
+            log_ptok,
+            conc,
+            log_conc,
         ]
 
         # queue depths per variant (9)
@@ -159,7 +174,8 @@ class LearnedRouter:
         dataset_type: str,
         difficulty: str,
         max_tokens: int,
-        estimated_tokens: int,
+        prompt_tokens: int,
+        concurrency: int,
         queue_depths: Dict[str, int],
         slo_dict: Optional[Dict[str, Dict[str, float]]] = None,
         mode: str = "ttft",
@@ -178,7 +194,7 @@ class LearnedRouter:
         # derived total slo
         total_slo = ttft_slo + tpot_slo * float(max_tokens)
 
-        features = self.extract_features(dataset_type, difficulty, max_tokens, estimated_tokens, queue_depths)
+        features = self.extract_features(dataset_type, difficulty, max_tokens, prompt_tokens, concurrency, queue_depths)
 
         best: Optional[LearnedRouterDecision] = None
         for v in allowed:

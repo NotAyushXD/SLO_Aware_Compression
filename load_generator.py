@@ -121,6 +121,7 @@ class ClosedLoopLoadGenerator:
                     dataset_type=dataset_type,
                     difficulty=difficulty,
                     prompt_mode=self.prompt_mode,
+                    concurrency=self.max_concurrency,
                 )
             except TypeError:
                 _pred_text, inference_metrics = self.inference_func(

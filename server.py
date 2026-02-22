@@ -234,6 +234,7 @@ class _PendingRequest:
     temperature: float
     top_p: float
     enqueue_time: float
+    concurrency: int = 1
     # NOTE: In dataclasses, non-default fields must come before default fields.
     # This event is created by the scheduler for each request.
     event: threading.Event = field(default_factory=threading.Event)
@@ -1116,6 +1117,7 @@ class SingleVariantServer:
         dataset_type: str = "gsm8k",
         difficulty: str = "easy",
         prompt_mode: str = "accuracy",
+        concurrency: int = 1,
         use_batching: Optional[bool] = None,
     ) -> Tuple[str, Dict]:
         """Generate completion text plus metrics."""
@@ -1144,6 +1146,7 @@ class SingleVariantServer:
                 temperature=float(temperature),
                 top_p=float(top_p),
                 enqueue_time=time.perf_counter(),
+                concurrency=int(concurrency),
                 event=threading.Event(),
             )
             assert self._scheduler is not None
@@ -1347,6 +1350,9 @@ class SingleVariantServer:
                         continue
 
 
+        # Attach client-side concurrency hint (used for router training features).
+        metrics["concurrency"] = int(concurrency)
+
         # Option A: ttft_ms already equals ttft_infer_ms for direct calls.
         return text, metrics
 
@@ -1401,12 +1407,29 @@ def _weaker_variants(start: str, allowed: List[str]) -> List[str]:
 
 @dataclass
 class _VariantStats:
+    """Lightweight EWMA tracking for per-variant latency + contention signals.
+
+    Used by the heuristic SLO-aware router and exposed for logging/debugging.
+    """
     ema_ttft_ms: Optional[float] = None
     ema_tpot_ms: Optional[float] = None
     ema_total_ms: Optional[float] = None
+    ema_output_tokens: Optional[float] = None
+    ema_queue_wait_ms: Optional[float] = None
+    ema_lock_wait_ms: Optional[float] = None
     n: int = 0
 
-    def update(self, ttft_ms: float, tpot_ms: float, total_ms: float, alpha: float) -> None:
+    def update(
+        self,
+        ttft_ms: float,
+        tpot_ms: float,
+        total_ms: float,
+        output_tokens: int,
+        queue_wait_ms: float,
+        lock_wait_ms: float,
+        *,
+        alpha: float,
+    ) -> None:
         def _ema(prev: Optional[float], x: float) -> float:
             if prev is None:
                 return float(x)
@@ -1415,6 +1438,9 @@ class _VariantStats:
         self.ema_ttft_ms = _ema(self.ema_ttft_ms, float(ttft_ms))
         self.ema_tpot_ms = _ema(self.ema_tpot_ms, float(tpot_ms))
         self.ema_total_ms = _ema(self.ema_total_ms, float(total_ms))
+        self.ema_output_tokens = _ema(self.ema_output_tokens, float(output_tokens))
+        self.ema_queue_wait_ms = _ema(self.ema_queue_wait_ms, float(queue_wait_ms))
+        self.ema_lock_wait_ms = _ema(self.ema_lock_wait_ms, float(lock_wait_ms))
         self.n += 1
 
 
@@ -1456,6 +1482,7 @@ class _MVRequest:
     max_tokens: int
     temperature: float
     top_p: float
+    concurrency: int = 1
     enqueue_t: float
     path: List[str]
     event: threading.Event
@@ -1601,6 +1628,13 @@ class MultiVariantService:
         self._shutdown = False
         self._active_variant = None
         self._active_batches_run = 0
+        # Lightweight tokenizer for routing feature extraction (CPU-side)
+        try:
+            from transformers import AutoTokenizer
+            self._router_tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+        except Exception:
+            self._router_tokenizer = None
+
 
         self._configure_capacity_and_preload()
 
@@ -1957,7 +1991,8 @@ class MultiVariantService:
         difficulty: str,
         prompt_mode: str,
         max_tokens: int,
-        estimated_tokens: int,
+        prompt_tokens: int,
+        concurrency: int,
         queue_depths: Dict[str, int],
     ) -> Tuple[str, str, Dict[str, Any]]:
         # Returns (variant, reason, router_meta)
@@ -1997,7 +2032,8 @@ class MultiVariantService:
                 dataset_type=dataset_type,
                 difficulty=difficulty,
                 max_tokens=int(max_tokens),
-                estimated_tokens=int(estimated_tokens),
+                prompt_tokens=int(prompt_tokens),
+                concurrency=int(concurrency),
                 queue_depths=queue_depths,
                 slo_dict=self.slo_dict,
                 mode=mode,
@@ -2032,7 +2068,8 @@ class MultiVariantService:
         difficulty: str,
         prompt_mode: str,
         max_tokens: int,
-        estimated_tokens: Optional[int] = None,
+        prompt_tokens: Optional[int] = None,
+        concurrency: int = 1,
     ) -> Tuple[List[str], str, Dict[str, Any], Dict[str, int]]:
         # Snapshot queue depths at routing time
         with self._lock:
@@ -2042,7 +2079,8 @@ class MultiVariantService:
                 difficulty=difficulty,
                 prompt_mode=prompt_mode,
                 max_tokens=max_tokens,
-                estimated_tokens=estimated_tokens,
+                prompt_tokens=prompt_tokens,
+                concurrency=concurrency,
                 queue_depths=queue_depths,
             )
 
@@ -2102,7 +2140,15 @@ class MultiVariantService:
         force_variant = kwargs.pop("force_variant", None) or kwargs.pop("router_fixed_variant", None)
         force_variant = _normalize_variant(force_variant) if force_variant else None
 
-        est_tokens = len(prompt.split())
+        # Prompt length (tokens) used as a feature for learned routing.
+        prompt_tokens = 0
+        try:
+            if getattr(self, "_router_tokenizer", None) is not None:
+                prompt_tokens = int(len(self._router_tokenizer(prompt, add_special_tokens=False).input_ids))
+            else:
+                prompt_tokens = int(len(prompt.split()))
+        except Exception:
+            prompt_tokens = int(len(prompt.split()))
         if force_variant:
             with self._lock:
                 qdepths = {v: len(self._queues.get(v, deque())) for v in self.variants}
@@ -2110,7 +2156,7 @@ class MultiVariantService:
             path, reason, router_meta = [chosen], f"forced:{chosen}", {"forced_variant": chosen}
         else:
             path, reason, router_meta, qdepths = self.plan_path(
-                dataset_type, difficulty, prompt_mode, int(max_tokens), estimated_tokens=est_tokens
+                dataset_type, difficulty, prompt_mode, int(max_tokens), prompt_tokens=prompt_tokens, concurrency=int(concurrency)
             )
 
         req = _MVRequest(
@@ -2121,6 +2167,7 @@ class MultiVariantService:
             max_tokens=int(max_tokens),
             temperature=float(temperature),
             top_p=float(top_p),
+            concurrency=int(concurrency),
             enqueue_t=time.perf_counter(),
             path=path,
             event=threading.Event(),
@@ -2315,7 +2362,7 @@ class MultiVariantService:
                                 total = float(m.get("total_latency_ms", 0.0) or 0.0) - sched_wait_ms
                                 n_out = int(m.get("output_tokens", m.get("n_output_tokens", 0)) or 0)
                                 q_wait = float(m.get("queue_wait_ms", 0.0) or 0.0)
-                                st.update(ttft_infer, tpot, total, alpha=self.ema_alpha)
+                                st.update(ttft_infer, tpot, total, n_out, q_wait, float(lock_wait_ms), alpha=self.ema_alpha)
                             except Exception:
                                 pass
 

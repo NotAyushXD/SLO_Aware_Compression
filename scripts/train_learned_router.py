@@ -319,7 +319,8 @@ def _collect_traces_for_concurrency(
                 "difficulty": difficulty,
                 "prompt_mode": prompt_mode,
                 "max_tokens": int(max_new_tokens),
-                "estimated_tokens": int(len(formatted_prompt.split())),
+                "prompt_tokens": int(len(tokenizer(formatted_prompt, add_special_tokens=False).input_ids)),
+                "concurrency": int(conc),
                 "variant": variant,
                 "variant_effective": metrics.get("variant_effective", metrics.get("variant")),
                 "concurrency": int(concurrency),
@@ -341,6 +342,7 @@ def _collect_traces_for_concurrency(
                 "tpot_ms": float(metrics.get("tpot_ms", 0.0) or 0.0),
                 "total_latency_ms": float(metrics.get("total_latency_ms", 0.0) or 0.0),
                 "queue_wait_ms": float(metrics.get("queue_wait_ms", 0.0) or 0.0),
+                "lock_wait_ms": float(metrics.get("lock_wait_ms", 0.0) or 0.0),
             }
             local.append(rec)
             _append_one(rec)
@@ -388,7 +390,8 @@ def _train_predictors(
             dataset_type=r["dataset"],
             difficulty=r["difficulty"],
             max_tokens=int(r["max_tokens"]),
-            estimated_tokens=int(r["estimated_tokens"]),
+            prompt_tokens=int(r["prompt_tokens"]),
+            concurrency=int(r.get("concurrency", 1)),
             queue_depths=qds,
         )[0].tolist()
         X_by_v[v].append(feats)
@@ -491,7 +494,8 @@ def _tune_lambda_mu(
                     dataset_type=state["dataset"],
                     difficulty=state["difficulty"],
                     max_tokens=int(state["max_tokens"]),
-                    estimated_tokens=int(state["estimated_tokens"]),
+                    prompt_tokens=int(state["prompt_tokens"]),
+                    concurrency=int(state.get("concurrency", 1)),
                     queue_depths=qds,
                     slo_dict=slo_dict,
                     mode=mode,
@@ -607,6 +611,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    # Tokenizer for prompt length features (CPU-side)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
 
     processed = Path(args.processed_dir)
     train_path = processed / "train_data.jsonl"

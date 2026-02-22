@@ -107,66 +107,98 @@ def _effective_enable_batching(prompt_mode: str, enable_batching_flag: Optional[
 
 
 
+
 def _build_stratified_pool(
     examples: List[Dict[str, Any]],
     k: int,
     seed: int,
 ) -> List[Dict[str, Any]]:
-    """Return a deterministic, stratified subset of size k.
+    """Return a deterministic stratified subset of size k.
 
-    Stratification key: (dataset, difficulty). This prevents calibration/load-test runs
-    from accidentally selecting only one bucket when processed val_data.jsonl is ordered.
+    Stratification key: (dataset, difficulty) with an explicit 6-bucket target:
+      (gsm8k|mmlu) × (easy|medium|hard)
+
+    If a bucket is sparse, we take as many as available and redistribute the
+    remainder to other buckets deterministically (seeded).
     """
     if k <= 0 or (not examples):
         return list(examples)
 
-    # If k >= pool size, nothing to sample.
     if k >= len(examples):
         return list(examples)
 
-    # Group by (dataset, difficulty)
-    buckets: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    # Canonical buckets (explicit 6)
+    canonical_keys: List[Tuple[str, str]] = [
+        ("gsm8k", "easy"),
+        ("gsm8k", "medium"),
+        ("gsm8k", "hard"),
+        ("mmlu", "easy"),
+        ("mmlu", "medium"),
+        ("mmlu", "hard"),
+    ]
+
+    buckets: Dict[Tuple[str, str], List[Dict[str, Any]]] = {k: [] for k in canonical_keys}
+    extras: List[Dict[str, Any]] = []
+
     for ex in examples:
         ds = (ex.get("dataset") or "unknown").lower().strip()
         diff = (ex.get("difficulty") or "medium").lower().strip()
         key = (ds, diff)
-        buckets.setdefault(key, []).append(ex)
+        if key in buckets:
+            buckets[key].append(ex)
+        else:
+            extras.append(ex)
 
-    # Deterministic shuffle inside each bucket
     rng = random.Random(int(seed))
-    for key in buckets:
+    for key in canonical_keys:
         rng.shuffle(buckets[key])
+    rng.shuffle(extras)
 
-    # Prefer a stable bucket ordering: dataset asc, then difficulty in easy/medium/hard/other.
-    diff_order = {"easy": 0, "medium": 1, "hard": 2}
-    ordered_keys = sorted(buckets.keys(), key=lambda t: (t[0], diff_order.get(t[1], 99), t[1]))
-
-    # Equal allocation across buckets, then top-up from remaining.
-    num_buckets = max(1, len(ordered_keys))
-    base = k // num_buckets
-    rem = k % num_buckets
-
-    targets: Dict[Tuple[str, str], int] = {}
-    for i, key in enumerate(ordered_keys):
-        targets[key] = base + (1 if i < rem else 0)
+    # Start with equal targets across 6 buckets
+    base = k // len(canonical_keys)
+    rem = k % len(canonical_keys)
+    targets = {key: base for key in canonical_keys}
+    for i in range(rem):
+        targets[canonical_keys[i]] += 1
 
     selected: List[Dict[str, Any]] = []
-    for key in ordered_keys:
+    remaining_capacity: List[Tuple[str, str]] = []
+
+    # First pass: take up to target from each bucket
+    for key in canonical_keys:
         take = min(targets[key], len(buckets[key]))
-        if take > 0:
+        if take:
             selected.extend(buckets[key][:take])
             buckets[key] = buckets[key][take:]
+        # Track buckets that still have capacity for top-ups
+        if buckets[key]:
+            remaining_capacity.append(key)
 
-    # Top up if any buckets were short.
+    # Compute remaining needed
     need = k - len(selected)
     if need > 0:
-        remaining: List[Dict[str, Any]] = []
-        for key in ordered_keys:
-            remaining.extend(buckets[key])
-        rng.shuffle(remaining)
-        selected.extend(remaining[:need])
+        # Prefer to top up from canonical buckets that still have items, in a round-robin seeded order
+        rng.shuffle(remaining_capacity)
+        while need > 0 and remaining_capacity:
+            progressed = False
+            for key in list(remaining_capacity):
+                if need <= 0:
+                    break
+                if buckets[key]:
+                    selected.append(buckets[key].pop(0))
+                    need -= 1
+                    progressed = True
+                if not buckets[key]:
+                    remaining_capacity.remove(key)
+            if not progressed:
+                break
 
-    # Final deterministic shuffle so ordering doesn't bias selection.
+    # If still short (all canonical buckets exhausted), top up from extras
+    if need > 0 and extras:
+        selected.extend(extras[:need])
+        need = k - len(selected)
+
+    # Final deterministic shuffle
     rng.shuffle(selected)
     return selected[:k]
 
@@ -309,6 +341,20 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--skip_load_test", action="store_true")
     p.add_argument("--num_requests", type=int, default=20)
+
+    p.add_argument(
+        "--load_test_split",
+        type=str,
+        default="val",
+        choices=["val", "test"],
+        help="Which split to use for load testing / SLO calibration requests (default: val). Use 'test' for final paper-grade evaluation.",
+    )
+    p.add_argument(
+        "--load_test_jsonl",
+        type=str,
+        default=None,
+        help="Optional explicit JSONL path for load-test/calibration requests. Overrides --load_test_split if provided.",
+    )
     p.add_argument("--concurrencies", type=int, nargs="+", default=[1, 2, 4])
 
     p.add_argument("--skip_accuracy_eval", action="store_true")
@@ -506,11 +552,19 @@ def main() -> None:
 
     primary_key = f"p{int(args.slo_primary_percentile)}"
 
-    # Optionally build a stratified load-test/calibration pool from val_data.
-    val_pool = val_data
+    # Optionally build a stratified load-test/calibration pool from a chosen split.
+    if args.load_test_jsonl:
+        load_pool = _read_jsonl(str(args.load_test_jsonl))
+        logger.info(f"Loaded load-test pool from --load_test_jsonl: {args.load_test_jsonl} (n={len(load_pool)})")
+    else:
+        split = (args.load_test_split or "val").lower().strip()
+        load_pool = test_data if split == "test" else val_data
+        logger.info(f"Using load-test split: {split} (n={len(load_pool)})")
+
     if args.stratify_difficulty:
-        val_pool = _build_stratified_pool(val_data, k=int(args.num_requests), seed=int(args.seed))
-        _log_strata_counts("[STRATIFIED] val_pool", val_pool)
+        load_pool = _build_stratified_pool(load_pool, k=int(args.num_requests), seed=int(args.seed))
+        _log_strata_counts("[STRATIFY]", load_pool)
+
 
 
     # ------------------------------------------------------------------
@@ -532,7 +586,7 @@ def main() -> None:
             inference_func=base_server.generate,
             max_concurrency=calib_conc,
             num_requests=args.num_requests,
-            data_loader=val_pool,
+            data_loader=load_pool,
             prompt_mode=args.prompt_mode,
             seed=args.seed,
         )
@@ -558,7 +612,7 @@ def main() -> None:
         if not val_data:
             logger.warning("val_data is empty. Load tests will run against a tiny dummy pool.")
             val_data = [{"dataset": "gsm8k", "prompt": "1+1?", "answer": "2", "difficulty": "easy"}]
-            val_pool = val_data
+            load_pool = val_data
 
         for conc in args.concurrencies:
             conc = int(conc)
@@ -568,7 +622,7 @@ def main() -> None:
                 inference_func=server.generate,
                 max_concurrency=conc,
                 num_requests=args.num_requests,
-                data_loader=val_pool,
+                data_loader=load_pool,
                 prompt_mode=args.prompt_mode,
                 seed=args.seed,
             )
