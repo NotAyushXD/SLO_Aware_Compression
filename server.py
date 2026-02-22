@@ -1521,10 +1521,13 @@ class _MVRequest:
     max_tokens: int
     temperature: float
     top_p: float
-    concurrency: int = 1
     enqueue_t: float
     path: List[str]
     event: threading.Event
+
+    # Concurrency of the issuing client/load generator (used as a feature for learned routing).
+    # NOTE: This must appear *after* all non-default fields to satisfy dataclass rules.
+    concurrency: int = 1
 
     # Routing context
     router_queue_depths: Dict[str, int] = field(default_factory=dict)
@@ -2158,6 +2161,7 @@ class MultiVariantService:
         dataset_type: str = "gsm8k",
         difficulty: str = "easy",
         prompt_mode: str = "slo",
+        concurrency: int = 1,
         use_batching: bool = True,
         **kwargs,
     ) -> Tuple[str, Dict[str, Any]]:
@@ -2255,6 +2259,12 @@ class MultiVariantService:
         req.output_metrics["router_final_variant"] = req.output_metrics.get("variant")
         req.output_metrics["router_num_attempts"] = len(req.attempts)
         req.output_metrics["router_queue_depths"] = getattr(req, "router_queue_depths", {})
+
+        # Useful context for downstream analysis / learned-router feature debugging.
+        try:
+            req.output_metrics.setdefault("concurrency", int(getattr(req, "concurrency", 1)))
+        except Exception:
+            pass
         req.output_metrics["router_meta"] = getattr(req, "router_meta", {})
 
         return req.output_text or "", req.output_metrics
