@@ -687,6 +687,40 @@ class SingleVariantServer:
 
         return sorted(allowed)
 
+    def _compute_ascii_token_ids(self) -> List[int]:
+        """Token ids that decode to ASCII-only text (plus \n/\t).
+
+        This is a lightweight stabilization mechanism for CHEAP (4-bit) long-form decoding:
+        by disallowing non-ASCII tokens, we prevent the common 'multilingual gibberish'
+        collapse mode while still allowing normal English + math symbols.
+
+        Computed lazily and cached in self._ascii_token_ids.
+        """
+        allowed: List[int] = []
+        vocab_size = int(len(self.tokenizer))
+
+        for tid in range(vocab_size):
+            try:
+                s = self.tokenizer.decode([tid], skip_special_tokens=True)
+            except Exception:
+                continue
+            if not s:
+                continue
+
+            ok = True
+            for ch in s:
+                o = ord(ch)
+                if ch in ("\n", "\t"):
+                    continue
+                # printable ASCII range
+                if o < 32 or o >= 127:
+                    ok = False
+                    break
+            if ok:
+                allowed.append(tid)
+
+        return allowed
+
     def _synchronize_device(self) -> None:
         if self.device == "cuda":
             torch.cuda.synchronize()
@@ -892,6 +926,8 @@ class SingleVariantServer:
         top_p: float = 1.0,
         require_all_final_answers: bool = False,
         constrain_numeric: bool = False,
+        constrain_ascii: bool = False,
+        seed_salt: int = 0,
     ) -> Tuple[List[str], List[Dict], float]:
         """Run a single batched HF generate call.
 
@@ -958,6 +994,21 @@ class SingleVariantServer:
 
                 prefix_allowed_tokens_fn = _numeric_prefix_allowed_tokens_fn
 
+        # ASCII-only constraint (stabilization for CHEAP GSM8K long-form decoding)
+        # This prevents the 4-bit model from drifting into non-ASCII gibberish while
+        # still allowing normal English tokens (ASCII) and math symbols.
+        if constrain_ascii and prefix_allowed_tokens_fn is None:
+            allowed_ids = getattr(self, "_ascii_token_ids", None)
+            if allowed_ids is None:
+                allowed_ids = self._compute_ascii_token_ids()
+                self._ascii_token_ids = allowed_ids
+            if allowed_ids:
+
+                def _ascii_prefix_allowed_tokens_fn(_batch_id: int, _input_ids):
+                    return allowed_ids
+
+                prefix_allowed_tokens_fn = _ascii_prefix_allowed_tokens_fn
+
         # Generation kwargs
         gen_kwargs = {
             "max_new_tokens": int(max_tokens),
@@ -1003,6 +1054,7 @@ class SingleVariantServer:
                         dataset_type,
                         prompts[0],
                         str(max_tokens),
+                        str(seed_salt),
                     )
                     try:
                         torch.manual_seed(seed)
@@ -1192,55 +1244,6 @@ class SingleVariantServer:
         # and to avoid wasting time generating 256 tokens of garbage, we run a
         # short, format-first ladder up-front for CHEAP+GSM8K+accuracy.
         #
-        # This is NOT an escalation to a stronger model. It is:
-        #   - same variant
-        #   - accuracy-mode only
-        #   - focused on producing a parseable numeric answer
-        #
-        variant_eff = getattr(self, "variant_effective", self.variant)
-        if dataset_type == "gsm8k" and prompt_mode == "accuracy" and variant_eff == "cheap":
-            attempts = [
-                ("answer_only", self._build_gsm8k_answer_only_prompt, 0.35, 0.90, 32, False),
-                ("fill_blank", self._build_gsm8k_fill_blank_prompt, 0.35, 0.90, 12, False),
-                ("digits_only", self._build_gsm8k_digits_only_prompt, 0.0, 1.0, 12, True),
-            ]
-
-            for (tag, builder, r_temp, r_top_p, r_max_tokens, r_constrain_numeric) in attempts:
-                try:
-                    rescue_prompt = builder(prompt)
-                    r_texts, r_metrics_list, r_lock_wait_ms = self._generate_hf_batch(
-                        prompts=[rescue_prompt],
-                        dataset_type=dataset_type,
-                        max_tokens=int(r_max_tokens),
-                        prompt_mode=prompt_mode,
-                        temperature=float(r_temp),
-                        top_p=float(r_top_p),
-                        require_all_final_answers=False,
-                        constrain_numeric=bool(r_constrain_numeric),
-                    )
-
-                    r_text = r_texts[0]
-                    try:
-                        r_ok = bool(extract_gsm8k_parseable(r_text) or extract_gsm8k_strict(r_text))
-                    except Exception:
-                        r_ok = False
-
-                    if r_ok:
-                        r_metrics = r_metrics_list[0]
-                        r_metrics["scheduler_wait_ms"] = 0.0
-                        r_metrics["lock_wait_ms"] = float(max(0.0, r_lock_wait_ms))
-                        r_metrics["queue_wait_ms"] = float(max(0.0, r_lock_wait_ms))
-                        r_metrics["format_retry"] = {
-                            "enabled": True,
-                            "reason": "cheap_gsm8k_primary_rescue",
-                            "variant_effective": variant_eff,
-                            "attempt": tag,
-                        }
-                        return r_text, r_metrics
-                except Exception:
-                    continue
-
-
         # Cheap (4-bit) GSM8K accuracy tends to collapse under long few-shot prompts + greedy decoding.
         # For CHEAP+GSM8K+accuracy, we use a compact single-example prompt and enable light,
         # deterministic sampling (seeded inside _generate_hf_batch) to prevent repetition loops.
@@ -1256,15 +1259,52 @@ class SingleVariantServer:
             if float(top_p or 1.0) >= 1.0:
                 top_p = 0.90
 
-        texts, metrics_list, lock_wait_ms = self._generate_hf_batch(
-            prompts=[prompt_use],
-            dataset_type=dataset_type,
-            max_tokens=int(max_tokens),
-            prompt_mode=prompt_mode,
-            temperature=float(temperature),
-            top_p=float(top_p),
-            require_all_final_answers=False,
-        )
+        # For CHEAP+GSM8K+accuracy: use a small, deterministic self-consistency pass.
+        # 4-bit decoding can be brittle on long-form math; sampling a few short candidates and
+        # taking a majority vote often improves correctness while keeping behavior reproducible.
+        if dataset_type == "gsm8k" and prompt_mode == "accuracy" and variant_eff == "cheap":
+            samples = []
+            for s in range(3):
+                s_texts, s_metrics_list, s_lock_wait_ms = self._generate_hf_batch(
+                    prompts=[prompt_use],
+                    dataset_type=dataset_type,
+                    max_tokens=int(max_tokens),
+                    prompt_mode=prompt_mode,
+                    temperature=float(temperature),
+                    top_p=float(top_p),
+                    require_all_final_answers=False,
+                    constrain_ascii=True,
+                    seed_salt=int(s),
+                )
+                s_text = s_texts[0]
+                try:
+                    cand = extract_gsm8k_strict(s_text) or extract_gsm8k_parseable(s_text)
+                except Exception:
+                    cand = ""
+                samples.append((s_text, s_metrics_list[0], float(max(0.0, s_lock_wait_ms)), cand))
+
+            # Choose candidate by majority vote over extracted numbers (fall back to the first sample).
+            chosen_text, chosen_metrics, chosen_lock_wait_ms = samples[0][0], samples[0][1], samples[0][2]
+            cand_list = [c for (_, _, _, c) in samples if c]
+            if cand_list:
+                from collections import Counter
+                best = Counter(cand_list).most_common(1)[0][0]
+                for (t, m, lw, c) in samples:
+                    if c == best:
+                        chosen_text, chosen_metrics, chosen_lock_wait_ms = t, m, lw
+                        break
+
+            texts, metrics_list, lock_wait_ms = [chosen_text], [chosen_metrics], chosen_lock_wait_ms
+        else:
+            texts, metrics_list, lock_wait_ms = self._generate_hf_batch(
+                prompts=[prompt_use],
+                dataset_type=dataset_type,
+                max_tokens=int(max_tokens),
+                prompt_mode=prompt_mode,
+                temperature=float(temperature),
+                top_p=float(top_p),
+                require_all_final_answers=False,
+            )
 
         metrics = metrics_list[0]
         metrics["scheduler_wait_ms"] = 0.0
@@ -1300,16 +1340,15 @@ class SingleVariantServer:
                 attempts = []
                 if variant_eff == "cheap":
                     attempts = [
-                        ("answer_only", self._build_gsm8k_answer_only_prompt, 0.35, 0.90, 32, False),
-                        ("fill_blank", self._build_gsm8k_fill_blank_prompt, 0.35, 0.90, 12, False),
-                        ("digits_only", self._build_gsm8k_digits_only_prompt, 0.0, 1.0, 12, True),
+                        ("answer_only", self._build_gsm8k_answer_only_prompt, 0.20, 0.90, 24, True),
+                        ("fill_blank", self._build_gsm8k_fill_blank_prompt, 0.20, 0.90, 12, True),
                     ]
                 else:
                     attempts = [
                         ("answer_only", self._build_gsm8k_answer_only_prompt, 0.0, 1.0, 48, False),
                     ]
 
-                for (tag, builder, r_temp, r_top_p, r_max_tokens, r_constrain_numeric) in attempts:
+                for (tag, builder, r_temp, r_top_p, r_max_tokens, r_constrain_ascii) in attempts:
                     try:
                         retry_prompt = builder(prompt)
                         r_texts, r_metrics_list, r_lock_wait_ms = self._generate_hf_batch(
@@ -1320,7 +1359,7 @@ class SingleVariantServer:
                             temperature=float(r_temp),
                             top_p=float(r_top_p),
                             require_all_final_answers=False,
-                            constrain_numeric=bool(r_constrain_numeric),
+                            constrain_ascii=bool(r_constrain_ascii),
                         )
 
                         r_text = r_texts[0]
