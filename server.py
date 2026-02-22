@@ -458,6 +458,10 @@ class SingleVariantServer:
         # Precompute MMLU allowed ids
         self.mmlu_allowed_token_ids = self._compute_mmlu_allowed_token_ids()
         logger.info(f"MMLU allowed token ids: {len(self.mmlu_allowed_token_ids)}")
+
+        # Precompute numeric-only allowed ids (used as a GSM8K rescue path for CHEAP)
+        self.numeric_token_ids = self._compute_numeric_token_ids()
+        logger.info(f"Numeric-only allowed token ids: {len(self.numeric_token_ids)}")
         logger.info(
             f"Tokenizer loaded: {type(self.tokenizer).__name__} (chat_template={bool(getattr(self.tokenizer, 'chat_template', None))})"
         )
@@ -593,6 +597,94 @@ class SingleVariantServer:
                 seen.add(i)
                 out.append(i)
         return out
+
+    def _compute_numeric_token_ids(self) -> List[int]:
+        '''Token ids whose string forms are numeric/whitespace only.
+
+        Used for a last-resort constrained decoding path in CHEAP GSM8K when 4-bit
+        generation collapses into gibberish.
+
+        We build this once at init so per-token constraint checks are cheap.
+        '''
+
+        allowed: set[int] = set()
+
+        # Always allow EOS if available
+        try:
+            if self.tokenizer.eos_token_id is not None:
+                allowed.add(int(self.tokenizer.eos_token_id))
+        except Exception:
+            pass
+
+        # Always allow common whitespace tokens
+        for s in [" ", "\n", "\t", "\r"]:
+            try:
+                ids = self.tokenizer.encode(s, add_special_tokens=False)
+                for _id in ids:
+                    allowed.add(int(_id))
+            except Exception:
+                continue
+
+        # SentencePiece boundary marker often used by Llama tokenizers
+        allowed_chars = set("0123456789-+.,▁")
+        allowed_chars.update({"\n", "\t", "\r", " "})
+
+        # Iterate over vocabulary using convert_ids_to_tokens (fast)
+        try:
+            vocab_size = int(getattr(self.tokenizer, "vocab_size", 0) or len(self.tokenizer))
+        except Exception:
+            vocab_size = 0
+
+        if vocab_size <= 0:
+            return sorted(allowed)
+
+        specials = set(getattr(self.tokenizer, "all_special_tokens", []) or [])
+
+        for i in range(vocab_size):
+            try:
+                tok = self.tokenizer.convert_ids_to_tokens(i)
+            except Exception:
+                continue
+            if not tok:
+                continue
+            if tok in specials:
+                continue
+
+            ok = True
+            for ch in tok:
+                if ch in allowed_chars:
+                    continue
+                ok = False
+                break
+
+            if ok:
+                allowed.add(int(i))
+
+        return sorted(allowed)
+
+        specials = set(getattr(self.tokenizer, "all_special_tokens", []) or [])
+
+        for i in range(vocab_size):
+            try:
+                tok = self.tokenizer.convert_ids_to_tokens(i)
+            except Exception:
+                continue
+            if not tok:
+                continue
+            if tok in specials:
+                continue
+
+            ok = True
+            for ch in tok:
+                if ch in allowed_chars:
+                    continue
+                ok = False
+                break
+
+            if ok:
+                allowed.add(int(i))
+
+        return sorted(allowed)
 
     def _synchronize_device(self) -> None:
         if self.device == "cuda":
@@ -744,6 +836,25 @@ class SingleVariantServer:
         )
         return f"{system}\n\n{user}".strip()
 
+    @classmethod
+    def _build_gsm8k_digits_only_prompt(cls, formatted_prompt: str) -> str:
+        '''Last-resort GSM8K prompt for CHEAP: ask for digits only.
+
+        We combine this with numeric-only constrained decoding so that even if the
+        4-bit model cannot produce coherent text, it can still emit a numeric
+        answer candidate that is parseable.
+        '''
+        q = cls._extract_gsm8k_question_from_prompt(formatted_prompt)
+        system = "You are a careful math problem solver."
+        user = (
+            "Solve the problem. Output ONLY the final numeric answer.\n"
+            "No words, no units, no punctuation.\n"
+            "If the answer is an integer, output digits only.\n\n"
+            f"Problem: {q}\n"
+            "Answer:"
+        )
+        return f"{system}\n\n{user}".strip()
+
     def _warmup(self) -> None:
         logger.info("Warming up server (3 iterations, deterministic)...")
         warm_prompt = "You are a helpful assistant. Reply with a single letter: A."
@@ -779,6 +890,7 @@ class SingleVariantServer:
         temperature: float = 0.0,
         top_p: float = 1.0,
         require_all_final_answers: bool = False,
+        constrain_numeric: bool = False,
     ) -> Tuple[List[str], List[Dict], float]:
         """Run a single batched HF generate call.
 
@@ -834,6 +946,16 @@ class SingleVariantServer:
 
             def prefix_allowed_tokens_fn(_batch_id: int, _input_ids):
                 return allowed_ids
+
+        # Numeric-only constraint (used for CHEAP GSM8K rescue)
+        if constrain_numeric and dataset_type == "gsm8k":
+            allowed_ids = getattr(self, "numeric_token_ids", None)
+            if allowed_ids:
+
+                def _numeric_prefix_allowed_tokens_fn(_batch_id: int, _input_ids):
+                    return allowed_ids
+
+                prefix_allowed_tokens_fn = _numeric_prefix_allowed_tokens_fn
 
         # Generation kwargs
         gen_kwargs = {
@@ -1057,6 +1179,65 @@ class SingleVariantServer:
 
         # Direct (non-batched) generation.
 
+
+        # ------------------------------------------------------------------
+        # CHEAP GSM8K primary rescue path (format-first, same variant)
+        # ------------------------------------------------------------------
+        # Empirically, some bnb 4-bit stacks on Kaggle can produce coherent 1-token
+        # multiple-choice answers (MMLU) but collapse into gibberish on longer
+        # free-form generations (GSM8K). To keep CHEAP non-trivial (format_ok > 0)
+        # and to avoid wasting time generating 256 tokens of garbage, we run a
+        # short, format-first ladder up-front for CHEAP+GSM8K+accuracy.
+        #
+        # This is NOT an escalation to a stronger model. It is:
+        #   - same variant
+        #   - accuracy-mode only
+        #   - focused on producing a parseable numeric answer
+        #
+        variant_eff = getattr(self, "variant_effective", self.variant)
+        if dataset_type == "gsm8k" and prompt_mode == "accuracy" and variant_eff == "cheap":
+            attempts = [
+                ("answer_only", self._build_gsm8k_answer_only_prompt, 0.35, 0.90, 32, False),
+                ("fill_blank", self._build_gsm8k_fill_blank_prompt, 0.35, 0.90, 12, False),
+                ("digits_only", self._build_gsm8k_digits_only_prompt, 0.0, 1.0, 12, True),
+            ]
+
+            for (tag, builder, r_temp, r_top_p, r_max_tokens, r_constrain_numeric) in attempts:
+                try:
+                    rescue_prompt = builder(prompt)
+                    r_texts, r_metrics_list, r_lock_wait_ms = self._generate_hf_batch(
+                        prompts=[rescue_prompt],
+                        dataset_type=dataset_type,
+                        max_tokens=int(r_max_tokens),
+                        prompt_mode=prompt_mode,
+                        temperature=float(r_temp),
+                        top_p=float(r_top_p),
+                        require_all_final_answers=False,
+                        constrain_numeric=bool(r_constrain_numeric),
+                    )
+
+                    r_text = r_texts[0]
+                    try:
+                        r_ok = bool(extract_gsm8k_parseable(r_text) or extract_gsm8k_strict(r_text))
+                    except Exception:
+                        r_ok = False
+
+                    if r_ok:
+                        r_metrics = r_metrics_list[0]
+                        r_metrics["scheduler_wait_ms"] = 0.0
+                        r_metrics["lock_wait_ms"] = float(max(0.0, r_lock_wait_ms))
+                        r_metrics["queue_wait_ms"] = float(max(0.0, r_lock_wait_ms))
+                        r_metrics["format_retry"] = {
+                            "enabled": True,
+                            "reason": "cheap_gsm8k_primary_rescue",
+                            "variant_effective": variant_eff,
+                            "attempt": tag,
+                        }
+                        return r_text, r_metrics
+                except Exception:
+                    continue
+
+
         # Cheap (4-bit) GSM8K accuracy tends to collapse under long few-shot prompts + greedy decoding.
         # For CHEAP+GSM8K+accuracy, we use a compact single-example prompt and enable light,
         # deterministic sampling (seeded inside _generate_hf_batch) to prevent repetition loops.
@@ -1116,15 +1297,16 @@ class SingleVariantServer:
                 attempts = []
                 if variant_eff == "cheap":
                     attempts = [
-                        ("answer_only", self._build_gsm8k_answer_only_prompt, 0.35, 0.90, 32),
-                        ("fill_blank", self._build_gsm8k_fill_blank_prompt, 0.35, 0.90, 12),
+                        ("answer_only", self._build_gsm8k_answer_only_prompt, 0.35, 0.90, 32, False),
+                        ("fill_blank", self._build_gsm8k_fill_blank_prompt, 0.35, 0.90, 12, False),
+                        ("digits_only", self._build_gsm8k_digits_only_prompt, 0.0, 1.0, 12, True),
                     ]
                 else:
                     attempts = [
-                        ("answer_only", self._build_gsm8k_answer_only_prompt, 0.0, 1.0, 48),
+                        ("answer_only", self._build_gsm8k_answer_only_prompt, 0.0, 1.0, 48, False),
                     ]
 
-                for (tag, builder, r_temp, r_top_p, r_max_tokens) in attempts:
+                for (tag, builder, r_temp, r_top_p, r_max_tokens, r_constrain_numeric) in attempts:
                     try:
                         retry_prompt = builder(prompt)
                         r_texts, r_metrics_list, r_lock_wait_ms = self._generate_hf_batch(
@@ -1135,6 +1317,7 @@ class SingleVariantServer:
                             temperature=float(r_temp),
                             top_p=float(r_top_p),
                             require_all_final_answers=False,
+                            constrain_numeric=bool(r_constrain_numeric),
                         )
 
                         r_text = r_texts[0]
