@@ -602,6 +602,98 @@ class SingleVariantServer:
 
         self._warmup()
 
+        # ------------------------------------------------------------------
+        # CHEAP (bnb 4-bit) GSM8K stability guard
+        # ------------------------------------------------------------------
+        # Some runtime stacks can load int4 successfully but still produce
+        # unusable long-form generations (GSM8K) while passing MMLU (1-token).
+        # If this happens, baseline GSM8K format/accuracy becomes 0% and router
+        # training traces become unusable. We proactively detect this and
+        # attempt alternate 4-bit configs; if all fail, fall back to int8/fp16.
+        if self.variant_requested == "cheap" and self.device == "cuda":
+            device_map = load_kwargs.get("device_map")
+            if not self._cheap_gsm8k_smoke_test():
+                logger.warning(
+                    "CHEAP quantization failed GSM8K smoke test (2+2). Trying alternate 4-bit configs..."
+                )
+
+                alt_4bit: List[Tuple[str, BitsAndBytesConfig]] = [
+                    (
+                        "bnb_nf4_int4_dq",
+                        BitsAndBytesConfig(
+                            load_in_4bit=True,
+                            bnb_4bit_quant_type="nf4",
+                            bnb_4bit_use_double_quant=True,
+                            bnb_4bit_compute_dtype=torch.float16,
+                        ),
+                    ),
+                    (
+                        "bnb_fp4_int4",
+                        BitsAndBytesConfig(
+                            load_in_4bit=True,
+                            bnb_4bit_quant_type="fp4",
+                            bnb_4bit_use_double_quant=False,
+                            bnb_4bit_compute_dtype=torch.float16,
+                        ),
+                    ),
+                    (
+                        "bnb_fp4_int4_dq",
+                        BitsAndBytesConfig(
+                            load_in_4bit=True,
+                            bnb_4bit_quant_type="fp4",
+                            bnb_4bit_use_double_quant=True,
+                            bnb_4bit_compute_dtype=torch.float16,
+                        ),
+                    ),
+                ]
+
+                recovered = False
+                for (qname, qcfg) in alt_4bit:
+                    try:
+                        self._reload_model_with_quant(
+                            model_dtype=model_dtype,
+                            device_map=device_map,
+                            quant_config=qcfg,
+                            quantization_name=qname,
+                            variant_effective="cheap",
+                        )
+                        # Keep the existing tokenizer; re-warm and re-test.
+                        self._warmup()
+                        if self._cheap_gsm8k_smoke_test():
+                            logger.warning(f"Recovered CHEAP GSM8K stability using {qname}.")
+                            recovered = True
+                            break
+                    except Exception as e:
+                        logger.warning(f"Alt CHEAP quant config {qname} failed: {e}")
+                        continue
+
+                if not recovered:
+                    # Fall back to int8 (if available) then fp16.
+                    logger.warning(
+                        "All CHEAP 4-bit configs failed GSM8K smoke test; falling back to int8 then fp16."
+                    )
+                    try:
+                        self._reload_model_with_quant(
+                            model_dtype=model_dtype,
+                            device_map=device_map,
+                            quant_config=BitsAndBytesConfig(load_in_8bit=True),
+                            quantization_name="bnb_int8_fallback",
+                            variant_effective="med",
+                        )
+                        self._warmup()
+                        if not self._cheap_gsm8k_smoke_test():
+                            raise RuntimeError("int8 fallback still failed GSM8K smoke test")
+                    except Exception as e:
+                        logger.warning(f"Int8 fallback failed ({e}); using fp16 weights.")
+                        self._reload_model_with_quant(
+                            model_dtype=model_dtype,
+                            device_map=device_map,
+                            quant_config=None,
+                            quantization_name=str(self.dtype),
+                            variant_effective="base",
+                        )
+                        self._warmup()
+
     def _compute_mmlu_allowed_token_ids(self) -> List[int]:
         ids: List[int] = []
         for s in self.MMLU_ALLOWED_CHARS:
@@ -680,29 +772,100 @@ class SingleVariantServer:
 
         return sorted(allowed)
 
-        specials = set(getattr(self.tokenizer, "all_special_tokens", []) or [])
+    # -------------------------------
+    # CHEAP stability checks (bnb 4-bit can be unstable on some stacks)
+    # -------------------------------
 
-        for i in range(vocab_size):
+    def _cheap_gsm8k_smoke_test(self) -> bool:
+        """Quick correctness sanity check for CHEAP GSM8K decoding.
+
+        Some environments (notably certain Kaggle images / bitsandbytes builds)
+        can load 4-bit weights successfully but produce non-numeric gibberish on
+        long-form decoding. MMLU can look fine because it's 1-token constrained.
+
+        We test a tiny GSM8K-style prompt (2+2) and require a parseable '4'.
+        """
+
+        try:
+            prompt = (
+                "You are a careful math problem solver.\n\n"
+                "Compute the final numeric answer.\n"
+                "Respond with ONLY the final answer in the exact format:\n"
+                "FINAL_ANSWER: <number>\n\n"
+                "Problem: What is 2 + 2?\n"
+            )
+            texts, _metrics_list, _lw = self._generate_hf_batch(
+                prompts=[prompt],
+                dataset_type="gsm8k",
+                max_tokens=24,
+                prompt_mode="accuracy",
+                temperature=0.20,
+                top_p=0.90,
+                require_all_final_answers=False,
+                constrain_ascii=True,
+                seed_salt=999,
+            )
+            out = texts[0] if texts else ""
+            cand = ""
             try:
-                tok = self.tokenizer.convert_ids_to_tokens(i)
+                cand = extract_gsm8k_strict(out) or extract_gsm8k_parseable(out)
             except Exception:
-                continue
-            if not tok:
-                continue
-            if tok in specials:
-                continue
+                cand = ""
+            return (cand or "").strip() == "4"
+        except Exception:
+            return False
 
-            ok = True
-            for ch in tok:
-                if ch in allowed_chars:
-                    continue
-                ok = False
-                break
+    def _reload_model_with_quant(
+        self,
+        *,
+        model_dtype: Any,
+        device_map: Any,
+        quant_config: Optional[BitsAndBytesConfig],
+        quantization_name: str,
+        variant_effective: str,
+    ) -> None:
+        """Reload the HF model with a different quantization config."""
 
-            if ok:
-                allowed.add(int(i))
+        try:
+            # Free the existing model first.
+            try:
+                del self.model
+            except Exception:
+                pass
+            gc.collect()
+            if self.device == "cuda":
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
-        return sorted(allowed)
+            load_kwargs: Dict[str, Any] = {"device_map": device_map}
+            if quant_config is not None:
+                load_kwargs["quantization_config"] = quant_config
+
+            # transformers>=4.57 deprecates `torch_dtype` in favor of `dtype`.
+            try:
+                self.model = AutoModelForCausalLM.from_pretrained(self.model_name, dtype=model_dtype, **load_kwargs)
+            except TypeError:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name, torch_dtype=model_dtype, **load_kwargs
+                )
+
+            self.model.eval()
+
+            # Silence generate() warnings for deterministic decoding (do_sample=False).
+            try:
+                gcfg = getattr(self.model, "generation_config", None)
+                if gcfg is not None:
+                    gcfg.temperature = 1.0
+                    gcfg.top_p = 1.0
+            except Exception:
+                pass
+
+            self.quantization = str(quantization_name)
+            self.variant_effective = str(variant_effective)
+        except Exception as e:
+            raise RuntimeError(f"Failed to reload model with quant={quantization_name}: {e}")
 
     def _compute_ascii_token_ids(self) -> List[int]:
         """Token ids that decode to ASCII-only text (plus \n/\t).
@@ -1389,15 +1552,18 @@ class SingleVariantServer:
                 attempts = []
                 if variant_eff == "cheap":
                     attempts = [
-                        ("answer_only", self._build_gsm8k_answer_only_prompt, 0.20, 0.90, 24, True),
-                        ("fill_blank", self._build_gsm8k_fill_blank_prompt, 0.20, 0.90, 12, True),
+                        ("answer_only", self._build_gsm8k_answer_only_prompt, 0.20, 0.90, 24, True, False),
+                        ("fill_blank", self._build_gsm8k_fill_blank_prompt, 0.20, 0.90, 12, True, False),
+                        # Last-resort: digits-only prompt + numeric constrained decoding.
+                        # We cap max_new_tokens to avoid runaway long integers.
+                        ("digits_only", self._build_gsm8k_digits_only_prompt, 0.20, 0.90, 8, True, True),
                     ]
                 else:
                     attempts = [
-                        ("answer_only", self._build_gsm8k_answer_only_prompt, 0.0, 1.0, 48, False),
+                        ("answer_only", self._build_gsm8k_answer_only_prompt, 0.0, 1.0, 48, False, False),
                     ]
 
-                for (tag, builder, r_temp, r_top_p, r_max_tokens, r_constrain_ascii) in attempts:
+                for (tag, builder, r_temp, r_top_p, r_max_tokens, r_constrain_ascii, r_constrain_numeric) in attempts:
                     try:
                         retry_prompt = builder(prompt)
                         r_texts, r_metrics_list, r_lock_wait_ms = self._generate_hf_batch(
@@ -1409,11 +1575,18 @@ class SingleVariantServer:
                             top_p=float(r_top_p),
                             require_all_final_answers=False,
                             constrain_ascii=bool(r_constrain_ascii),
+                            constrain_numeric=bool(r_constrain_numeric),
                         )
 
                         r_text = r_texts[0]
                         try:
-                            r_ok = bool(extract_gsm8k_parseable(r_text) or extract_gsm8k_strict(r_text))
+                            cand = extract_gsm8k_parseable(r_text) or extract_gsm8k_strict(r_text)
+                            r_ok = bool(cand)
+                            # Guard against nonsense 30+ digit outputs from numeric-only decoding.
+                            if r_ok and tag == "digits_only":
+                                digits = re.sub(r"[^0-9]", "", str(cand))
+                                if len(digits) > 10:
+                                    r_ok = False
                         except Exception:
                             r_ok = False
 
