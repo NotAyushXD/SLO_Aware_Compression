@@ -29,6 +29,22 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("server")
 
 
+# -----------------------------------------------------------------------------
+# Cost accounting (paper-facing)
+# -----------------------------------------------------------------------------
+# These are *relative* cost multipliers used for reporting and for the learned
+# router's objective (cheaper variants should have lower multipliers).
+#
+# NOTE: This is intentionally simple and stable. If you later want a more
+# realistic cost model, you can change this to: cost_per_token = (ms/token) *
+# (GPU-$ / hour) or similar. For now we keep it unitless but consistent.
+VARIANT_COST_MULTIPLIERS: Dict[str, float] = {
+    "base": 1.0,
+    "med": 0.6,
+    "cheap": 0.3,
+}
+
+
 def _resolve_dtype(requested: str, device: str) -> str:
     """Resolve "auto" into an explicit dtype where it materially helps."""
 
@@ -372,6 +388,7 @@ class _BatchingScheduler:
                 # queue_wait_ms is used by load_generator to compute total queueing.
                 m["queue_wait_ms"] = float(max(0.0, scheduler_wait_ms + float(lock_wait_ms)))
                 m["queue_depth_at_submit"] = int(getattr(r, "queue_depth_at_submit", 0))
+                m["concurrency"] = int(getattr(r, "concurrency", 1))
 
                 # ------------------------------------------------------------------
                 # Option A (paper definition): queue-inclusive TTFT
@@ -959,6 +976,20 @@ class SingleVariantServer:
         t_after_inputs = time.perf_counter()
         prompt_len = int(inputs["input_ids"].shape[1])
 
+        # Per-sample prompt token counts (exclude padding). This is useful for
+        # (1) paper cost accounting and (2) router feature logging.
+        prompt_tokens_list: List[int] = []
+        try:
+            attn = inputs.get("attention_mask")
+            if attn is None:
+                prompt_tokens_list = [int(prompt_len)] * int(bsz)
+            elif attn.ndim == 2:
+                prompt_tokens_list = [int(attn[i].sum().item()) for i in range(int(bsz))]
+            else:
+                prompt_tokens_list = [int(prompt_len)] * int(bsz)
+        except Exception:
+            prompt_tokens_list = [int(prompt_len)] * int(bsz)
+
         # Decoding strategy
         do_sample = bool(prompt_mode != "slo" and temperature and float(temperature) > 0.0)
 
@@ -1115,14 +1146,28 @@ class SingleVariantServer:
 
         tokenize_ms = float(max(0.0, (t_after_inputs - t0_total) * 1000.0))
 
+        # Cost accounting (unitless multipliers). We attach both the multiplier
+        # and a token-weighted "cost_units" so downstream reports can compute
+        # total cost / cost-per-good-output.
+        variant_eff = getattr(self, "variant_effective", self.variant)
+        cost_mult = float(VARIANT_COST_MULTIPLIERS.get(str(variant_eff), 1.0))
+
         metrics_list: List[Dict] = []
-        for out_len, raw_text, postprocessed, postprocess_candidate in zip(out_lens, raw_texts, postprocessed_flags, postprocess_candidates):
+        for out_len, raw_text, postprocessed, postprocess_candidate, prompt_tokens in zip(
+            out_lens,
+            raw_texts,
+            postprocessed_flags,
+            postprocess_candidates,
+            prompt_tokens_list,
+        ):
             if out_len <= 1:
                 tpot_ms = 0.0
             else:
                 tpot_ms = (decode_s * 1000.0) / float(out_len - 1)
 
             throughput = (float(out_len) / total_gen_time) if total_gen_time > 0 else 0.0
+            total_tokens = int(max(0, int(prompt_tokens))) + int(max(0, int(out_len)))
+            cost_units = float(cost_mult) * float(total_tokens)
 
             metrics_list.append(
                 {
@@ -1141,9 +1186,13 @@ class SingleVariantServer:
                     "ttft_ms": float(ttft_infer_s * 1000.0),
                     "tpot_ms": float(tpot_ms),
                     "output_length": int(out_len),
+                    "prompt_tokens": int(prompt_tokens),
+                    "total_tokens": int(total_tokens),
                     "throughput_tokens_per_sec": float(throughput),
                     "total_latency_ms": float(total_latency_s * 1000.0),
                     "tokenize_ms": tokenize_ms,
+                    "cost_multiplier": float(cost_mult),
+                    "cost_units": float(cost_units),
                     # queue_wait_ms / scheduler_wait_ms filled by caller
                     "variant": self.variant,
                     "variant_effective": getattr(self, "variant_effective", self.variant),
@@ -1525,8 +1574,8 @@ class _MVRequest:
     path: List[str]
     event: threading.Event
 
-    # Concurrency of the issuing client/load generator (used as a feature for learned routing).
-    # NOTE: This must appear *after* all non-default fields to satisfy dataclass rules.
+    # Client-side offered-load hint (used for learned router features/logging).
+    # Must come *after* non-default fields for dataclass correctness.
     concurrency: int = 1
 
     # Routing context
@@ -2161,13 +2210,20 @@ class MultiVariantService:
         dataset_type: str = "gsm8k",
         difficulty: str = "easy",
         prompt_mode: str = "slo",
-        concurrency: int = 1,
         use_batching: bool = True,
         **kwargs,
     ) -> Tuple[str, Dict[str, Any]]:
         dataset_type = dataset_type.lower()
         difficulty = (difficulty or "easy").lower()
         prompt_mode = (prompt_mode or "slo").lower()
+
+        # Offered-load hint (from the closed-loop load generator). Used only as a
+        # routing feature + for logging. Keep a sane default.
+        try:
+            concurrency = int(kwargs.pop("concurrency", 1) or 1)
+        except Exception:
+            concurrency = 1
+        concurrency = max(1, int(concurrency))
 
         # Align max_tokens with SingleVariantServer defaults
         if max_tokens is None:
@@ -2199,7 +2255,12 @@ class MultiVariantService:
             path, reason, router_meta = [chosen], f"forced:{chosen}", {"forced_variant": chosen}
         else:
             path, reason, router_meta, qdepths = self.plan_path(
-                dataset_type, difficulty, prompt_mode, int(max_tokens), prompt_tokens=prompt_tokens, concurrency=int(concurrency)
+                dataset_type,
+                difficulty,
+                prompt_mode,
+                int(max_tokens),
+                prompt_tokens=prompt_tokens,
+                concurrency=int(concurrency),
             )
 
         req = _MVRequest(
@@ -2259,13 +2320,8 @@ class MultiVariantService:
         req.output_metrics["router_final_variant"] = req.output_metrics.get("variant")
         req.output_metrics["router_num_attempts"] = len(req.attempts)
         req.output_metrics["router_queue_depths"] = getattr(req, "router_queue_depths", {})
-
-        # Useful context for downstream analysis / learned-router feature debugging.
-        try:
-            req.output_metrics.setdefault("concurrency", int(getattr(req, "concurrency", 1)))
-        except Exception:
-            pass
         req.output_metrics["router_meta"] = getattr(req, "router_meta", {})
+        req.output_metrics["concurrency"] = int(concurrency)
 
         return req.output_text or "", req.output_metrics
 
@@ -2378,6 +2434,7 @@ class MultiVariantService:
                     m["scheduler_wait_ms"] = sched_wait_ms
                     m["lock_wait_ms"] = float(lock_wait_ms)
                     m["queue_wait_ms"] = sched_wait_ms + float(lock_wait_ms)
+                    m["concurrency"] = int(getattr(r, "concurrency", 1))
 
                     # TTFT includes scheduler wait (paper Option A)
                     try:

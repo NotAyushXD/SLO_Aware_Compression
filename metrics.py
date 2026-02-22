@@ -133,7 +133,9 @@ class MetricsCalculator:
         e2e_p = self.calculate_percentiles(e2e_values)
         queue_p = self.calculate_percentiles(queue_values)
 
+        # ------------------------------------------------------------------
         # Throughput: total output tokens / wall time from first submit to last completion.
+        # ------------------------------------------------------------------
         if self.metrics:
             first_submit = min(float(getattr(m, "submit_time", time.time())) for m in self.metrics)
             last_complete = max(float(getattr(m, "end_time", time.time())) for m in self.metrics)
@@ -158,13 +160,122 @@ class MetricsCalculator:
             and bool(getattr(m, 'inference_metrics', {}).get('router_escalated', False))
         )
         escalation_rate = float(escalations) / max(successful, 1)
-# SLO compliance
+
+        # ------------------------------------------------------------------
+        # SLO compliance + Goodput + Quality + Cost
+        # ------------------------------------------------------------------
+        # Helpers for backward compatibility with older logs.
+        def _inf(m) -> Dict:
+            return getattr(m, "inference_metrics", {}) or {}
+
+        def _variant_cost_multiplier(inf: Dict) -> float:
+            # Prefer server-reported multiplier if present.
+            try:
+                if "cost_multiplier" in inf and inf["cost_multiplier"] is not None:
+                    return float(inf["cost_multiplier"])
+            except Exception:
+                pass
+
+            v = (inf.get("variant_effective") or inf.get("variant") or "base")
+            v = str(v).lower().strip()
+            # Use the learned router's cost table if available.
+            try:
+                from learned_router import LearnedRouter
+
+                return float(LearnedRouter.VARIANT_COSTS.get(v, 1.0))
+            except Exception:
+                # Fallback: keep in sync with learned_router.py
+                return {"base": 1.0, "med": 0.6, "cheap": 0.3}.get(v, 1.0)
+
+        def _cost_units(inf: Dict) -> float:
+            # Prefer server-reported cost units if present.
+            try:
+                if "cost_units" in inf and inf["cost_units"] is not None:
+                    return float(inf["cost_units"])
+            except Exception:
+                pass
+
+            cm = _variant_cost_multiplier(inf)
+            total_tokens = inf.get("total_tokens")
+            if total_tokens is None:
+                pt = int(inf.get("prompt_tokens", 0) or 0)
+                ot = int(inf.get("output_length", inf.get("output_tokens", 0)) or 0)
+                total_tokens = pt + ot
+                if total_tokens <= 0:
+                    total_tokens = ot
+            try:
+                return float(cm) * float(total_tokens)
+            except Exception:
+                return 0.0
+
+        # Quality (strict primary + parseable sensitivity)
+        correct_all = 0
+        correct_parseable_all = 0
+        format_ok_all = 0
+        format_ok_parseable_all = 0
+
+        correct_success = 0
+        correct_parseable_success = 0
+        format_ok_success = 0
+        format_ok_parseable_success = 0
+
+        # Goodput (SLO-compliant throughput)
+        goodput_out_tokens = 0
+        goodput_req = 0
+        qa_goodput_out_tokens = 0
+        qa_goodput_req = 0
+        qa_goodput_out_tokens_parseable = 0
+
+        # Cost
+        total_cost_units = 0.0
+        total_cost_units_slo_ok = 0.0
+        total_cost_units_qa_ok = 0.0
+        cost_mult_sum = 0.0
+        cost_mult_count = 0
+        total_tokens_sum = 0
+
+        # SLO compliance
         slo_ok = 0
         slo_viol = 0
         viol_details = []
 
         for m in self.metrics:
-            if not getattr(m, "success", False):
+            inf = _inf(m)
+
+            # Quality signals (if present)
+            try:
+                c = int(inf.get("correct", 0) or 0)
+                cp = int(inf.get("correct_parseable", 0) or 0)
+                f = int(inf.get("format_ok", 0) or 0)
+                fp = int(inf.get("format_ok_parseable", 0) or 0)
+            except Exception:
+                c, cp, f, fp = 0, 0, 0, 0
+
+            correct_all += int(c)
+            correct_parseable_all += int(cp)
+            format_ok_all += int(f)
+            format_ok_parseable_all += int(fp)
+
+            is_success = bool(getattr(m, "success", False))
+            if is_success:
+                correct_success += int(c)
+                correct_parseable_success += int(cp)
+                format_ok_success += int(f)
+                format_ok_parseable_success += int(fp)
+
+                # Cost accounting (success-only)
+                cm = _variant_cost_multiplier(inf)
+                cu = _cost_units(inf)
+                total_cost_units += float(cu)
+                cost_mult_sum += float(cm)
+                cost_mult_count += 1
+                try:
+                    total_tokens_sum += int(inf.get("total_tokens", 0) or 0)
+                except Exception:
+                    pass
+
+            # SLO compliance + goodput
+            if not is_success:
                 slo_viol += 1
                 continue
 
@@ -176,9 +287,27 @@ class MetricsCalculator:
 
             ttft_ok = ttft <= float(slo.get("ttft_ms", 0.0) or 0.0)
             tpot_ok = tpot <= float(slo.get("tpot_ms", 0.0) or 0.0)
+            slo_pass = bool(ttft_ok and tpot_ok)
 
-            if ttft_ok and tpot_ok:
+            out_toks = int(inf.get("output_length", inf.get("output_tokens", 0)) or 0)
+            if slo_pass:
                 slo_ok += 1
+                goodput_req += 1
+                goodput_out_tokens += max(0, int(out_toks))
+
+                # Cost restricted to SLO-compliant requests (success-only).
+                total_cost_units_slo_ok += float(_cost_units(inf))
+
+                # Quality-adjusted goodput (strict primary)
+                if int(c) == 1:
+                    qa_goodput_req += 1
+                    qa_goodput_out_tokens += max(0, int(out_toks))
+                    total_cost_units_qa_ok += float(_cost_units(inf))
+
+                # Quality-adjusted goodput (parseable sensitivity)
+                if int(cp) == 1:
+                    qa_goodput_out_tokens_parseable += max(0, int(out_toks))
+
             else:
                 slo_viol += 1
                 viol_details.append(
@@ -196,6 +325,31 @@ class MetricsCalculator:
 
         slo_compliance = slo_ok / max(successful, 1)
 
+        # Goodput + quality-adjusted goodput
+        goodput_tokens_per_sec = float(goodput_out_tokens) / max(float(total_duration), 1e-9)
+        goodput_requests_per_sec = float(goodput_req) / max(float(total_duration), 1e-9)
+        qa_goodput_tokens_per_sec = float(qa_goodput_out_tokens) / max(float(total_duration), 1e-9)
+        qa_goodput_requests_per_sec = float(qa_goodput_req) / max(float(total_duration), 1e-9)
+        qa_goodput_tokens_per_sec_parseable = float(qa_goodput_out_tokens_parseable) / max(float(total_duration), 1e-9)
+
+        # Accuracy under load
+        accuracy_all = float(correct_all) / max(total_requests, 1)
+        accuracy_success = float(correct_success) / max(successful, 1)
+        accuracy_parseable_all = float(correct_parseable_all) / max(total_requests, 1)
+        accuracy_parseable_success = float(correct_parseable_success) / max(successful, 1)
+
+        # Accuracy conditional on SLO compliance (success-only)
+        accuracy_slo_success = float(qa_goodput_req) / max(goodput_req, 1)
+
+        # Cost summaries
+        avg_cost_multiplier = float(cost_mult_sum) / max(cost_mult_count, 1)
+        token_weighted_cost_multiplier = (
+            float(total_cost_units) / max(float(total_tokens_sum), 1.0) if total_tokens_sum > 0 else float(avg_cost_multiplier)
+        )
+        cost_units_per_sec = float(total_cost_units) / max(float(total_duration), 1e-9)
+        cost_per_goodput_token = float(total_cost_units) / max(float(goodput_out_tokens), 1.0)
+        cost_per_qa_goodput_token = float(total_cost_units) / max(float(qa_goodput_out_tokens), 1.0)
+
         return {
             "summary": {
                 "total_requests": total_requests,
@@ -208,6 +362,30 @@ class MetricsCalculator:
                 "escalation_rate": float(escalation_rate),
                 "total_duration_sec": float(total_duration),
                 "throughput_tokens_per_sec": float(throughput),
+                # Goodput (SLO-compliant throughput)
+                "goodput_tokens_per_sec": float(goodput_tokens_per_sec),
+                "goodput_requests_per_sec": float(goodput_requests_per_sec),
+                # Quality-adjusted goodput (strict primary)
+                "quality_adjusted_goodput_tokens_per_sec": float(qa_goodput_tokens_per_sec),
+                "quality_adjusted_goodput_requests_per_sec": float(qa_goodput_requests_per_sec),
+                # Quality-adjusted goodput (parseable sensitivity)
+                "quality_adjusted_goodput_tokens_per_sec_parseable": float(qa_goodput_tokens_per_sec_parseable),
+                # Accuracy under load (strict primary)
+                "accuracy_all": float(accuracy_all),
+                "accuracy_success": float(accuracy_success),
+                "accuracy_slo_compliant_success": float(accuracy_slo_success),
+                # Accuracy under load (parseable sensitivity)
+                "accuracy_parseable_all": float(accuracy_parseable_all),
+                "accuracy_parseable_success": float(accuracy_parseable_success),
+                # Cost accounting
+                "avg_cost_multiplier": float(avg_cost_multiplier),
+                "token_weighted_cost_multiplier": float(token_weighted_cost_multiplier),
+                "total_cost_units": float(total_cost_units),
+                "cost_units_per_sec": float(cost_units_per_sec),
+                "total_cost_units_slo_compliant": float(total_cost_units_slo_ok),
+                "total_cost_units_quality_adjusted": float(total_cost_units_qa_ok),
+                "cost_per_goodput_token": float(cost_per_goodput_token),
+                "cost_per_quality_adjusted_goodput_token": float(cost_per_qa_goodput_token),
             },
             "ttft": {
                 "p50": ttft_p.p50,
@@ -263,9 +441,25 @@ class MetricsCalculator:
         print(f"  Success Rate:          {s['success_rate']*100:6.2f}%")
         print(f"  Total Duration:        {s['total_duration_sec']:6.2f} seconds")
         print(f"  Throughput:            {s['throughput_tokens_per_sec']:6.1f} tokens/sec")
+        print(f"  Goodput (SLO OK):       {s.get('goodput_tokens_per_sec', 0.0):6.1f} tokens/sec")
+        print(f"  QA Goodput (SLO+Acc):   {s.get('quality_adjusted_goodput_tokens_per_sec', 0.0):6.1f} tokens/sec")
         print(f"  SLO Compliance:        {s['slo_compliance']*100:6.2f}%")
         print(f"  SLO Violations:        {s['slo_violations']:6d}")
         print(f"  Escalation Rate:       {s['escalation_rate']*100:6.2f}%")
+
+        # Quality under load (if computed by load_generator)
+        if 'accuracy_success' in s:
+            print(f"  Accuracy (success):    {s.get('accuracy_success', 0.0)*100:6.2f}%")
+            print(f"  Accuracy (SLO OK):     {s.get('accuracy_slo_compliant_success', 0.0)*100:6.2f}%")
+            print(f"  Acc (parseable, succ): {s.get('accuracy_parseable_success', 0.0)*100:6.2f}%")
+
+        # Cost accounting (unitless multipliers)
+        if 'avg_cost_multiplier' in s:
+            print(f"  Avg Cost Multiplier:   {s.get('avg_cost_multiplier', 0.0):6.3f}  (req-avg)")
+            print(f"  Token-Wt Cost Mult:    {s.get('token_weighted_cost_multiplier', 0.0):6.3f}  (token-avg)")
+            print(f"  Cost Units / sec:      {s.get('cost_units_per_sec', 0.0):6.1f}")
+            print(f"  Cost / Goodput token:  {s.get('cost_per_goodput_token', 0.0):6.3f}")
+            print(f"  Cost / QA token:       {s.get('cost_per_quality_adjusted_goodput_token', 0.0):6.3f}")
 
         print("\nTTFT (Time-to-First-Token) in milliseconds:")
         for k in ("p50", "p75", "p90", "p95", "p99"):

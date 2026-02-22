@@ -21,6 +21,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from prompt_templates import build_llama_formatted_prompt
+from evaluation import EvaluationMetrics
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -131,6 +132,31 @@ class ClosedLoopLoadGenerator:
                     difficulty=difficulty,
                 )
 
+            # ----------------------------
+            # Online quality signals (paper-facing): correctness + format adherence
+            # ----------------------------
+            # This enables joint latency/quality analysis under load, and supports
+            # metrics like "quality-adjusted goodput".
+            try:
+                truth = ex.get("answer", "")
+                ok, extracted, fmt_ok = EvaluationMetrics.is_correct(_pred_text, str(truth), dataset_type)
+                ok_p, extracted_p, fmt_ok_p = EvaluationMetrics.is_correct_parseable(_pred_text, str(truth), dataset_type)
+                inference_metrics.update(
+                    {
+                        # strict (paper primary)
+                        "correct": int(bool(ok)),
+                        "format_ok": int(bool(fmt_ok)),
+                        "extracted_answer": extracted,
+                        # parseable (sensitivity)
+                        "correct_parseable": int(bool(ok_p)),
+                        "format_ok_parseable": int(bool(fmt_ok_p)),
+                        "extracted_answer_parseable": extracted_p,
+                    }
+                )
+            except Exception:
+                # Never fail the load generator due to evaluation quirks.
+                pass
+
         except Exception as e:
             inference_metrics = {
                 "success": False,
@@ -141,6 +167,10 @@ class ClosedLoopLoadGenerator:
                 "throughput_tokens_per_sec": 0.0,
                 "queue_wait_ms": 0.0,
                 "total_latency_ms": 0.0,
+                "correct": 0,
+                "format_ok": 0,
+                "correct_parseable": 0,
+                "format_ok_parseable": 0,
             }
 
         worker_end_time = time.time()

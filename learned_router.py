@@ -32,39 +32,6 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 
-# Must match LearnedRouter.extract_features() exactly.
-FEATURE_NAMES: List[str] = [
-    # dataset one-hot (2)
-    "dataset_gsm8k",
-    "dataset_mmlu",
-    # difficulty one-hot (3)
-    "diff_easy",
-    "diff_medium",
-    "diff_hard",
-    # max_tokens transforms (3)
-    "max_tokens",
-    "sqrt_max_tokens",
-    "log1p_max_tokens",
-    # prompt_tokens transforms (3)
-    "prompt_tokens",
-    "sqrt_prompt_tokens",
-    "log1p_prompt_tokens",
-    # concurrency transforms (2)
-    "concurrency",
-    "log1p_concurrency",
-    # queue-depth transforms per variant (3 * 3 = 9)
-    "qd_cheap",
-    "sqrt_qd_cheap",
-    "log1p_qd_cheap",
-    "qd_med",
-    "sqrt_qd_med",
-    "log1p_qd_med",
-    "qd_base",
-    "sqrt_qd_base",
-    "log1p_qd_base",
-]
-
-
 @dataclass
 class LearnedRouterDecision:
     variant: str
@@ -270,11 +237,22 @@ class LearnedRouter:
             pickle.dump(self.tpot_models, f)
         with open(os.path.join(out_dir, "weights.json"), "w") as f:
             json.dump({"lambda_slo": self.lambda_slo, "mu_quality": self.mu_quality}, f, indent=2)
-        meta: Dict[str, Any] = {
-            "feature_dim": int(len(FEATURE_NAMES)),
-            "feature_names": FEATURE_NAMES,
-            "variants": ["cheap", "med", "base"],
-        }
+        # Keep metadata consistent with the actual feature extractor.
+        try:
+            feature_dim = int(
+                self.extract_features(
+                    dataset_type="gsm8k",
+                    difficulty="easy",
+                    max_tokens=1,
+                    prompt_tokens=1,
+                    concurrency=1,
+                    queue_depths={"cheap": 0, "med": 0, "base": 0},
+                ).shape[1]
+            )
+        except Exception:
+            feature_dim = 22
+
+        meta: Dict[str, Any] = {"feature_dim": int(feature_dim), "variants": ["cheap", "med", "base"]}
         if extra_metadata:
             meta["extra_metadata"] = extra_metadata
         with open(os.path.join(out_dir, "metadata.json"), "w") as f:

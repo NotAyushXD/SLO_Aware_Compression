@@ -29,7 +29,6 @@ if str(_ROOT) not in sys.path:
 
 import argparse
 import json
-import math
 import os
 import random
 import time
@@ -38,15 +37,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from sklearn.linear_model import LogisticRegression, Ridge
-from sklearn.metrics import accuracy_score, mean_absolute_error, mean_squared_error, roc_auc_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from transformers import AutoTokenizer
 
 from evaluation import EvaluationMetrics
 from learned_router import LearnedRouter
 from prompt_templates import build_llama_formatted_prompt
 from server import MultiVariantService
+from transformers import AutoTokenizer
 
 
 def _read_jsonl(path: str) -> List[Dict[str, Any]]:
@@ -227,7 +225,7 @@ def _collect_traces_for_concurrency(
     variants: List[str],
     prompt_mode: str,
     seed: int,
-    tokenizer: Any,
+    tokenizer,
     skip_keys: Optional[set] = None,
     time_budget_s: float = 0.0,
     append_path: Optional[str] = None,
@@ -307,8 +305,8 @@ def _collect_traces_for_concurrency(
                 dataset_type=dataset_type,
                 difficulty=difficulty,
                 prompt_mode=prompt_mode,
-                concurrency=int(concurrency),
                 force_variant=variant,
+                concurrency=int(concurrency),
             )
 
             truth = ex.get("answer", "")
@@ -324,9 +322,7 @@ def _collect_traces_for_concurrency(
                 "difficulty": difficulty,
                 "prompt_mode": prompt_mode,
                 "max_tokens": int(max_new_tokens),
-                "prompt_tokens": int(len(tokenizer(formatted_prompt, add_special_tokens=False).input_ids))
-                if tokenizer is not None
-                else int(len(formatted_prompt.split())),
+                "prompt_tokens": int(len(tokenizer(formatted_prompt, add_special_tokens=False).input_ids)),
                 "variant": variant,
                 "variant_effective": metrics.get("variant_effective", metrics.get("variant")),
                 "concurrency": int(concurrency),
@@ -447,90 +443,6 @@ def _train_predictors(
     return quality_models, ttft_models, tpot_models
 
 
-def _evaluate_predictors(
-    *,
-    records: List[Dict[str, Any]],
-    variants: List[str],
-    quality_models: Dict[str, Any],
-    ttft_models: Dict[str, Any],
-    tpot_models: Dict[str, Any],
-    split_name: str,
-) -> Dict[str, Any]:
-    """Compute lightweight predictor diagnostics.
-
-    These are not used for model selection; they are printed/saved to help debug
-    collection quality and feature/label issues.
-    """
-
-    out: Dict[str, Any] = {"split": split_name, "by_variant": {}}
-    for v in variants:
-        rows = [r for r in records if str(r.get("variant")) == v and bool(r.get("success", 1))]
-        if not rows:
-            out["by_variant"][v] = {"n": 0}
-            continue
-
-        X = []
-        yq = []
-        yttft = []
-        ytpot = []
-        for r in rows:
-            qds = r.get("queue_depths") or {}
-            feats = LearnedRouter.extract_features(
-                dataset_type=r.get("dataset", "gsm8k"),
-                difficulty=r.get("difficulty", "easy"),
-                max_tokens=int(r.get("max_tokens", 0) or 0),
-                prompt_tokens=int(r.get("prompt_tokens", 0) or 0),
-                concurrency=int(r.get("concurrency", 1) or 1),
-                queue_depths=qds,
-            )[0].tolist()
-            X.append(feats)
-            yq.append(int(r.get("correct", 0) or 0))
-            yttft.append(float(r.get("ttft_ms", 0.0) or 0.0))
-            ytpot.append(float(r.get("tpot_ms", 0.0) or 0.0))
-
-        X_np = np.array(X, dtype=float)
-        yq_np = np.array(yq, dtype=int)
-        yttft_np = np.array(yttft, dtype=float)
-        ytpot_np = np.array(ytpot, dtype=float)
-
-        # Quality
-        qm = quality_models[v]
-        try:
-            probs = qm.predict_proba(X_np)[:, 1]
-        except Exception:
-            probs = qm.predict(X_np)
-        preds = (probs >= 0.5).astype(int)
-
-        q_acc = float(accuracy_score(yq_np, preds))
-        q_pos_rate = float(np.mean(yq_np))
-        try:
-            q_auc = float(roc_auc_score(yq_np, probs)) if len(set(yq_np.tolist())) > 1 else None
-        except Exception:
-            q_auc = None
-
-        # Latency
-        tt_pred = np.array(ttft_models[v].predict(X_np), dtype=float)
-        tp_pred = np.array(tpot_models[v].predict(X_np), dtype=float)
-
-        tt_mae = float(mean_absolute_error(yttft_np, tt_pred))
-        tp_mae = float(mean_absolute_error(ytpot_np, tp_pred))
-        tt_rmse = float(math.sqrt(mean_squared_error(yttft_np, tt_pred)))
-        tp_rmse = float(math.sqrt(mean_squared_error(ytpot_np, tp_pred)))
-
-        out["by_variant"][v] = {
-            "n": int(len(rows)),
-            "quality_pos_rate": q_pos_rate,
-            "quality_acc@0.5": q_acc,
-            "quality_auc": q_auc,
-            "ttft_mae": tt_mae,
-            "ttft_rmse": tt_rmse,
-            "tpot_mae": tp_mae,
-            "tpot_rmse": tp_rmse,
-        }
-
-    return out
-
-
 def _group_by_example(records: List[Dict[str, Any]], variants: List[str]) -> Dict[int, Dict[str, Dict[str, Any]]]:
     grouped: Dict[int, Dict[str, Dict[str, Any]]] = {}
     for r in records:
@@ -553,24 +465,21 @@ def _tune_lambda_mu(
     val_grouped: Dict[int, Dict[str, Dict[str, Any]]],
     slo_dict: Dict[str, Dict[str, float]],
     variants: List[str],
-    target_slo_compliance: float = 0.0,
-) -> Tuple[float, float, Dict[str, Any], List[Dict[str, Any]]]:
-    """Grid-search lambda/mu on VAL only.
-
-    Returns:
-      (best_lambda, best_mu, best_stats, full_grid)
-    """
+) -> Tuple[float, float, Dict[str, Any]]:
+    """Grid-search lambda/mu on VAL only."""
 
     lambdas = [0.1, 0.3, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0]
     mus = [0.1, 0.3, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0]
 
-    grid: List[Dict[str, Any]] = []
+    best_loss: Optional[float] = None
+    best_stats: Dict[str, Any] = {}
 
     for lam in lambdas:
         for mu in mus:
             router.lambda_slo = float(lam)
             router.mu_quality = float(mu)
 
+            total_loss = 0.0
             n = 0
             correct = 0
             slo_ok = 0
@@ -614,6 +523,10 @@ def _tune_lambda_mu(
                 is_correct = bool(true.get("correct", 0))
                 cost = float(router.VARIANT_COSTS.get(chosen, 1.0))
 
+                # Loss: prioritize meeting SLO, then correctness, then cost.
+                loss = (1.0 if violation else 0.0) + 0.5 * (0.0 if is_correct else 1.0) + 0.1 * cost
+
+                total_loss += loss
                 n += 1
                 correct += int(is_correct)
                 slo_ok += int(not violation)
@@ -622,52 +535,21 @@ def _tune_lambda_mu(
             if n == 0:
                 continue
 
-            stats = {
-                "accuracy": float(correct / n),
-                "slo_compliance": float(slo_ok / n),
-                "avg_cost": float(cost_sum / n),
-                "lambda": float(lam),
-                "mu": float(mu),
-            }
-            grid.append(stats)
+            avg_loss = total_loss / n
+            if best_loss is None or avg_loss < best_loss:
+                best_loss = avg_loss
+                best_stats = {
+                    "avg_loss": float(avg_loss),
+                    "accuracy": float(correct / n),
+                    "slo_compliance": float(slo_ok / n),
+                    "avg_cost": float(cost_sum / n),
+                    "lambda": float(lam),
+                    "mu": float(mu),
+                }
 
-    if not grid:
+    if best_loss is None:
         raise RuntimeError("No validation examples available for tuning.")
-
-    target = float(target_slo_compliance or 0.0)
-    if target > 0.0:
-        eligible = [s for s in grid if float(s.get("slo_compliance", 0.0)) >= target]
-        if eligible:
-            best = max(eligible, key=lambda s: (float(s["accuracy"]), float(s["slo_compliance"]), -float(s["avg_cost"])))
-            best = dict(best)
-            best["selection"] = {
-                "rule": "compliance_first_then_accuracy",
-                "target_slo_compliance": target,
-                "eligible": len(eligible),
-                "total": len(grid),
-            }
-            return float(best["lambda"]), float(best["mu"]), best, grid
-
-        # Fallback: no config meets target → maximize compliance, then accuracy, then lower cost.
-        best = max(grid, key=lambda s: (float(s["slo_compliance"]), float(s["accuracy"]), -float(s["avg_cost"])))
-        best = dict(best)
-        best["selection"] = {
-            "rule": "fallback_max_compliance",
-            "target_slo_compliance": target,
-            "eligible": 0,
-            "total": len(grid),
-        }
-        return float(best["lambda"]), float(best["mu"]), best, grid
-
-    # Default: maximize compliance, then accuracy, then lower cost.
-    best = max(grid, key=lambda s: (float(s["slo_compliance"]), float(s["accuracy"]), -float(s["avg_cost"])))
-    best = dict(best)
-    best["selection"] = {
-        "rule": "max_compliance_then_accuracy",
-        "target_slo_compliance": 0.0,
-        "total": len(grid),
-    }
-    return float(best["lambda"]), float(best["mu"]), best, grid
+    return float(best_stats["lambda"]), float(best_stats["mu"]), best_stats
 
 
 def parse_args() -> argparse.Namespace:
@@ -725,17 +607,6 @@ def parse_args() -> argparse.Namespace:
         "--eval_on_test",
         action="store_true",
         help="If set, run a quick held-out accuracy eval on TEST for each learned mode (no load/concurrency sweep).",
-    )
-
-    ap.add_argument(
-        "--target_slo_compliance",
-        type=float,
-        default=0.0,
-        help=(
-            "Compliance-first tuning target in [0,1]. If > 0, tuning selects (lambda,mu) "
-            "by: (1) keep configs with observed VAL compliance >= target, (2) maximize VAL accuracy, "
-            "(3) tie-break by lower avg cost. If no configs meet the target, falls back to maximizing compliance."
-        ),
     )
     return ap.parse_args()
 
@@ -880,16 +751,6 @@ def main() -> None:
     quality_models, ttft_models, tpot_models = _train_predictors(records, variants)
     router = LearnedRouter(quality_models, ttft_models, tpot_models, lambda_slo=1.5, mu_quality=1.5)
 
-    # Lightweight diagnostics (helps catch "fishy" training runs early).
-    trainval_metrics = _evaluate_predictors(
-        records=records,
-        variants=variants,
-        quality_models=quality_models,
-        ttft_models=ttft_models,
-        tpot_models=tpot_models,
-        split_name="train+val",
-    )
-
     # -----------------------------
     # 3) Tune weights on VAL only
     # -----------------------------
@@ -899,50 +760,8 @@ def main() -> None:
     if len(val_grouped) == 0:
         raise RuntimeError("No validation examples found; cannot tune lambda/mu.")
 
-    val_metrics = _evaluate_predictors(
-        records=val_records,
-        variants=variants,
-        quality_models=quality_models,
-        ttft_models=ttft_models,
-        tpot_models=tpot_models,
-        split_name="val",
-    )
-
-    def _print_metrics(m: Dict[str, Any]) -> None:
-        print(f"\n[predictor-metrics] split={m.get('split')}")
-        for vv in variants:
-            r = (m.get('by_variant') or {}).get(vv) or {}
-            if int(r.get('n', 0)) == 0:
-                print(f"  {vv:5s}: n=0")
-                continue
-            auc = r.get('quality_auc', None)
-            auc_s = f"{auc:.3f}" if isinstance(auc, (int, float)) else "NA"
-            print(
-                f"  {vv:5s}: n={int(r['n'])} pos={r['quality_pos_rate']:.3f} "
-                f"q_acc@0.5={r['quality_acc@0.5']:.3f} auc={auc_s} "
-                f"ttft_mae={r['ttft_mae']:.1f} ttft_rmse={r['ttft_rmse']:.1f} "
-                f"tpot_mae={r['tpot_mae']:.2f} tpot_rmse={r['tpot_rmse']:.2f}"
-            )
-
-    _print_metrics(trainval_metrics)
-    _print_metrics(val_metrics)
-
-    lam_ttft, mu_ttft, stats_ttft, grid_ttft = _tune_lambda_mu(
-        "ttft",
-        router,
-        val_grouped,
-        slo_dict,
-        variants,
-        target_slo_compliance=float(args.target_slo_compliance or 0.0),
-    )
-    lam_total, mu_total, stats_total, grid_total = _tune_lambda_mu(
-        "total",
-        router,
-        val_grouped,
-        slo_dict,
-        variants,
-        target_slo_compliance=float(args.target_slo_compliance or 0.0),
-    )
+    lam_ttft, mu_ttft, stats_ttft = _tune_lambda_mu("ttft", router, val_grouped, slo_dict, variants)
+    lam_total, mu_total, stats_total = _tune_lambda_mu("total", router, val_grouped, slo_dict, variants)
 
     # -----------------------------
     # 4) Save artifacts
@@ -958,12 +777,6 @@ def main() -> None:
         "slo_profile": args.slo_profile,
     }
 
-    # Persist predictor diagnostics for debugging and paper appendices.
-    _write_json(
-        str(out_root / "predictor_metrics.json"),
-        {"trainval": trainval_metrics, "val": val_metrics, **meta_common},
-    )
-
     out_ttft = out_root / "learned_ttft"
     out_total = out_root / "learned_total"
     out_ttft.mkdir(parents=True, exist_ok=True)
@@ -973,13 +786,11 @@ def main() -> None:
     router.mu_quality = float(mu_ttft)
     router.save(str(out_ttft), extra_metadata={"mode": "ttft", "tuned": stats_ttft, **meta_common})
     _write_json(str(out_ttft / "tuning.json"), {"mode": "ttft", "tuned": stats_ttft, **meta_common})
-    _write_json(str(out_ttft / "tuning_grid.json"), {"mode": "ttft", "grid": grid_ttft, **meta_common})
 
     router.lambda_slo = float(lam_total)
     router.mu_quality = float(mu_total)
     router.save(str(out_total), extra_metadata={"mode": "total", "tuned": stats_total, **meta_common})
     _write_json(str(out_total / "tuning.json"), {"mode": "total", "tuned": stats_total, **meta_common})
-    _write_json(str(out_total / "tuning_grid.json"), {"mode": "total", "grid": grid_total, **meta_common})
 
     _write_json(str(out_root / "train_summary.json"), {"num_trace_rows": len(records), "num_examples": len(grouped_all)})
 
