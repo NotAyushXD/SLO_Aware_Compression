@@ -315,6 +315,13 @@ def _collect_traces_for_concurrency(
 
             qdepths = _extract_queue_depths(metrics, variants)
 
+            rm = metrics.get("router_meta")
+            if not isinstance(rm, dict):
+                rm = {}
+            adapter_state = rm.get("adapter_state")
+            if not isinstance(adapter_state, dict):
+                adapter_state = {}
+
             rec = {
                 "global_example_idx": int(ex.get("_global_index", ex_idx)),
                 "split": str(ex.get("_split", "")),
@@ -345,6 +352,15 @@ def _collect_traces_for_concurrency(
                 "total_latency_ms": float(metrics.get("total_latency_ms", 0.0) or 0.0),
                 "queue_wait_ms": float(metrics.get("queue_wait_ms", 0.0) or 0.0),
                 "lock_wait_ms": float(metrics.get("lock_wait_ms", 0.0) or 0.0),
+                # adapters (optional)
+                "adapter_id": str(rm.get("adapter_id") or metrics.get("adapter_id") or ""),
+                "adapter_rank": rm.get("adapter_rank", metrics.get("adapter_active_rank")),
+                "adapter_state": adapter_state,
+                "adapter_cache_hit": int(metrics.get("adapter_cache_hit", 1) or 0),
+                "adapter_num_loaded": int(metrics.get("adapter_num_loaded", 0) or 0),
+                "adapter_load_ms": float(metrics.get("adapter_load_ms", 0.0) or 0.0),
+                "adapter_switch_ms": float(metrics.get("adapter_switch_ms", 0.0) or 0.0),
+                "adapter_setup_ms": float(metrics.get("adapter_setup_ms", 0.0) or 0.0),
             }
             local.append(rec)
             _append_one(rec)
@@ -395,6 +411,9 @@ def _train_predictors(
             prompt_tokens=int(r["prompt_tokens"]),
             concurrency=int(r.get("concurrency", 1)),
             queue_depths=qds,
+            adapter_id=str(r.get("adapter_id") or ""),
+            adapter_rank=(r.get("adapter_rank") if r.get("adapter_rank") is not None else None),
+            adapter_state=(r.get("adapter_state") if isinstance(r.get("adapter_state"), dict) else None),
         )[0].tolist()
         X_by_v[v].append(feats)
         yq_by_v[v].append(int(r.get("correct", 0)))
@@ -499,6 +518,9 @@ def _tune_lambda_mu(
                     prompt_tokens=int(state["prompt_tokens"]),
                     concurrency=int(state.get("concurrency", 1)),
                     queue_depths=qds,
+                    adapter_id=str(state.get("adapter_id") or ""),
+                    adapter_rank=(state.get("adapter_rank") if state.get("adapter_rank") is not None else None),
+                    adapter_state=(state.get("adapter_state") if isinstance(state.get("adapter_state"), dict) else None),
                     slo_dict=slo_dict,
                     mode=mode,
                     allowed_variants=variants,
@@ -571,10 +593,40 @@ def parse_args() -> argparse.Namespace:
 
     ap.add_argument("--max_batch_size", type=int, default=8)
     ap.add_argument("--batch_wait_ms", type=int, default=8)
+    ap.add_argument(
+        "--dispatcher_policy",
+        type=str,
+        default="age",
+        help=(
+            "MultiVariant dispatcher policy. Use setup-aware variants (e.g., setup_lstf) "
+            "to reduce adapter thrash when enable_adapters is set."
+        ),
+    )
     ap.add_argument("--load_strategy", type=str, default="auto")
     ap.add_argument("--max_loaded_variants", type=int, default=None)
     ap.add_argument("--preload_variants", nargs="*", default=None)
     ap.add_argument("--warmup", action="store_true")
+
+    # -----------------------------
+    # Adapter portfolio (optional)
+    # -----------------------------
+    ap.add_argument("--enable_adapters", action="store_true")
+    ap.add_argument("--adapter_root", type=str, default=None)
+    ap.add_argument("--adapter_policy", type=str, default="none", choices=["none", "dataset", "fixed"])
+    ap.add_argument("--adapter_fixed", type=str, default=None)
+    ap.add_argument(
+        "--adapter_rank_policy",
+        type=str,
+        default="max",
+        choices=["max", "difficulty", "load", "fixed"],
+    )
+    ap.add_argument("--adapter_rank_tiers", type=str, default="8,16,32")
+    ap.add_argument("--adapter_fixed_rank", type=int, default=None)
+    ap.add_argument("--max_loaded_adapters", type=int, default=8)
+    ap.add_argument("--adapter_eviction_policy", type=str, default="lru", choices=["lru"])
+    ap.add_argument("--adapter_synthetic_load_ms", type=float, default=0.0)
+    ap.add_argument("--adapter_synthetic_switch_ms", type=float, default=0.0)
+    ap.add_argument("--dispatcher_max_sticky_adapter_batches", type=int, default=4)
 
     ap.add_argument(
         "--max_examples",
@@ -687,10 +739,23 @@ def main() -> None:
             enable_batching=True,
             max_batch_size=int(args.max_batch_size),
             batch_wait_ms=int(args.batch_wait_ms),
+            dispatcher_policy=str(args.dispatcher_policy),
             load_strategy=str(args.load_strategy),
             max_loaded_variants=args.max_loaded_variants,
             preload_variants=args.preload_variants,
             warmup=bool(args.warmup),
+            enable_adapters=bool(args.enable_adapters),
+            adapter_root=args.adapter_root,
+            adapter_policy=str(args.adapter_policy),
+            adapter_fixed=args.adapter_fixed,
+            adapter_rank_policy=str(args.adapter_rank_policy),
+            adapter_rank_tiers=str(args.adapter_rank_tiers),
+            adapter_fixed_rank=args.adapter_fixed_rank,
+            max_loaded_adapters=int(args.max_loaded_adapters),
+            adapter_eviction_policy=str(args.adapter_eviction_policy),
+            adapter_synthetic_load_ms=float(args.adapter_synthetic_load_ms),
+            adapter_synthetic_switch_ms=float(args.adapter_synthetic_switch_ms),
+            dispatcher_max_sticky_adapter_batches=int(args.dispatcher_max_sticky_adapter_batches),
         )
 
         try:
@@ -775,6 +840,18 @@ def main() -> None:
         "seed": int(args.seed),
         "slo_thresholds_path": args.slo_thresholds_path,
         "slo_profile": args.slo_profile,
+        "dispatcher_policy": str(args.dispatcher_policy),
+        "enable_adapters": bool(args.enable_adapters),
+        "adapter_root": args.adapter_root,
+        "adapter_policy": str(args.adapter_policy),
+        "adapter_fixed": args.adapter_fixed,
+        "adapter_rank_policy": str(args.adapter_rank_policy),
+        "adapter_rank_tiers": str(args.adapter_rank_tiers),
+        "adapter_fixed_rank": args.adapter_fixed_rank,
+        "max_loaded_adapters": int(args.max_loaded_adapters),
+        "adapter_synthetic_load_ms": float(args.adapter_synthetic_load_ms),
+        "adapter_synthetic_switch_ms": float(args.adapter_synthetic_switch_ms),
+        "dispatcher_max_sticky_adapter_batches": int(args.dispatcher_max_sticky_adapter_batches),
     }
 
     out_ttft = out_root / "learned_ttft"
@@ -819,10 +896,23 @@ def main() -> None:
                 enable_batching=True,
                 max_batch_size=int(args.max_batch_size),
                 batch_wait_ms=int(args.batch_wait_ms),
+                dispatcher_policy=str(args.dispatcher_policy),
                 load_strategy=str(args.load_strategy),
                 max_loaded_variants=args.max_loaded_variants,
                 preload_variants=args.preload_variants,
                 warmup=bool(args.warmup),
+                enable_adapters=bool(args.enable_adapters),
+                adapter_root=args.adapter_root,
+                adapter_policy=str(args.adapter_policy),
+                adapter_fixed=args.adapter_fixed,
+                adapter_rank_policy=str(args.adapter_rank_policy),
+                adapter_rank_tiers=str(args.adapter_rank_tiers),
+                adapter_fixed_rank=args.adapter_fixed_rank,
+                max_loaded_adapters=int(args.max_loaded_adapters),
+                adapter_eviction_policy=str(args.adapter_eviction_policy),
+                adapter_synthetic_load_ms=float(args.adapter_synthetic_load_ms),
+                adapter_synthetic_switch_ms=float(args.adapter_synthetic_switch_ms),
+                dispatcher_max_sticky_adapter_batches=int(args.dispatcher_max_sticky_adapter_batches),
             )
             try:
                 service.set_slo_dict(slo_dict)

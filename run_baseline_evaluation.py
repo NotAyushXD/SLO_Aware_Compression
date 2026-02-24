@@ -248,7 +248,16 @@ def parse_args() -> argparse.Namespace:
         "--router_mode",
         type=str,
         default="difficulty",
-        choices=["difficulty", "slo_aware", "fixed", "always_cheap", "always_base", "learned_ttft", "learned_total"],
+        choices=[
+            "difficulty",
+            "slo_aware",
+            "fixed",
+            "always_cheap",
+            "always_base",
+            "learned_ttft",
+            "learned_total",
+            "risk",
+        ],
         help="Routing policy for multi-variant serving.",
     )
     p.add_argument(
@@ -263,6 +272,119 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Path to learned-router artifacts. For learned_* modes, this is REQUIRED. You may pass either a root folder containing subfolders learned_ttft/learned_total, or a mode-specific folder.",
+    )
+
+    # Risk router artifacts + knobs
+    p.add_argument(
+        "--risk_router_dir",
+        type=str,
+        default=None,
+        help="Path to risk-router bundle artifacts (trained with scripts/train_risk_router.py). Required for --router_mode risk.",
+    )
+    p.add_argument(
+        "--risk_latency_delta",
+        type=float,
+        default=0.05,
+        help="Latency risk level δ for conformal upper bounds (violation rate target).",
+    )
+    p.add_argument(
+        "--risk_quality_epsilon",
+        type=float,
+        default=0.25,
+        help="Quality risk target ε (upper bound on error among accepted predictions, per variant).",
+    )
+    p.add_argument(
+        "--risk_quality_alpha",
+        type=float,
+        default=0.05,
+        help="Confidence level α for the quality risk bound (Clopper-Pearson).",
+    )
+
+    # Dispatcher policy (scheduler)
+    p.add_argument(
+        "--dispatcher_policy",
+        type=str,
+        default="age",
+        choices=["age", "edf", "lstf", "setup_aware", "setup_edf", "setup_lstf"],
+        help="How the multi-variant dispatcher picks the next queue: age (default), edf, or lstf.",
+    )
+
+    # ------------------------------------------------------------------
+    # PEFT / LoRA adapters (optional)
+    # ------------------------------------------------------------------
+    p.add_argument(
+        "--enable_adapters",
+        action="store_true",
+        help="Enable PEFT/LoRA adapters (shared-base) in the serving stack.",
+    )
+    p.add_argument(
+        "--adapter_root",
+        type=str,
+        default=None,
+        help="Root directory containing PEFT adapters. Convention: <adapter_root>/<adapter_id>/adapter_config.json",
+    )
+    p.add_argument(
+        "--adapter_policy",
+        type=str,
+        default="none",
+        choices=["none", "dataset", "fixed"],
+        help="How to choose adapter_id per request: none, dataset (adapter_id=dataset_type), or fixed.",
+    )
+    p.add_argument(
+        "--adapter_fixed",
+        type=str,
+        default=None,
+        help="If --adapter_policy fixed, the adapter_id to use.",
+    )
+    p.add_argument(
+        "--adapter_rank_policy",
+        type=str,
+        default="max",
+        choices=["max", "difficulty", "load", "fixed"],
+        help="Nested-rank tier policy (effective LoRA rank at runtime).",
+    )
+    p.add_argument(
+        "--adapter_rank_tiers",
+        type=str,
+        default="8,16,32",
+        help="Comma-separated list of nested-rank tiers (e.g., '8,16,32').",
+    )
+    p.add_argument(
+        "--adapter_fixed_rank",
+        type=int,
+        default=None,
+        help="If --adapter_rank_policy fixed, the active LoRA rank to use.",
+    )
+    p.add_argument(
+        "--max_loaded_adapters",
+        type=int,
+        default=8,
+        help="Max number of adapters to keep resident per variant (LRU eviction).",
+    )
+    p.add_argument(
+        "--adapter_eviction_policy",
+        type=str,
+        default="lru",
+        choices=["lru"],
+        help="Adapter cache eviction policy.",
+    )
+    p.add_argument(
+        "--adapter_synthetic_load_ms",
+        type=float,
+        default=0.0,
+        help="Optional extra (simulated) adapter load overhead in ms per cache miss.",
+    )
+    p.add_argument(
+        "--adapter_synthetic_switch_ms",
+        type=float,
+        default=0.0,
+        help="Optional extra (simulated) adapter switch overhead in ms per activation.",
+    )
+    p.add_argument(
+        "--dispatcher_max_sticky_adapter_batches",
+        type=int,
+        default=4,
+        help="For setup_* dispatcher policies, limit how many consecutive batches to keep the same adapter active.",
     )
 
     p.add_argument(
@@ -387,6 +509,13 @@ def main() -> None:
         if args.learned_router_dir is None:
             raise ValueError("--learned_router_dir is required for learned router modes.")
 
+    # risk router artifacts are required for risk mode
+    if args.router_mode == "risk":
+        if args.service != "multi":
+            raise ValueError("risk router mode requires --service multi.")
+        if args.risk_router_dir is None:
+            raise ValueError("--risk_router_dir is required for --router_mode risk.")
+
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -499,8 +628,13 @@ def main() -> None:
                 variants=tuple(args.multi_variants),
                 router_mode=args.router_mode,
                 learned_router_dir=args.learned_router_dir,
+                risk_router_dir=args.risk_router_dir,
+                risk_latency_delta=float(args.risk_latency_delta),
+                risk_quality_epsilon=float(args.risk_quality_epsilon),
+                risk_quality_alpha=float(args.risk_quality_alpha),
                 fixed_variant=args.router_fixed_variant,
                 allow_quality_downgrade_for_slo=bool(args.router_allow_quality_downgrade_for_slo),
+                dispatcher_policy=str(args.dispatcher_policy),
                 device=effective_device,
                 dtype=args.dtype,
                 enable_batching=effective_enable_batching,
@@ -509,6 +643,18 @@ def main() -> None:
                 ema_alpha=args.router_ema_alpha,
                 max_retries=args.router_max_retries,
                 lazy_load_base=bool(args.router_lazy_load_base),
+                enable_adapters=bool(args.enable_adapters),
+                adapter_root=args.adapter_root,
+                adapter_policy=str(args.adapter_policy),
+                adapter_fixed=args.adapter_fixed,
+                adapter_rank_policy=str(args.adapter_rank_policy),
+                adapter_rank_tiers=str(args.adapter_rank_tiers),
+                adapter_fixed_rank=args.adapter_fixed_rank,
+                max_loaded_adapters=int(args.max_loaded_adapters),
+                adapter_eviction_policy=str(args.adapter_eviction_policy),
+                adapter_synthetic_load_ms=float(args.adapter_synthetic_load_ms),
+                adapter_synthetic_switch_ms=float(args.adapter_synthetic_switch_ms),
+                dispatcher_max_sticky_adapter_batches=int(args.dispatcher_max_sticky_adapter_batches),
             )
         else:
             server = SingleVariantServer(
@@ -519,6 +665,17 @@ def main() -> None:
                 enable_batching=effective_enable_batching,
                 max_batch_size=args.max_batch_size,
                 batch_wait_ms=args.batch_wait_ms,
+                enable_adapters=bool(args.enable_adapters),
+                adapter_root=args.adapter_root,
+                adapter_policy=str(args.adapter_policy),
+                adapter_fixed=args.adapter_fixed,
+                adapter_rank_policy=str(args.adapter_rank_policy),
+                adapter_rank_tiers=str(args.adapter_rank_tiers),
+                adapter_fixed_rank=args.adapter_fixed_rank,
+                max_loaded_adapters=int(args.max_loaded_adapters),
+                adapter_eviction_policy=str(args.adapter_eviction_policy),
+                adapter_synthetic_load_ms=float(args.adapter_synthetic_load_ms),
+                adapter_synthetic_switch_ms=float(args.adapter_synthetic_switch_ms),
             )
     else:
         if args.service == "multi":

@@ -1,6 +1,7 @@
 import gc
 import hashlib
 import logging
+import os
 import re
 import threading
 import time
@@ -24,6 +25,16 @@ from answer_utils import (
     extract_gsm8k_parseable,
     extract_gsm8k_strict,
     extract_mmlu_answer,
+)
+
+# Optional PEFT / LoRA adapter support (paper portfolio extension)
+from adapter_utils import (
+    AdapterManager,
+    AdapterRegistry,
+    choose_active_rank,
+    choose_adapter_id,
+    load_adapter_config,
+    peft_available,
 )
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("server")
@@ -251,6 +262,9 @@ class _PendingRequest:
     top_p: float
     enqueue_time: float
     concurrency: int = 1
+    # Adapter context (optional)
+    adapter_id: str = ""
+    adapter_rank: Optional[int] = None
     # NOTE: In dataclasses, non-default fields must come before default fields.
     # This event is created by the scheduler for each request.
     event: threading.Event = field(default_factory=threading.Event)
@@ -259,10 +273,18 @@ class _PendingRequest:
     result_metrics: Optional[Dict] = None
     error: Optional[str] = None
 
-    def batch_key(self) -> Tuple[str, str, int, bool]:
+    def batch_key(self) -> Tuple[str, str, int, bool, str, int]:
         # In SLO mode we always use greedy decoding, so sampling params are irrelevant.
         do_sample = bool(self.prompt_mode != "slo" and self.temperature and self.temperature > 0.0)
-        return (self.dataset_type, self.prompt_mode, int(self.max_tokens), do_sample)
+        # Include adapter info so batches do not mix adapters / rank tiers.
+        return (
+            self.dataset_type,
+            self.prompt_mode,
+            int(self.max_tokens),
+            do_sample,
+            str(getattr(self, "adapter_id", "") or ""),
+            int(getattr(self, "adapter_rank", 0) or 0),
+        )
 
 
 class _BatchingScheduler:
@@ -367,6 +389,8 @@ class _BatchingScheduler:
             max_tokens = batch[0].max_tokens
             temperature = batch[0].temperature
             top_p = batch[0].top_p
+            adapter_id = getattr(batch[0], "adapter_id", "") or ""
+            adapter_rank = getattr(batch[0], "adapter_rank", None)
 
             texts, metrics_list, lock_wait_ms = self.server._generate_hf_batch(
                 prompts=prompts,
@@ -375,6 +399,8 @@ class _BatchingScheduler:
                 prompt_mode=prompt_mode,
                 temperature=temperature,
                 top_p=top_p,
+                adapter_id=str(adapter_id),
+                adapter_rank=int(adapter_rank) if adapter_rank is not None else None,
                 require_all_final_answers=(dataset_type == "gsm8k"),
             )
 
@@ -446,6 +472,18 @@ class SingleVariantServer:
         enable_batching: bool = False,
         max_batch_size: int = 4,
         batch_wait_ms: int = 8,
+        # PEFT / adapters (optional)
+        enable_adapters: bool = False,
+        adapter_root: Optional[str] = None,
+        adapter_policy: str = "none",
+        adapter_fixed: Optional[str] = None,
+        adapter_rank_policy: str = "max",
+        adapter_rank_tiers: str = "8,16,32",
+        adapter_fixed_rank: Optional[int] = None,
+        max_loaded_adapters: int = 8,
+        adapter_eviction_policy: str = "lru",
+        adapter_synthetic_load_ms: float = 0.0,
+        adapter_synthetic_switch_ms: float = 0.0,
     ):
         self.model_name = model_name
         self.variant_requested = variant
@@ -466,6 +504,23 @@ class SingleVariantServer:
             GPUMonitor.log_gpu_status(prefix="  ")
 
         self._generation_lock = threading.Lock()
+
+        # Adapter configuration (selection policy is applied in generate())
+        self.enable_adapters = bool(enable_adapters)
+        self.adapter_root = adapter_root
+        self.adapter_policy = (adapter_policy or "none").lower().strip()
+        self.adapter_fixed = adapter_fixed
+        self.adapter_rank_policy = (adapter_rank_policy or "max").lower().strip()
+        self.adapter_rank_tiers = [
+            int(x) for x in str(adapter_rank_tiers or "").replace(" ", "").split(",") if str(x).strip().isdigit()
+        ]
+        if not self.adapter_rank_tiers:
+            self.adapter_rank_tiers = [8, 16, 32]
+        self.adapter_fixed_rank = int(adapter_fixed_rank) if adapter_fixed_rank is not None else None
+        self.max_loaded_adapters = int(max(1, max_loaded_adapters))
+        self.adapter_eviction_policy = (adapter_eviction_policy or "lru").lower().strip()
+        self.adapter_synthetic_load_ms = float(max(0.0, adapter_synthetic_load_ms))
+        self.adapter_synthetic_switch_ms = float(max(0.0, adapter_synthetic_switch_ms))
 
         # Tokenizer (cheap)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -572,6 +627,29 @@ class SingleVariantServer:
 
         self.model.eval()
 
+        # Optional PEFT adapter manager (wrap-on-first-use)
+        self._adapter_registry: Optional[AdapterRegistry] = None
+        self._adapter_manager: Optional[AdapterManager] = None
+        if self.enable_adapters:
+            if not peft_available():
+                raise RuntimeError(
+                    "--enable_adapters was set but `peft` is not installed. "
+                    "Install with: pip install peft"
+                )
+            self._adapter_registry = AdapterRegistry(self.adapter_root)
+            self._adapter_manager = AdapterManager(
+                base_model=self.model,
+                adapter_registry=self._adapter_registry,
+                max_loaded_adapters=self.max_loaded_adapters,
+                eviction_policy=self.adapter_eviction_policy,
+                synthetic_load_ms=self.adapter_synthetic_load_ms,
+                synthetic_switch_ms=self.adapter_synthetic_switch_ms,
+            )
+            logger.info(
+                f"Adapters enabled: policy={self.adapter_policy} adapter_root={self.adapter_root} "
+                f"max_loaded_adapters={self.max_loaded_adapters} nested_rank_policy={self.adapter_rank_policy} tiers={self.adapter_rank_tiers}"
+            )
+
         # Silence generate() warnings for deterministic decoding (do_sample=False).
         try:
             gcfg = getattr(self.model, "generation_config", None)
@@ -601,98 +679,6 @@ class SingleVariantServer:
             )
 
         self._warmup()
-
-        # ------------------------------------------------------------------
-        # CHEAP (bnb 4-bit) GSM8K stability guard
-        # ------------------------------------------------------------------
-        # Some runtime stacks can load int4 successfully but still produce
-        # unusable long-form generations (GSM8K) while passing MMLU (1-token).
-        # If this happens, baseline GSM8K format/accuracy becomes 0% and router
-        # training traces become unusable. We proactively detect this and
-        # attempt alternate 4-bit configs; if all fail, fall back to int8/fp16.
-        if self.variant_requested == "cheap" and self.device == "cuda":
-            device_map = load_kwargs.get("device_map")
-            if not self._cheap_gsm8k_smoke_test():
-                logger.warning(
-                    "CHEAP quantization failed GSM8K smoke test (2+2). Trying alternate 4-bit configs..."
-                )
-
-                alt_4bit: List[Tuple[str, BitsAndBytesConfig]] = [
-                    (
-                        "bnb_nf4_int4_dq",
-                        BitsAndBytesConfig(
-                            load_in_4bit=True,
-                            bnb_4bit_quant_type="nf4",
-                            bnb_4bit_use_double_quant=True,
-                            bnb_4bit_compute_dtype=torch.float16,
-                        ),
-                    ),
-                    (
-                        "bnb_fp4_int4",
-                        BitsAndBytesConfig(
-                            load_in_4bit=True,
-                            bnb_4bit_quant_type="fp4",
-                            bnb_4bit_use_double_quant=False,
-                            bnb_4bit_compute_dtype=torch.float16,
-                        ),
-                    ),
-                    (
-                        "bnb_fp4_int4_dq",
-                        BitsAndBytesConfig(
-                            load_in_4bit=True,
-                            bnb_4bit_quant_type="fp4",
-                            bnb_4bit_use_double_quant=True,
-                            bnb_4bit_compute_dtype=torch.float16,
-                        ),
-                    ),
-                ]
-
-                recovered = False
-                for (qname, qcfg) in alt_4bit:
-                    try:
-                        self._reload_model_with_quant(
-                            model_dtype=model_dtype,
-                            device_map=device_map,
-                            quant_config=qcfg,
-                            quantization_name=qname,
-                            variant_effective="cheap",
-                        )
-                        # Keep the existing tokenizer; re-warm and re-test.
-                        self._warmup()
-                        if self._cheap_gsm8k_smoke_test():
-                            logger.warning(f"Recovered CHEAP GSM8K stability using {qname}.")
-                            recovered = True
-                            break
-                    except Exception as e:
-                        logger.warning(f"Alt CHEAP quant config {qname} failed: {e}")
-                        continue
-
-                if not recovered:
-                    # Fall back to int8 (if available) then fp16.
-                    logger.warning(
-                        "All CHEAP 4-bit configs failed GSM8K smoke test; falling back to int8 then fp16."
-                    )
-                    try:
-                        self._reload_model_with_quant(
-                            model_dtype=model_dtype,
-                            device_map=device_map,
-                            quant_config=BitsAndBytesConfig(load_in_8bit=True),
-                            quantization_name="bnb_int8_fallback",
-                            variant_effective="med",
-                        )
-                        self._warmup()
-                        if not self._cheap_gsm8k_smoke_test():
-                            raise RuntimeError("int8 fallback still failed GSM8K smoke test")
-                    except Exception as e:
-                        logger.warning(f"Int8 fallback failed ({e}); using fp16 weights.")
-                        self._reload_model_with_quant(
-                            model_dtype=model_dtype,
-                            device_map=device_map,
-                            quant_config=None,
-                            quantization_name=str(self.dtype),
-                            variant_effective="base",
-                        )
-                        self._warmup()
 
     def _compute_mmlu_allowed_token_ids(self) -> List[int]:
         ids: List[int] = []
@@ -772,100 +758,29 @@ class SingleVariantServer:
 
         return sorted(allowed)
 
-    # -------------------------------
-    # CHEAP stability checks (bnb 4-bit can be unstable on some stacks)
-    # -------------------------------
+        specials = set(getattr(self.tokenizer, "all_special_tokens", []) or [])
 
-    def _cheap_gsm8k_smoke_test(self) -> bool:
-        """Quick correctness sanity check for CHEAP GSM8K decoding.
-
-        Some environments (notably certain Kaggle images / bitsandbytes builds)
-        can load 4-bit weights successfully but produce non-numeric gibberish on
-        long-form decoding. MMLU can look fine because it's 1-token constrained.
-
-        We test a tiny GSM8K-style prompt (2+2) and require a parseable '4'.
-        """
-
-        try:
-            prompt = (
-                "You are a careful math problem solver.\n\n"
-                "Compute the final numeric answer.\n"
-                "Respond with ONLY the final answer in the exact format:\n"
-                "FINAL_ANSWER: <number>\n\n"
-                "Problem: What is 2 + 2?\n"
-            )
-            texts, _metrics_list, _lw = self._generate_hf_batch(
-                prompts=[prompt],
-                dataset_type="gsm8k",
-                max_tokens=24,
-                prompt_mode="accuracy",
-                temperature=0.20,
-                top_p=0.90,
-                require_all_final_answers=False,
-                constrain_ascii=True,
-                seed_salt=999,
-            )
-            out = texts[0] if texts else ""
-            cand = ""
+        for i in range(vocab_size):
             try:
-                cand = extract_gsm8k_strict(out) or extract_gsm8k_parseable(out)
+                tok = self.tokenizer.convert_ids_to_tokens(i)
             except Exception:
-                cand = ""
-            return (cand or "").strip() == "4"
-        except Exception:
-            return False
+                continue
+            if not tok:
+                continue
+            if tok in specials:
+                continue
 
-    def _reload_model_with_quant(
-        self,
-        *,
-        model_dtype: Any,
-        device_map: Any,
-        quant_config: Optional[BitsAndBytesConfig],
-        quantization_name: str,
-        variant_effective: str,
-    ) -> None:
-        """Reload the HF model with a different quantization config."""
+            ok = True
+            for ch in tok:
+                if ch in allowed_chars:
+                    continue
+                ok = False
+                break
 
-        try:
-            # Free the existing model first.
-            try:
-                del self.model
-            except Exception:
-                pass
-            gc.collect()
-            if self.device == "cuda":
-                try:
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
+            if ok:
+                allowed.add(int(i))
 
-            load_kwargs: Dict[str, Any] = {"device_map": device_map}
-            if quant_config is not None:
-                load_kwargs["quantization_config"] = quant_config
-
-            # transformers>=4.57 deprecates `torch_dtype` in favor of `dtype`.
-            try:
-                self.model = AutoModelForCausalLM.from_pretrained(self.model_name, dtype=model_dtype, **load_kwargs)
-            except TypeError:
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    self.model_name, torch_dtype=model_dtype, **load_kwargs
-                )
-
-            self.model.eval()
-
-            # Silence generate() warnings for deterministic decoding (do_sample=False).
-            try:
-                gcfg = getattr(self.model, "generation_config", None)
-                if gcfg is not None:
-                    gcfg.temperature = 1.0
-                    gcfg.top_p = 1.0
-            except Exception:
-                pass
-
-            self.quantization = str(quantization_name)
-            self.variant_effective = str(variant_effective)
-        except Exception as e:
-            raise RuntimeError(f"Failed to reload model with quant={quantization_name}: {e}")
+        return sorted(allowed)
 
     def _compute_ascii_token_ids(self) -> List[int]:
         """Token ids that decode to ASCII-only text (plus \n/\t).
@@ -1108,6 +1023,9 @@ class SingleVariantServer:
         constrain_numeric: bool = False,
         constrain_ascii: bool = False,
         seed_salt: int = 0,
+        # Adapters
+        adapter_id: str = "",
+        adapter_rank: Optional[int] = None,
     ) -> Tuple[List[str], List[Dict], float]:
         """Run a single batched HF generate call.
 
@@ -1230,10 +1148,39 @@ class SingleVariantServer:
 
         streamer = TimingStreamer(self._synchronize_device)
 
+        # Adapter activation occurs under the generation lock to avoid races
+        # between adapter switching and generation.
+        adapter_metrics: Dict[str, Any] = {
+            "adapter_id": str(adapter_id or ""),
+            "adapter_active_rank": int(adapter_rank) if adapter_rank is not None else None,
+            "adapter_cache_hit": 1,
+            "adapter_load_ms": 0.0,
+            "adapter_switch_ms": 0.0,
+            "adapter_evicted": [],
+            "adapter_num_loaded": 0,
+        }
+
         t_lock_req = time.perf_counter()
         with self._generation_lock:
             t_lock_acq = time.perf_counter()
             lock_wait_ms = (t_lock_acq - t_lock_req) * 1000.0
+
+            # Adapter switch / load (if enabled)
+            if self._adapter_manager is not None:
+                try:
+                    adapter_metrics = self._adapter_manager.activate(
+                        str(adapter_id or ""),
+                        active_rank=int(adapter_rank) if adapter_rank is not None else None,
+                    )
+                    # Keep self.model pointing at the current (possibly PEFT-wrapped) model.
+                    self.model = self._adapter_manager.model
+                except Exception as e:
+                    # Adapter failures should not crash the server; fall back to base.
+                    adapter_metrics["adapter_error"] = str(e)
+                    try:
+                        self.model = self._adapter_manager.model
+                    except Exception:
+                        pass
 
             self._synchronize_device()
             t0_gen = time.perf_counter()
@@ -1256,12 +1203,32 @@ class SingleVariantServer:
                             torch.cuda.manual_seed_all(seed)
                     except Exception:
                         pass
-                sequences = self.model.generate(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs.get("attention_mask"),
-                    streamer=streamer,
-                    **gen_kwargs,
-                )
+                # If adapters are enabled but this request wants the base model,
+                # run generate() inside the disable_adapter() context.
+                if self._adapter_manager is not None and self._adapter_manager.is_peft_wrapped and not str(adapter_id or "").strip():
+                    ctx = getattr(self.model, "disable_adapter", None)
+                    if ctx is not None:
+                        with ctx():
+                            sequences = self.model.generate(
+                                input_ids=inputs["input_ids"],
+                                attention_mask=inputs.get("attention_mask"),
+                                streamer=streamer,
+                                **gen_kwargs,
+                            )
+                    else:
+                        sequences = self.model.generate(
+                            input_ids=inputs["input_ids"],
+                            attention_mask=inputs.get("attention_mask"),
+                            streamer=streamer,
+                            **gen_kwargs,
+                        )
+                else:
+                    sequences = self.model.generate(
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs.get("attention_mask"),
+                        streamer=streamer,
+                        **gen_kwargs,
+                    )
 
             self._synchronize_device()
             t1_gen = time.perf_counter()
@@ -1360,6 +1327,16 @@ class SingleVariantServer:
                     "variant": self.variant,
                     "variant_effective": getattr(self, "variant_effective", self.variant),
                     "quantization": getattr(self, "quantization", None),
+                    # Adapter info (optional)
+                    "adapter_id": adapter_metrics.get("adapter_id", ""),
+                    "adapter_active_rank": adapter_metrics.get("adapter_active_rank", None),
+                    "adapter_cache_hit": int(adapter_metrics.get("adapter_cache_hit", 1) or 0),
+                    "adapter_load_ms": float(adapter_metrics.get("adapter_load_ms", 0.0) or 0.0),
+                    "adapter_switch_ms": float(adapter_metrics.get("adapter_switch_ms", 0.0) or 0.0),
+                    "adapter_setup_ms": float(adapter_metrics.get("adapter_setup_ms", 0.0) or 0.0),
+                    "adapter_num_loaded": int(adapter_metrics.get("adapter_num_loaded", 0) or 0),
+                    "adapter_evicted": adapter_metrics.get("adapter_evicted", []) or [],
+                    "adapter_error": adapter_metrics.get("adapter_error"),
                     "dtype": self.dtype,
                     "model": self.model_name,
                     "device": self.device,
@@ -1383,6 +1360,9 @@ class SingleVariantServer:
         prompt_mode: str = "accuracy",
         concurrency: int = 1,
         use_batching: Optional[bool] = None,
+        # Adapters (optional)
+        adapter_id: Optional[str] = None,
+        adapter_rank: Optional[int] = None,
     ) -> Tuple[str, Dict]:
         """Generate completion text plus metrics."""
 
@@ -1394,6 +1374,32 @@ class SingleVariantServer:
             max_tokens = get_max_tokens(difficulty, dataset_type, prompt_mode)
         if dataset_type == "mmlu":
             max_tokens = 1
+
+        # Resolve adapter selection (if enabled)
+        adapter_id_use = ""
+        adapter_rank_use: Optional[int] = None
+        if self.enable_adapters:
+            adapter_id_use = choose_adapter_id(
+                policy=self.adapter_policy,
+                dataset_type=dataset_type,
+                fixed_adapter=self.adapter_fixed,
+                explicit_adapter=adapter_id,
+            )
+            try:
+                qd = int(self._scheduler.get_queue_depth()) if self._scheduler is not None else 0
+            except Exception:
+                qd = 0
+            if adapter_id_use:
+                if adapter_rank is not None:
+                    adapter_rank_use = int(adapter_rank)
+                else:
+                    adapter_rank_use = choose_active_rank(
+                        policy=self.adapter_rank_policy,
+                        difficulty=difficulty,
+                        total_queue_depth=qd,
+                        tiers=self.adapter_rank_tiers,
+                        fixed_rank=self.adapter_fixed_rank,
+                    )
 
         batching_enabled = self._scheduler is not None
         if use_batching is None:
@@ -1411,6 +1417,8 @@ class SingleVariantServer:
                 top_p=float(top_p),
                 enqueue_time=time.perf_counter(),
                 concurrency=int(concurrency),
+                adapter_id=str(adapter_id_use or ""),
+                adapter_rank=int(adapter_rank_use) if adapter_rank_use is not None else None,
                 event=threading.Event(),
             )
             assert self._scheduler is not None
@@ -1484,6 +1492,8 @@ class SingleVariantServer:
                     prompt_mode=prompt_mode,
                     temperature=float(temperature),
                     top_p=float(top_p),
+                    adapter_id=str(adapter_id_use or ""),
+                    adapter_rank=int(adapter_rank_use) if adapter_rank_use is not None else None,
                     require_all_final_answers=False,
                     constrain_ascii=True,
                     seed_salt=int(s),
@@ -1515,6 +1525,8 @@ class SingleVariantServer:
                 prompt_mode=prompt_mode,
                 temperature=float(temperature),
                 top_p=float(top_p),
+                adapter_id=str(adapter_id_use or ""),
+                adapter_rank=int(adapter_rank_use) if adapter_rank_use is not None else None,
                 require_all_final_answers=False,
             )
 
@@ -1552,18 +1564,15 @@ class SingleVariantServer:
                 attempts = []
                 if variant_eff == "cheap":
                     attempts = [
-                        ("answer_only", self._build_gsm8k_answer_only_prompt, 0.20, 0.90, 24, True, False),
-                        ("fill_blank", self._build_gsm8k_fill_blank_prompt, 0.20, 0.90, 12, True, False),
-                        # Last-resort: digits-only prompt + numeric constrained decoding.
-                        # We cap max_new_tokens to avoid runaway long integers.
-                        ("digits_only", self._build_gsm8k_digits_only_prompt, 0.20, 0.90, 8, True, True),
+                        ("answer_only", self._build_gsm8k_answer_only_prompt, 0.20, 0.90, 24, True),
+                        ("fill_blank", self._build_gsm8k_fill_blank_prompt, 0.20, 0.90, 12, True),
                     ]
                 else:
                     attempts = [
-                        ("answer_only", self._build_gsm8k_answer_only_prompt, 0.0, 1.0, 48, False, False),
+                        ("answer_only", self._build_gsm8k_answer_only_prompt, 0.0, 1.0, 48, False),
                     ]
 
-                for (tag, builder, r_temp, r_top_p, r_max_tokens, r_constrain_ascii, r_constrain_numeric) in attempts:
+                for (tag, builder, r_temp, r_top_p, r_max_tokens, r_constrain_ascii) in attempts:
                     try:
                         retry_prompt = builder(prompt)
                         r_texts, r_metrics_list, r_lock_wait_ms = self._generate_hf_batch(
@@ -1573,20 +1582,15 @@ class SingleVariantServer:
                             prompt_mode=prompt_mode,
                             temperature=float(r_temp),
                             top_p=float(r_top_p),
+                            adapter_id=str(adapter_id_use or ""),
+                            adapter_rank=int(adapter_rank_use) if adapter_rank_use is not None else None,
                             require_all_final_answers=False,
                             constrain_ascii=bool(r_constrain_ascii),
-                            constrain_numeric=bool(r_constrain_numeric),
                         )
 
                         r_text = r_texts[0]
                         try:
-                            cand = extract_gsm8k_parseable(r_text) or extract_gsm8k_strict(r_text)
-                            r_ok = bool(cand)
-                            # Guard against nonsense 30+ digit outputs from numeric-only decoding.
-                            if r_ok and tag == "digits_only":
-                                digits = re.sub(r"[^0-9]", "", str(cand))
-                                if len(digits) > 10:
-                                    r_ok = False
+                            r_ok = bool(extract_gsm8k_parseable(r_text) or extract_gsm8k_strict(r_text))
                         except Exception:
                             r_ok = False
 
@@ -1747,6 +1751,10 @@ class _MVRequest:
     path: List[str]
     event: threading.Event
 
+    # Adapter context (optional)
+    adapter_id: str = ""
+    adapter_rank: Optional[int] = None
+
     # Client-side offered-load hint (used for learned router features/logging).
     # Must come *after* non-default fields for dataclass correctness.
     concurrency: int = 1
@@ -1810,14 +1818,51 @@ class MultiVariantService:
         warmup: bool = False,
         # Router policy
         allow_quality_downgrade_for_slo: bool = False,
+        # Risk router (calibrated guarantees)
+        risk_router_dir: Optional[str] = None,
+        risk_latency_delta: float = 0.05,
+        risk_quality_epsilon: float = 0.25,
+        risk_quality_alpha: float = 0.05,
         # Dispatcher policy
+        dispatcher_policy: str = "age",
         dispatcher_batch_wait_s: float = 0.002,
         dispatcher_max_sticky_batches: int = 4,
         dispatcher_starvation_ms: float = 50.0,
+        # PEFT / adapters (optional portfolio extension)
+        enable_adapters: bool = False,
+        adapter_root: Optional[str] = None,
+        adapter_policy: str = "none",
+        adapter_fixed: Optional[str] = None,
+        adapter_rank_policy: str = "max",
+        adapter_rank_tiers: str = "8,16,32",
+        adapter_fixed_rank: Optional[int] = None,
+        max_loaded_adapters: int = 8,
+        adapter_eviction_policy: str = "lru",
+        adapter_synthetic_load_ms: float = 0.0,
+        adapter_synthetic_switch_ms: float = 0.0,
+        dispatcher_max_sticky_adapter_batches: int = 4,
     ):
         self.model_name = model_name
         self.device = device
         self.dtype = dtype
+
+        # Adapter portfolio configuration (optional)
+        self.enable_adapters = bool(enable_adapters)
+        self.adapter_root = adapter_root
+        self.adapter_policy = (adapter_policy or "none").lower().strip()
+        self.adapter_fixed = adapter_fixed
+        self.adapter_rank_policy = (adapter_rank_policy or "max").lower().strip()
+        self.adapter_rank_tiers = [
+            int(x) for x in str(adapter_rank_tiers or "").replace(" ", "").split(",") if str(x).strip().isdigit()
+        ]
+        if not self.adapter_rank_tiers:
+            self.adapter_rank_tiers = [8, 16, 32]
+        self.adapter_fixed_rank = int(adapter_fixed_rank) if adapter_fixed_rank is not None else None
+        self.max_loaded_adapters = int(max(1, max_loaded_adapters))
+        self.adapter_eviction_policy = (adapter_eviction_policy or "lru").lower().strip()
+        self.adapter_synthetic_load_ms = float(max(0.0, adapter_synthetic_load_ms))
+        self.adapter_synthetic_switch_ms = float(max(0.0, adapter_synthetic_switch_ms))
+        self.dispatcher_max_sticky_adapter_batches = int(max(1, dispatcher_max_sticky_adapter_batches))
 
         self.router_mode = (router_mode or "difficulty").lower()
 
@@ -1856,6 +1901,36 @@ class MultiVariantService:
             artifacts_dir = self._resolve_learned_router_path(learned_router_dir, self.router_mode)
             self._learned_router = LearnedRouter.load(artifacts_dir)
 
+        # Risk router (conformal latency bounds + calibrated quality gating)
+        self.risk_router_dir = risk_router_dir
+        self.risk_latency_delta = float(risk_latency_delta)
+        self.risk_quality_epsilon = float(risk_quality_epsilon)
+        self.risk_quality_alpha = float(risk_quality_alpha)
+        self._risk_router = None
+        if self.router_mode in {"risk"}:
+            if not risk_router_dir:
+                raise ValueError("--risk_router_dir is required when router_mode is risk.")
+            from risk_router import RiskRouter
+
+            rdir = os.path.abspath(os.path.expanduser(risk_router_dir))
+            self._risk_router = RiskRouter.load_bundle(rdir)
+            try:
+                self._risk_router.quality_alpha = float(self.risk_quality_alpha)
+            except Exception:
+                pass
+
+        # Validate adapter dependency early.
+        if self.enable_adapters and not peft_available():
+            raise RuntimeError(
+                "Adapters are enabled (enable_adapters=True) but `peft` is not installed. "
+                "Install with: pip install peft"
+            )
+
+        self.dispatcher_policy = (dispatcher_policy or "age").lower().strip()
+        if self.dispatcher_policy not in {"age", "edf", "lstf", "setup_aware", "setup_edf", "setup_lstf"}:
+            logger.warning(f"Unknown dispatcher_policy='{dispatcher_policy}'. Falling back to 'age'.")
+            self.dispatcher_policy = "age"
+
         self.dispatcher_batch_wait_s = float(max(0.0, dispatcher_batch_wait_s))
         self.dispatcher_max_sticky_batches = int(max(1, dispatcher_max_sticky_batches))
         self.dispatcher_starvation_ms = float(max(0.0, dispatcher_starvation_ms))
@@ -1892,6 +1967,9 @@ class MultiVariantService:
         self._shutdown = False
         self._active_variant = None
         self._active_batches_run = 0
+        # Adapter stickiness / setup-aware batching (per-variant)
+        self._last_adapter_key_by_variant: Dict[str, Tuple[str, int]] = {}
+        self._active_adapter_batches_run = 0
         # Lightweight tokenizer for routing feature extraction (CPU-side)
         try:
             from transformers import AutoTokenizer
@@ -1916,6 +1994,7 @@ class MultiVariantService:
         logger.info(f"  model_name={self.model_name}")
         logger.info(f"  variants={self.variants}")
         logger.info(f"  router_mode={self.router_mode}")
+        logger.info(f"  dispatcher_policy={self.dispatcher_policy}")
         logger.info(f"  load_strategy={self.load_strategy} (max_loaded_variants={self.max_loaded_variants})")
 
     # -------------------------
@@ -2212,6 +2291,17 @@ class MultiVariantService:
                     enable_batching=self.enable_batching,
                     max_batch_size=self.max_batch_size,
                     batch_wait_ms=self.batch_wait_ms,
+                    enable_adapters=self.enable_adapters,
+                    adapter_root=self.adapter_root,
+                    adapter_policy=self.adapter_policy,
+                    adapter_fixed=self.adapter_fixed,
+                    adapter_rank_policy=self.adapter_rank_policy,
+                    adapter_rank_tiers=",".join([str(x) for x in self.adapter_rank_tiers]),
+                    adapter_fixed_rank=self.adapter_fixed_rank,
+                    max_loaded_adapters=self.max_loaded_adapters,
+                    adapter_eviction_policy=self.adapter_eviction_policy,
+                    adapter_synthetic_load_ms=self.adapter_synthetic_load_ms,
+                    adapter_synthetic_switch_ms=self.adapter_synthetic_switch_ms,
                 )
             except Exception:
                 with self._lock:
@@ -2249,6 +2339,188 @@ class MultiVariantService:
         penalty = qd * (stats.ema_total_ms or base_total) * 0.35
         return base_total + penalty
 
+    def _get_latency_budgets_ms(self, difficulty: str, max_tokens: int) -> Tuple[float, float]:
+        """Return (ttft_budget_ms, total_budget_ms) from the current SLO dict.
+
+        If total_ms is not provided, we derive total_budget_ms as:
+          total = ttft_ms + tpot_ms * max_tokens
+        """
+
+        diff = (difficulty or "easy").lower().strip()
+        slo = None
+        if isinstance(self.slo_dict, dict) and self.slo_dict:
+            slo = self.slo_dict.get(diff) or self.slo_dict.get("default")
+        if not isinstance(slo, dict) or not slo:
+            # If SLOs are not configured, treat as effectively unconstrained.
+            return 1e9, 1e9
+
+        try:
+            ttft_budget = float(slo.get("ttft_ms", 1e9))
+        except Exception:
+            ttft_budget = 1e9
+
+        if "total_ms" in slo:
+            try:
+                total_budget = float(slo.get("total_ms", 1e9))
+            except Exception:
+                total_budget = 1e9
+        else:
+            try:
+                tpot_budget = float(slo.get("tpot_ms", 1e9))
+            except Exception:
+                tpot_budget = 1e9
+            total_budget = ttft_budget + tpot_budget * float(max_tokens)
+
+        return float(ttft_budget), float(total_budget)
+
+    # -------------------------
+    # Adapter-aware routing features
+    # -------------------------
+
+    def _resolve_adapter_choice_locked(
+        self,
+        *,
+        dataset_type: str,
+        difficulty: str,
+        queue_depths: Dict[str, int],
+        explicit_adapter: Optional[str] = None,
+        explicit_rank: Optional[int] = None,
+    ) -> Tuple[str, Optional[int]]:
+        """Resolve (adapter_id, adapter_rank) for this request.
+
+        This is treated as part of the *variant configuration* for batching/scheduling.
+        We resolve it *before* routing so the router can use adapter hotness/setup features.
+        """
+
+        if not self.enable_adapters:
+            return "", None
+
+        # Decide adapter ID.
+        adapter_id_use = choose_adapter_id(
+            policy=self.adapter_policy,
+            dataset_type=dataset_type,
+            fixed_adapter=self.adapter_fixed,
+            explicit_adapter=str(explicit_adapter) if explicit_adapter is not None else None,
+        )
+
+        # Best-effort existence check: if adapter directory missing, fall back to base.
+        if adapter_id_use and self.adapter_root:
+            expected = os.path.join(os.path.abspath(os.path.expanduser(self.adapter_root)), adapter_id_use)
+            if not os.path.isdir(expected):
+                adapter_id_use = ""
+
+        adapter_rank_use: Optional[int] = None
+        if adapter_id_use:
+            if explicit_rank is not None:
+                try:
+                    adapter_rank_use = int(explicit_rank)
+                except Exception:
+                    adapter_rank_use = None
+            else:
+                total_q = 0
+                try:
+                    total_q = int(sum(int(v or 0) for v in (queue_depths or {}).values()))
+                except Exception:
+                    total_q = 0
+                adapter_rank_use = choose_active_rank(
+                    policy=self.adapter_rank_policy,
+                    difficulty=difficulty,
+                    total_queue_depth=total_q,
+                    tiers=self.adapter_rank_tiers,
+                    fixed_rank=self.adapter_fixed_rank,
+                )
+
+        return str(adapter_id_use or ""), (int(adapter_rank_use) if adapter_rank_use is not None else None)
+
+    def _snapshot_adapter_state_locked(self, *, adapter_id: str, adapter_rank: Optional[int]) -> Dict[str, Dict[str, Any]]:
+        """Best-effort per-variant adapter hotness/residency snapshot.
+
+        Returned dict is safe to JSON-serialize and to include in router_meta.
+        """
+
+        aid = str(adapter_id or "").strip()
+        try:
+            rank_i = int(adapter_rank) if adapter_rank is not None else 0
+        except Exception:
+            rank_i = 0
+        key = (aid, int(rank_i))
+
+        out: Dict[str, Dict[str, Any]] = {}
+        for v in self.variants:
+            # Default: cold / unknown.
+            st: Dict[str, Any] = {
+                "adapter_id": aid,
+                "adapter_active_rank": int(rank_i) if adapter_rank is not None else None,
+                "resident": 0,
+                "active": 0,
+                "hot": 0,
+                "num_loaded": 0,
+                "capacity": int(self.max_loaded_adapters),
+                "ewma_load_ms": float(self.adapter_synthetic_load_ms),
+                "ewma_switch_ms": float(self.adapter_synthetic_switch_ms),
+                "setup_est_ms": 0.0,
+            }
+
+            if not self.enable_adapters or not aid:
+                out[v] = st
+                continue
+
+            # Hotness is based on the variant's most recently served adapter key.
+            try:
+                st["hot"] = int(1 if self._last_adapter_key_by_variant.get(v) == key else 0)
+            except Exception:
+                st["hot"] = 0
+
+            srv = self._servers.get(v)
+            mgr = getattr(srv, "_adapter_manager", None) if srv is not None else None
+
+            if mgr is not None:
+                # Use AdapterManager's snapshot (includes EWMA estimates).
+                try:
+                    snap = mgr.snapshot_for(aid, active_rank=(int(rank_i) if adapter_rank is not None else None))
+                    if isinstance(snap, dict):
+                        st.update(snap)
+                except Exception:
+                    pass
+
+                # Ensure fields exist.
+                try:
+                    st.setdefault("resident", int(1 if mgr.is_loaded(aid) else 0))
+                except Exception:
+                    st.setdefault("resident", 0)
+                try:
+                    st.setdefault("active", int(1 if getattr(mgr, "active_adapter", None) == aid else 0))
+                except Exception:
+                    st.setdefault("active", 0)
+                try:
+                    st.setdefault("num_loaded", int(len(getattr(mgr, "loaded_adapters")() or [])))
+                except Exception:
+                    try:
+                        st.setdefault("num_loaded", int(len(getattr(mgr, "_lru", {}) or {})))
+                    except Exception:
+                        st.setdefault("num_loaded", 0)
+
+                # If hot, treat as no-setup (adapter already active with the same rank).
+                if int(st.get("hot", 0) or 0) == 1:
+                    st["setup_est_ms"] = 0.0
+            else:
+                # Variant not loaded or adapters not initialized yet.
+                # Predict a miss cost using synthetic params (paper knob).
+                st["resident"] = 0
+                st["active"] = 0
+                st["num_loaded"] = 0
+                st["ewma_load_ms"] = float(self.adapter_synthetic_load_ms)
+                st["ewma_switch_ms"] = float(self.adapter_synthetic_switch_ms)
+                if aid:
+                    if int(st.get("hot", 0) or 0) == 1:
+                        st["setup_est_ms"] = 0.0
+                    else:
+                        st["setup_est_ms"] = float(max(0.0, st["ewma_load_ms"] + st["ewma_switch_ms"]))
+
+            out[v] = st
+
+        return out
+
     def choose_variant(
         self,
         dataset_type: str,
@@ -2258,6 +2530,10 @@ class MultiVariantService:
         prompt_tokens: int,
         concurrency: int,
         queue_depths: Dict[str, int],
+        # Adapter-aware routing inputs (optional)
+        adapter_id: str = "",
+        adapter_rank: Optional[int] = None,
+        adapter_state: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Tuple[str, str, Dict[str, Any]]:
         # Returns (variant, reason, router_meta)
         dataset_type = (dataset_type or "gsm8k").lower()
@@ -2299,12 +2575,41 @@ class MultiVariantService:
                 prompt_tokens=int(prompt_tokens),
                 concurrency=int(concurrency),
                 queue_depths=queue_depths,
+                adapter_id=str(adapter_id or ""),
+                adapter_rank=int(adapter_rank) if adapter_rank is not None else None,
+                adapter_state=adapter_state,
                 slo_dict=self.slo_dict,
                 mode=mode,
                 allowed_variants=self.variants,
             )
             meta = decision.to_dict()
             meta["router_mode_label"] = "Learned-TTFT" if self.router_mode == "learned_ttft" else "Learned-Total (Derived)"
+            return decision.variant, meta["router_mode_label"], meta
+
+        # Risk router (calibrated latency upper bounds + calibrated quality gating)
+        if self.router_mode == "risk":
+            if self._risk_router is None:
+                raise RuntimeError("Risk router requested but artifacts were not loaded.")
+            decision = self._risk_router.route(
+                dataset_type=dataset_type,
+                difficulty=difficulty,
+                max_tokens=int(max_tokens),
+                prompt_tokens=int(prompt_tokens),
+                concurrency=int(concurrency),
+                queue_depths=queue_depths,
+                adapter_id=str(adapter_id or ""),
+                adapter_rank=int(adapter_rank) if adapter_rank is not None else None,
+                adapter_state=adapter_state,
+                slo_dict=self.slo_dict,
+                latency_delta=float(self.risk_latency_delta),
+                quality_epsilon=float(self.risk_quality_epsilon),
+                allowed_variants=self.variants,
+            )
+            meta = decision.to_dict()
+            meta["router_mode_label"] = f"Risk(δ={self.risk_latency_delta}, ε={self.risk_quality_epsilon})"
+            meta["risk_latency_delta"] = float(self.risk_latency_delta)
+            meta["risk_quality_epsilon"] = float(self.risk_quality_epsilon)
+            meta["risk_quality_alpha"] = float(self.risk_quality_alpha)
             return decision.variant, meta["router_mode_label"], meta
 
         # SLO-aware: choose cheapest predicted to meet SLO.
@@ -2334,10 +2639,29 @@ class MultiVariantService:
         max_tokens: int,
         prompt_tokens: Optional[int] = None,
         concurrency: int = 1,
-    ) -> Tuple[List[str], str, Dict[str, Any], Dict[str, int]]:
-        # Snapshot queue depths at routing time
+        # Optional explicit adapter override (paper: "active adapters" are part of state s)
+        explicit_adapter: Optional[str] = None,
+        explicit_rank: Optional[int] = None,
+    ) -> Tuple[List[str], str, Dict[str, Any], Dict[str, int], str, Optional[int]]:
+        """Compute the escalation path and routing metadata.
+
+        Returns:
+          path, reason, router_meta, queue_depths, adapter_id, adapter_rank
+        """
+
+        # Snapshot queue depths and adapter hotness at routing time.
         with self._lock:
             queue_depths = {v: len(self._queues.get(v, deque())) for v in self.variants}
+
+            adapter_id_use, adapter_rank_use = self._resolve_adapter_choice_locked(
+                dataset_type=dataset_type,
+                difficulty=difficulty,
+                queue_depths=queue_depths,
+                explicit_adapter=explicit_adapter,
+                explicit_rank=explicit_rank,
+            )
+            adapter_state = self._snapshot_adapter_state_locked(adapter_id=adapter_id_use, adapter_rank=adapter_rank_use)
+
             chosen, reason, meta = self.choose_variant(
                 dataset_type=dataset_type,
                 difficulty=difficulty,
@@ -2346,7 +2670,19 @@ class MultiVariantService:
                 prompt_tokens=prompt_tokens,
                 concurrency=concurrency,
                 queue_depths=queue_depths,
+                adapter_id=adapter_id_use,
+                adapter_rank=adapter_rank_use,
+                adapter_state=adapter_state,
             )
+
+            # Always include adapter context in router_meta for training/analysis.
+            try:
+                meta = dict(meta or {})
+            except Exception:
+                meta = {"router_meta_unparsed": str(meta)}
+            meta.setdefault("adapter_id", adapter_id_use)
+            meta.setdefault("adapter_rank", adapter_rank_use)
+            meta.setdefault("adapter_state", adapter_state)
 
         path = [chosen]
         if self.max_retries > 0 and chosen != "base" and "base" in self.variants:
@@ -2355,7 +2691,7 @@ class MultiVariantService:
             if len(path) < (self.max_retries + 1):
                 path.append("base")
 
-        return path[: self.max_retries + 1], reason, meta, queue_depths
+        return path[: self.max_retries + 1], reason, meta, queue_depths, adapter_id_use, adapter_rank_use
 
 
     def _should_retry(self, dataset_type: str, text: str) -> bool:
@@ -2412,6 +2748,18 @@ class MultiVariantService:
         force_variant = kwargs.pop("force_variant", None) or kwargs.pop("router_fixed_variant", None)
         force_variant = _normalize_variant(force_variant) if force_variant else None
 
+        # ------------------------------------------------------------
+        # Adapter selection (optional).
+        # IMPORTANT: we resolve adapter_id/adapter_rank *before routing*
+        # so learned/risk routers can use adapter hotness/setup features.
+        # ------------------------------------------------------------
+        explicit_adapter = kwargs.pop("adapter_id", None)
+        explicit_rank = kwargs.pop("adapter_rank", None)
+        try:
+            explicit_rank = int(explicit_rank) if explicit_rank is not None else None
+        except Exception:
+            explicit_rank = None
+
         # Prompt length (tokens) used as a feature for learned routing.
         prompt_tokens = 0
         try:
@@ -2421,20 +2769,59 @@ class MultiVariantService:
                 prompt_tokens = int(len(prompt.split()))
         except Exception:
             prompt_tokens = int(len(prompt.split()))
+        adapter_id_use = ""
+        adapter_rank_use: Optional[int] = None
+
         if force_variant:
+            # Forced path (trace collection) still needs a consistent adapter snapshot.
             with self._lock:
                 qdepths = {v: len(self._queues.get(v, deque())) for v in self.variants}
+                adapter_id_use, adapter_rank_use = self._resolve_adapter_choice_locked(
+                    dataset_type=dataset_type,
+                    difficulty=difficulty,
+                    queue_depths=qdepths,
+                    explicit_adapter=str(explicit_adapter) if explicit_adapter is not None else None,
+                    explicit_rank=explicit_rank,
+                )
+                adapter_state = self._snapshot_adapter_state_locked(adapter_id=adapter_id_use, adapter_rank=adapter_rank_use)
+
             chosen = force_variant if force_variant in self.variants else "base"
-            path, reason, router_meta = [chosen], f"forced:{chosen}", {"forced_variant": chosen}
+            path, reason, router_meta = [chosen], f"forced:{chosen}", {
+                "forced_variant": chosen,
+                "adapter_id": adapter_id_use,
+                "adapter_rank": adapter_rank_use,
+                "adapter_state": adapter_state,
+            }
         else:
-            path, reason, router_meta, qdepths = self.plan_path(
+            path, reason, router_meta, qdepths, adapter_id_use, adapter_rank_use = self.plan_path(
                 dataset_type,
                 difficulty,
                 prompt_mode,
                 int(max_tokens),
                 prompt_tokens=prompt_tokens,
                 concurrency=int(concurrency),
+                explicit_adapter=str(explicit_adapter) if explicit_adapter is not None else None,
+                explicit_rank=explicit_rank,
             )
+
+        if router_meta is None:
+            router_meta = {}
+        try:
+            router_meta = dict(router_meta)
+        except Exception:
+            router_meta = {"router_meta_unparsed": str(router_meta)}
+        router_meta.setdefault("adapter_id", adapter_id_use)
+        router_meta.setdefault("adapter_rank", adapter_rank_use)
+        # Adapter state is a *router feature* (hotness/setup cost) and used in trace logs.
+        if "adapter_state" not in router_meta:
+            try:
+                with self._lock:
+                    router_meta["adapter_state"] = self._snapshot_adapter_state_locked(
+                        adapter_id=str(adapter_id_use or ""),
+                        adapter_rank=(int(adapter_rank_use) if adapter_rank_use is not None else None),
+                    )
+            except Exception:
+                router_meta["adapter_state"] = {}
 
         req = _MVRequest(
             prompt=prompt,
@@ -2450,6 +2837,8 @@ class MultiVariantService:
             event=threading.Event(),
             router_queue_depths=qdepths,
             router_meta=router_meta,
+            adapter_id=str(adapter_id_use or ""),
+            adapter_rank=int(adapter_rank_use) if adapter_rank_use is not None else None,
         )
 
         # Queue request for its first variant
@@ -2507,6 +2896,64 @@ class MultiVariantService:
         if not non_empty:
             return None
 
+        # "setup_*" policies reuse the same base policy for *which variant*
+        # to serve next, but enable adapter-aware batching within a variant.
+        base_policy = self.dispatcher_policy
+        if base_policy.startswith("setup_"):
+            base_policy = base_policy.replace("setup_", "", 1)
+            if base_policy == "aware":
+                base_policy = "age"
+
+        # Deadline-aware scheduling policies
+        if base_policy in {"edf", "lstf"}:
+            now = time.perf_counter()
+            best_v: Optional[str] = None
+            best_score: Optional[float] = None
+
+            for v in non_empty:
+                head = self._queues[v][0]
+                if base_policy == "edf":
+                    # Earliest absolute SLO deadline first.
+                    _ttft_b, total_b = self._get_latency_budgets_ms(head.difficulty, head.max_tokens)
+                    deadline_t = head.enqueue_t + (float(total_b) / 1000.0)
+                    score = float(deadline_t)
+                else:
+                    # Least slack time first.
+                    slack = None
+                    try:
+                        rm = getattr(head, "router_meta", {}) or {}
+                        if isinstance(rm, dict):
+                            slack = rm.get("slack_min_ms")
+                            if slack is None and isinstance(rm.get("chosen"), dict):
+                                slack = rm["chosen"].get("slack_min_ms")
+                    except Exception:
+                        slack = None
+
+                    if slack is None:
+                        # Fall back to an EMA-based latency estimate.
+                        _ttft_b, total_b = self._get_latency_budgets_ms(head.difficulty, head.max_tokens)
+                        pred = self._predict_latency_ms(v, head.max_tokens)
+                        slack = float(total_b) - float(pred)
+                    score = float(slack)
+
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_v = v
+
+            # Starvation guard: if something has waited too long, serve it.
+            if best_v is not None:
+                oldest_ms = 0.0
+                oldest_v = None
+                for v in non_empty:
+                    w_ms = (now - self._queues[v][0].enqueue_t) * 1000.0
+                    if w_ms > oldest_ms:
+                        oldest_ms = w_ms
+                        oldest_v = v
+                if oldest_v is not None and oldest_ms >= self.dispatcher_starvation_ms:
+                    return oldest_v
+                return best_v
+            return non_empty[0]
+
         # Stickiness: keep serving current variant if it has work and hasn't hit max sticky batches
         if self._active_variant in non_empty:
             # Starvation guard: if another queue has been waiting too long, switch.
@@ -2542,17 +2989,47 @@ class MultiVariantService:
         if not q:
             return []
 
-        first = q[0]
-        key = (first.dataset_type, first.prompt_mode, first.max_tokens, first.temperature, first.top_p)
+        def _k(r: _MVRequest) -> Tuple[Any, ...]:
+            return (
+                r.dataset_type,
+                r.prompt_mode,
+                int(r.max_tokens),
+                float(r.temperature),
+                float(r.top_p),
+                str(getattr(r, "adapter_id", "") or ""),
+                int(getattr(r, "adapter_rank", 0) or 0),
+            )
 
+        # Setup-aware batching: prefer the last adapter/rank used for this variant
+        # (reduces adapter switch + cache-miss overhead).
+        key = None
+        pref = self._last_adapter_key_by_variant.get(variant)
+        if (
+            pref is not None
+            and self.dispatcher_policy.startswith("setup")
+            and self._active_variant == variant
+            and int(getattr(self, "_active_adapter_batches_run", 0)) < int(getattr(self, "dispatcher_max_sticky_adapter_batches", 4))
+        ):
+            pref_aid, pref_rank = pref
+            for r in q:
+                if str(getattr(r, "adapter_id", "") or "") == str(pref_aid or "") and int(getattr(r, "adapter_rank", 0) or 0) == int(pref_rank or 0):
+                    key = _k(r)
+                    break
+
+        if key is None:
+            key = _k(q[0])
+
+        # Collect a batch by scanning the queue and extracting matching items.
+        # This avoids head-of-line blocking when adapters are interleaved.
         batch: List[_MVRequest] = []
-        while q and len(batch) < self.max_batch_size:
-            nxt = q[0]
-            k2 = (nxt.dataset_type, nxt.prompt_mode, nxt.max_tokens, nxt.temperature, nxt.top_p)
-            if k2 != key:
-                break
-            batch.append(q.popleft())
-
+        new_q: Deque[_MVRequest] = deque()
+        while q:
+            r = q.popleft()
+            if len(batch) < self.max_batch_size and _k(r) == key:
+                batch.append(r)
+            else:
+                new_q.append(r)
+        q.extend(new_q)
         return batch
 
     def _dispatcher_loop(self) -> None:
@@ -2569,12 +3046,28 @@ class MultiVariantService:
                 variant = v
                 batch = self._pop_batch_locked(variant)
 
-                # Update stickiness counters
+                # Update stickiness counters (variant + adapter)
+                if batch:
+                    batch_adapter_key = (
+                        str(getattr(batch[0], "adapter_id", "") or ""),
+                        int(getattr(batch[0], "adapter_rank", 0) or 0),
+                    )
+                else:
+                    batch_adapter_key = ("", 0)
+
                 if self._active_variant == variant:
                     self._active_batches_run += 1
+                    if self._last_adapter_key_by_variant.get(variant) == batch_adapter_key:
+                        self._active_adapter_batches_run += 1
+                    else:
+                        self._active_adapter_batches_run = 1
                 else:
                     self._active_variant = variant
                     self._active_batches_run = 1
+                    self._active_adapter_batches_run = 1
+
+                # Remember last adapter used for this variant (setup-aware scheduling).
+                self._last_adapter_key_by_variant[variant] = batch_adapter_key
 
             if not batch:
                 continue
@@ -2598,6 +3091,8 @@ class MultiVariantService:
                     temperature=batch[0].temperature,
                     top_p=batch[0].top_p,
                     prompt_mode=batch[0].prompt_mode,
+                    adapter_id=str(getattr(batch[0], "adapter_id", "") or ""),
+                    adapter_rank=int(getattr(batch[0], "adapter_rank", 0) or 0) or None,
                     require_all_final_answers=require_all_final,
                 )
 
@@ -2623,6 +3118,8 @@ class MultiVariantService:
                     r.attempts.append(
                         {
                             "variant": m.get("variant"),
+                            "adapter_id": m.get("adapter_id", ""),
+                            "adapter_active_rank": m.get("adapter_active_rank"),
                             "success": bool(m.get("success", False)),
                             "ttft_ms": m.get("ttft_ms"),
                             "tpot_ms": m.get("tpot_ms"),

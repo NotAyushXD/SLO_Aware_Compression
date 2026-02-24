@@ -12,13 +12,18 @@ Models:
   - Quality: per-variant logistic regression (P(correct | features))
   - Latency: per-variant ridge regression for TTFT and TPOT
 
-Features (22D):
+Features (22D + adapter features):
   - dataset one-hot (gsm8k, mmlu) => 2
   - difficulty one-hot (easy, medium, hard) => 3
   - max_tokens, sqrt(max_tokens), log1p(max_tokens), max_tokens transforms => 3
   - prompt_tokens: raw, sqrt, log1p => 3
   - concurrency: raw, log1p => 2
   - queue_depth per variant (cheap, med, base): raw, sqrt, log1p => 9
+
+Adapter-aware features (paper polish track):
+  - request has_adapter, adapter_rank, log1p(adapter_rank)
+  - per-variant adapter cache/hotness state (cheap/med/base):
+      resident, hot, num_loaded, log1p(num_loaded), setup_est_ms, log1p(setup_est_ms)
 """
 
 from __future__ import annotations
@@ -87,6 +92,10 @@ class LearnedRouter:
         prompt_tokens: int,
         concurrency: int,
         queue_depths: Dict[str, int],
+        # Adapter-aware routing (optional)
+        adapter_id: str = "",
+        adapter_rank: Optional[int] = None,
+        adapter_state: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> np.ndarray:
         dataset_type = (dataset_type or "").lower()
         difficulty = (difficulty or "easy").lower()
@@ -135,6 +144,50 @@ class LearnedRouter:
             qd = float(queue_depths.get(v, 0))
             feats.extend([qd, float(np.sqrt(qd)), float(np.log1p(qd))])
 
+        # ------------------------------------------------------------------
+        # Adapter hotness / setup-cost features
+        # ------------------------------------------------------------------
+        aid = str(adapter_id or "").strip()
+        has_adapter = 1.0 if aid else 0.0
+        try:
+            rnk = float(int(adapter_rank) if adapter_rank is not None else 0)
+        except Exception:
+            rnk = 0.0
+        feats.extend([has_adapter, rnk, float(np.log1p(max(0.0, rnk)))])
+
+        ast = adapter_state if isinstance(adapter_state, dict) else {}
+        for v in ["cheap", "med", "base"]:
+            st = ast.get(v) if isinstance(ast.get(v), dict) else {}
+            try:
+                resident = float(int(st.get("resident", 0) or 0))
+            except Exception:
+                resident = 0.0
+            # "hot" means the last served adapter key matches this request.
+            # If missing, fall back to 'active'.
+            try:
+                hot = float(int(st.get("hot", st.get("active", 0)) or 0))
+            except Exception:
+                hot = 0.0
+            try:
+                num_loaded = float(int(st.get("num_loaded", 0) or 0))
+            except Exception:
+                num_loaded = 0.0
+            try:
+                setup_est = float(st.get("setup_est_ms", 0.0) or 0.0)
+            except Exception:
+                setup_est = 0.0
+
+            feats.extend(
+                [
+                    resident,
+                    hot,
+                    num_loaded,
+                    float(np.log1p(max(0.0, num_loaded))),
+                    setup_est,
+                    float(np.log1p(max(0.0, setup_est))),
+                ]
+            )
+
         return np.array(feats, dtype=np.float32).reshape(1, -1)
 
     def _get_slo(self, slo_dict: Optional[Dict[str, Dict[str, float]]], difficulty: str) -> Dict[str, float]:
@@ -177,6 +230,10 @@ class LearnedRouter:
         prompt_tokens: int,
         concurrency: int,
         queue_depths: Dict[str, int],
+        # Adapter-aware routing inputs (optional)
+        adapter_id: str = "",
+        adapter_rank: Optional[int] = None,
+        adapter_state: Optional[Dict[str, Dict[str, Any]]] = None,
         slo_dict: Optional[Dict[str, Dict[str, float]]] = None,
         mode: str = "ttft",
         allowed_variants: Optional[List[str]] = None,
@@ -194,7 +251,17 @@ class LearnedRouter:
         # derived total slo
         total_slo = ttft_slo + tpot_slo * float(max_tokens)
 
-        features = self.extract_features(dataset_type, difficulty, max_tokens, prompt_tokens, concurrency, queue_depths)
+        features = self.extract_features(
+            dataset_type,
+            difficulty,
+            max_tokens,
+            prompt_tokens,
+            concurrency,
+            queue_depths,
+            adapter_id=str(adapter_id or ""),
+            adapter_rank=int(adapter_rank) if adapter_rank is not None else None,
+            adapter_state=adapter_state,
+        )
 
         best: Optional[LearnedRouterDecision] = None
         for v in allowed:
