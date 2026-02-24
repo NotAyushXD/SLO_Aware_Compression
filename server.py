@@ -19,6 +19,13 @@ from transformers import (
     StoppingCriteriaList,
 )
 
+# Logits processors (optional, for NaN-safe sampling)
+try:
+    from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
+except Exception:  # pragma: no cover
+    LogitsProcessor = object  # type: ignore
+    LogitsProcessorList = list  # type: ignore
+
 from prompt_templates import get_max_tokens
 from answer_utils import (
     enforce_strict_gsm8k_final_answer,
@@ -145,6 +152,66 @@ class TimingStreamer:
 
     def end(self):
         return
+
+
+class NaNSafeLogitsProcessor(LogitsProcessor):
+    """Make sampling robust to NaNs/Infs in logits.
+
+    Some combinations of:
+      - 4-bit quantization (bnb),
+      - CUDA kernels,
+      - and stochastic decoding
+    can occasionally produce NaN/Inf logits. When `do_sample=True`, transformers
+    calls `torch.multinomial`, which can throw a CUDA "device-side assert" if the
+    probability tensor contains NaNs/Infs.
+
+    This processor sanitizes logits *before* softmax/sampling:
+      - NaN -> large negative
+      - +Inf -> large positive (then clamped)
+      - -Inf is preserved (important for constrained decoding masks)
+
+    The goal is stability, not accuracy.
+    """
+
+    def __init__(self, clamp_min: float = -1e4, clamp_max: float = 1e4):
+        super().__init__()
+        self.clamp_min = float(clamp_min)
+        self.clamp_max = float(clamp_max)
+
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+        try:
+            if not torch.is_floating_point(scores):
+                return scores
+
+            # Preserve -inf entries (used to ban tokens under constrained decoding).
+            neginf_mask = torch.isneginf(scores)
+
+            # Replace NaN / +inf.
+            scores = torch.where(
+                torch.isnan(scores),
+                torch.full_like(scores, self.clamp_min),
+                scores,
+            )
+            scores = torch.where(
+                torch.isposinf(scores),
+                torch.full_like(scores, self.clamp_max),
+                scores,
+            )
+
+            # Clamp only finite values to avoid turning -inf into finite.
+            finite = torch.isfinite(scores)
+            if finite.any():
+                clamped = scores.clamp(min=self.clamp_min, max=self.clamp_max)
+                scores = torch.where(finite, clamped, scores)
+
+            # Restore -inf.
+            if neginf_mask.any():
+                scores = scores.masked_fill(neginf_mask, float("-inf"))
+
+            return scores
+        except Exception:
+            # Never crash generation due to a defensive processor.
+            return scores
 
 
 class StopOnFinalAnswer(StoppingCriteria):
@@ -1145,6 +1212,18 @@ class SingleVariantServer:
         if dataset_type == "gsm8k" and getattr(self, "variant_effective", self.variant) == "cheap":
             gen_kwargs.setdefault("repetition_penalty", 1.08)
             gen_kwargs.setdefault("no_repeat_ngram_size", 3)
+
+        # NaN-safe logits sanitization for stochastic decoding.
+        # This avoids rare-but-fatal "device-side assert" crashes inside torch.multinomial.
+        if do_sample:
+            try:
+                lp = LogitsProcessorList()
+                lp.append(NaNSafeLogitsProcessor())
+                gen_kwargs["logits_processor"] = lp
+            except Exception:
+                # Best-effort; if something about the transformers version disagrees,
+                # simply skip the safety processor.
+                pass
 
         streamer = TimingStreamer(self._synchronize_device)
 
