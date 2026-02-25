@@ -536,6 +536,13 @@ class SingleVariantServer:
         variant: str = "med",
         device: str = "auto",
         dtype: str = "auto",
+        # Optional override for variant quantization.
+        # Examples:
+        #   - "fp16" / "none": load full-precision (no bnb quant)
+        #   - "int8": bitsandbytes 8-bit
+        #   - "int4": bitsandbytes 4-bit (nf4)
+        # If None, the server uses the default mapping from `variant`.
+        quantization_override: Optional[str] = None,
         enable_batching: bool = False,
         max_batch_size: int = 4,
         batch_wait_ms: int = 8,
@@ -613,11 +620,14 @@ class SingleVariantServer:
         elif self.dtype == "bfloat16":
             model_dtype = torch.bfloat16
 
-        # Quantization by variant (with safety fallbacks)
+        # Quantization by variant (with optional overrides + safety fallbacks)
         quant_config = None
         load_kwargs: Dict[str, Any] = {
             "device_map": "auto" if self.device == "cuda" else None,
         }
+
+        # Normalize override string early.
+        q_override = (quantization_override or "").lower().strip() if quantization_override is not None else ""
 
         # Detect compute capability for guardrails (e.g., P100 + bnb int8 can be unstable).
         cc_major: Optional[int] = None
@@ -627,56 +637,115 @@ class SingleVariantServer:
             except Exception:
                 cc_major = None
 
-        if self.variant == "base":
-            self.quantization = f"{self.dtype}"
-            quant_config = None
-        elif self.variant == "med":
-            # bitsandbytes int8 is CUDA-only and can be flaky on older GPUs.
-            if self.device != "cuda":
-                logger.warning("MED (int8) requested on non-CUDA device; falling back to fp16.")
-                self.variant_effective = "base"
+        # --------------------------------------
+        # Quantization override (highest priority)
+        # --------------------------------------
+        override_applied = False
+        if q_override:
+            if q_override in ("none", "fp16", "float16", "fp32", "float32", "bf16", "bfloat16"):
+                # "16-bit quantization" == just load fp16/bf16 weights.
                 self.quantization = f"{self.dtype}"
                 quant_config = None
-            elif cc_major is not None and cc_major < 7:
-                logger.warning(
-                    f"MED (bnb int8) is disabled on this GPU (compute_capability={cc_major}.x); falling back to fp16."
-                )
-                self.variant_effective = "base"
-                self.quantization = f"{self.dtype}"
-                quant_config = None
+                override_applied = True
+            elif q_override in ("int8", "8bit", "8-bit", "bnb_int8"):
+                if self.device != "cuda":
+                    logger.warning("int8 requested on non-CUDA device; falling back to fp16.")
+                    self.variant_effective = "base"
+                    self.quantization = f"{self.dtype}"
+                    quant_config = None
+                elif cc_major is not None and cc_major < 7:
+                    logger.warning(
+                        f"bnb int8 is disabled on this GPU (compute_capability={cc_major}.x); falling back to fp16."
+                    )
+                    self.variant_effective = "base"
+                    self.quantization = f"{self.dtype}"
+                    quant_config = None
+                else:
+                    self.quantization = "bnb_int8"
+                    quant_config = BitsAndBytesConfig(load_in_8bit=True)
+                override_applied = True
+            elif q_override in ("int4", "4bit", "4-bit", "nf4", "bnb_nf4_int4", "bnb_int4"):
+                if self.device != "cuda":
+                    logger.warning("int4 requested on non-CUDA device; falling back to fp16.")
+                    self.variant_effective = "base"
+                    self.quantization = f"{self.dtype}"
+                    quant_config = None
+                elif cc_major is not None and cc_major < 7:
+                    logger.warning(
+                        f"int4 requested on compute capability {cc_major}.x (<7.0); falling back to fp16."
+                    )
+                    self.variant_effective = "base"
+                    self.quantization = f"{self.dtype}"
+                    quant_config = None
+                else:
+                    self.quantization = "bnb_nf4_int4"
+                    quant_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_use_double_quant=False,
+                        bnb_4bit_compute_dtype=torch.float16,
+                    )
+                override_applied = True
             else:
-                self.quantization = "bnb_int8"
-                quant_config = BitsAndBytesConfig(load_in_8bit=True)
-        elif self.variant == "cheap":
-            if self.device != "cuda":
-                logger.warning("CHEAP (int4) requested on non-CUDA device; falling back to fp16.")
-                self.variant_effective = "base"
+                logger.warning(f"Unknown quantization_override='{quantization_override}'. Using default mapping.")
+                q_override = ""
+
+        # --------------------------------------
+        # Default mapping from `variant`
+        # --------------------------------------
+        if not q_override or not override_applied:
+            if self.variant == "base":
                 self.quantization = f"{self.dtype}"
                 quant_config = None
-            elif cc_major is not None and cc_major < 7:
-                logger.warning(f"CHEAP (int4) requested on compute capability {cc_major}.x (<7.0); falling back to fp16.")
-                self.variant_effective = "base"
-                self.quantization = f"{self.dtype}"
-                quant_config = None
+            elif self.variant == "med":
+                # bitsandbytes int8 is CUDA-only and can be flaky on older GPUs.
+                if self.device != "cuda":
+                    logger.warning("MED (int8) requested on non-CUDA device; falling back to fp16.")
+                    self.variant_effective = "base"
+                    self.quantization = f"{self.dtype}"
+                    quant_config = None
+                elif cc_major is not None and cc_major < 7:
+                    logger.warning(
+                        f"MED (bnb int8) is disabled on this GPU (compute_capability={cc_major}.x); falling back to fp16."
+                    )
+                    self.variant_effective = "base"
+                    self.quantization = f"{self.dtype}"
+                    quant_config = None
+                else:
+                    self.quantization = "bnb_int8"
+                    quant_config = BitsAndBytesConfig(load_in_8bit=True)
+            elif self.variant == "cheap":
+                if self.device != "cuda":
+                    logger.warning("CHEAP (int4) requested on non-CUDA device; falling back to fp16.")
+                    self.variant_effective = "base"
+                    self.quantization = f"{self.dtype}"
+                    quant_config = None
+                elif cc_major is not None and cc_major < 7:
+                    logger.warning(
+                        f"CHEAP (int4) requested on compute capability {cc_major}.x (<7.0); falling back to fp16."
+                    )
+                    self.variant_effective = "base"
+                    self.quantization = f"{self.dtype}"
+                    quant_config = None
+                else:
+                    self.quantization = "bnb_nf4_int4"
+                    quant_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_quant_type="nf4",
+                        # NOTE:
+                        # - Double-quant can save memory, but it is also one of the main knobs that can
+                        #   increase output degeneracy for some instruct models (esp. long-form GSM8K).
+                        # - For "cheap" we prefer *stability/quality* over the last bit of VRAM.
+                        bnb_4bit_use_double_quant=False,
+                        # Use fp16 compute for stability across common Kaggle/Colab GPUs.
+                        # (bf16 compute can be unstable for some bnb 4-bit stacks; fp16 is the safest.)
+                        bnb_4bit_compute_dtype=torch.float16,
+                    )
             else:
-                self.quantization = "bnb_nf4_int4"
-                quant_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_quant_type="nf4",
-                    # NOTE:
-                    # - Double-quant can save memory, but it is also one of the main knobs that can
-                    #   increase output degeneracy for some instruct models (esp. long-form GSM8K).
-                    # - For "cheap" we prefer *stability/quality* over the last bit of VRAM.
-                    bnb_4bit_use_double_quant=False,
-                    # Use fp16 compute for stability across common Kaggle/Colab GPUs.
-                    # (bf16 compute can be unstable for some bnb 4-bit stacks; fp16 is the safest.)
-                    bnb_4bit_compute_dtype=torch.float16,
-                )
-        else:
-            logger.warning(f"Unknown variant '{self.variant}', defaulting to base (fp16)")
-            self.variant_effective = "base"
-            self.quantization = f"{self.dtype}"
-            quant_config = None
+                logger.warning(f"Unknown variant '{self.variant}', defaulting to base (fp16)")
+                self.variant_effective = "base"
+                self.quantization = f"{self.dtype}"
+                quant_config = None
 
         if self.variant_effective != self.variant:
             logger.warning(
@@ -1141,6 +1210,15 @@ class SingleVariantServer:
         # Decoding strategy
         do_sample = bool(prompt_mode != "slo" and temperature and float(temperature) > 0.0)
 
+        # "CHEAP" historically meant 4-bit nf4 quantization. If callers override CHEAP to
+        # be a small fp16 model (e.g., Llama-3B), we should *not* apply 4-bit-specific
+        # guardrails (they can hurt quality / truncate generations).
+        variant_eff = getattr(self, "variant_effective", self.variant)
+        quant_str = str(getattr(self, "quantization", "") or "").lower()
+        is_4bit_cheap = bool(
+            variant_eff == "cheap" and any(t in quant_str for t in ("4bit", "int4", "nf4", "fp4"))
+        )
+
         # Stopping criteria
         stopping_criteria = None
         if dataset_type == "gsm8k":
@@ -1150,7 +1228,7 @@ class SingleVariantServer:
                 require_all=bool(require_all_final_answers and bsz > 1),
             )
             criteria = [stopper]
-            if getattr(self, "variant_effective", self.variant) == "cheap":
+            if is_4bit_cheap:
                 criteria.append(StopOnDegenerateGibberish(tokenizer=self.tokenizer, prompt_len=prompt_len))
             stopping_criteria = StoppingCriteriaList(criteria)
 
@@ -1209,7 +1287,7 @@ class SingleVariantServer:
         # loops on longer GSM8K generations under greedy decoding. These light-weight
         # constraints are deterministic and typically improve both format adherence and
         # correctness for CHEAP without materially harming latency.
-        if dataset_type == "gsm8k" and getattr(self, "variant_effective", self.variant) == "cheap":
+        if dataset_type == "gsm8k" and is_4bit_cheap:
             gen_kwargs.setdefault("repetition_penalty", 1.08)
             gen_kwargs.setdefault("no_repeat_ngram_size", 3)
 
@@ -1532,7 +1610,33 @@ class SingleVariantServer:
             return req.result_text or "", req.result_metrics or {}
 
         # Direct (non-batched) generation.
+        # NOTE: In accuracy mode we may run multiple internal attempts (self-consistency
+        # or format retries). We measure end-to-end wall time here so `total_latency_ms`
+        # matches what the client observes.
+        req_t0 = time.perf_counter()
+        total_cost_units: float = 0.0
+        total_lock_wait_ms: float = 0.0
+        num_attempts: int = 0
 
+        def _accumulate_attempt(m: Dict[str, Any], lw_ms: float) -> None:
+            nonlocal total_cost_units, total_lock_wait_ms, num_attempts
+            num_attempts += 1
+            try:
+                total_cost_units += float(m.get("cost_units") or 0.0)
+            except Exception:
+                pass
+            try:
+                total_lock_wait_ms += float(max(0.0, lw_ms or 0.0))
+            except Exception:
+                pass
+
+        # Determine whether this server's CHEAP variant is actually 4-bit. If CHEAP is
+        # overridden to a small fp16/bf16 model, we disable 4-bit-specific hacks.
+        variant_eff = getattr(self, "variant_effective", self.variant)
+        quant_str = str(getattr(self, "quantization", "") or "").lower()
+        is_4bit_cheap = bool(
+            variant_eff == "cheap" and any(t in quant_str for t in ("4bit", "int4", "nf4", "fp4"))
+        )
 
         # ------------------------------------------------------------------
         # CHEAP GSM8K primary rescue path (format-first, same variant)
@@ -1548,7 +1652,7 @@ class SingleVariantServer:
         # deterministic sampling (seeded inside _generate_hf_batch) to prevent repetition loops.
         prompt_use = prompt
         variant_eff = getattr(self, "variant_effective", self.variant)
-        if dataset_type == "gsm8k" and prompt_mode == "accuracy" and variant_eff == "cheap":
+        if dataset_type == "gsm8k" and prompt_mode == "accuracy" and is_4bit_cheap:
             try:
                 prompt_use = self._build_gsm8k_compact_prompt(prompt)
             except Exception:
@@ -1561,7 +1665,7 @@ class SingleVariantServer:
         # For CHEAP+GSM8K+accuracy: use a small, deterministic self-consistency pass.
         # 4-bit decoding can be brittle on long-form math; sampling a few short candidates and
         # taking a majority vote often improves correctness while keeping behavior reproducible.
-        if dataset_type == "gsm8k" and prompt_mode == "accuracy" and variant_eff == "cheap":
+        if dataset_type == "gsm8k" and prompt_mode == "accuracy" and is_4bit_cheap:
             samples = []
             for s in range(3):
                 s_texts, s_metrics_list, s_lock_wait_ms = self._generate_hf_batch(
@@ -1582,6 +1686,7 @@ class SingleVariantServer:
                     cand = extract_gsm8k_strict(s_text) or extract_gsm8k_parseable(s_text)
                 except Exception:
                     cand = ""
+                _accumulate_attempt(s_metrics_list[0], s_lock_wait_ms)
                 samples.append((s_text, s_metrics_list[0], float(max(0.0, s_lock_wait_ms)), cand))
 
             # Choose candidate by majority vote over extracted numbers (fall back to the first sample).
@@ -1608,6 +1713,9 @@ class SingleVariantServer:
                 adapter_rank=int(adapter_rank_use) if adapter_rank_use is not None else None,
                 require_all_final_answers=False,
             )
+
+            # Single-attempt direct generation.
+            _accumulate_attempt(metrics_list[0], lock_wait_ms)
 
         metrics = metrics_list[0]
         metrics["scheduler_wait_ms"] = 0.0
@@ -1641,7 +1749,7 @@ class SingleVariantServer:
                 #  - CHEAP: two short retries with deterministic sampling:
                 #      (1) answer-only, (2) fill-the-blank ending with 'FINAL_ANSWER: '.
                 attempts = []
-                if variant_eff == "cheap":
+                if is_4bit_cheap:
                     attempts = [
                         ("answer_only", self._build_gsm8k_answer_only_prompt, 0.20, 0.90, 24, True),
                         ("fill_blank", self._build_gsm8k_fill_blank_prompt, 0.20, 0.90, 12, True),
@@ -1650,6 +1758,10 @@ class SingleVariantServer:
                     attempts = [
                         ("answer_only", self._build_gsm8k_answer_only_prompt, 0.0, 1.0, 48, False),
                     ]
+
+                first_attempt_output_len = int(metrics.get("output_length") or 0)
+                first_attempt_tpot_ms = float(metrics.get("tpot_ms") or 0.0)
+                first_attempt_total_ms = float(metrics.get("total_latency_ms") or 0.0)
 
                 for (tag, builder, r_temp, r_top_p, r_max_tokens, r_constrain_ascii) in attempts:
                     try:
@@ -1668,6 +1780,7 @@ class SingleVariantServer:
                         )
 
                         r_text = r_texts[0]
+                        _accumulate_attempt(r_metrics_list[0], r_lock_wait_ms)
                         try:
                             r_ok = bool(extract_gsm8k_parseable(r_text) or extract_gsm8k_strict(r_text))
                         except Exception:
@@ -1684,15 +1797,40 @@ class SingleVariantServer:
                                 "reason": "gsm8k_format_failure",
                                 "variant_effective": variant_eff,
                                 "attempt": tag,
-                                "first_attempt_output_len": int(metrics.get("output_length") or 0),
-                                "first_attempt_tpot_ms": float(metrics.get("tpot_ms") or 0.0),
-                                "first_attempt_total_ms": float(metrics.get("total_latency_ms") or 0.0),
+                                "first_attempt_output_len": first_attempt_output_len,
+                                "first_attempt_tpot_ms": first_attempt_tpot_ms,
+                                "first_attempt_total_ms": first_attempt_total_ms,
                             }
-                            return r_text, r_metrics
+                            # Swap in the successful retry output, but do not return yet.
+                            # We'll overwrite latency/cost below to reflect *all* attempts.
+                            text = r_text
+                            metrics = r_metrics
+                            break
                     except Exception:
                         # If a retry fails for any reason, try the next attempt.
                         continue
 
+
+        # ------------------------------------------------------------------
+        # Fix latency/cost accounting for multi-attempt direct calls
+        # ------------------------------------------------------------------
+        # In accuracy mode we may run multiple internal attempts (self-consistency,
+        # format retries). The client waits for *all* of them, so `total_latency_ms`
+        # must reflect end-to-end wall time, not just the last attempt.
+        req_total_ms = float(max(0.0, (time.perf_counter() - req_t0) * 1000.0))
+        metrics["total_latency_ms"] = req_total_ms
+        if num_attempts > 0:
+            metrics["cost_units"] = float(total_cost_units)
+            metrics["num_attempts"] = int(num_attempts)
+            metrics["lock_wait_ms"] = float(total_lock_wait_ms)
+            metrics["queue_wait_ms"] = float(total_lock_wait_ms)
+        # Effective throughput for the returned output.
+        try:
+            out_len = int(metrics.get("output_length") or 0)
+            if req_total_ms > 0.0:
+                metrics["throughput_tokens_per_sec"] = float(out_len) / (req_total_ms / 1000.0)
+        except Exception:
+            pass
 
         # Attach client-side concurrency hint (used for router training features).
         metrics["concurrency"] = int(concurrency)
@@ -1876,6 +2014,12 @@ class MultiVariantService:
         variants: Optional[List[str]] = None,
         device: str = "cuda",
         dtype: str = "float16",
+        # Optional per-variant overrides (useful when CHEAP is a different model size).
+        # Example:
+        #   variant_models={"cheap": "meta-llama/Llama-3.2-3B-Instruct"}
+        #   variant_quantization={"cheap": "fp16"}
+        variant_models: Optional[Dict[str, str]] = None,
+        variant_quantization: Optional[Dict[str, str]] = None,
         router_mode: str = "difficulty",
         router_fixed_variant: Optional[str] = None,
         fixed_variant: Optional[str] = None,
@@ -2029,6 +2173,29 @@ class MultiVariantService:
             self.fixed_variant = "base"
 
         self._stats = {v: _VariantStats() for v in self.variants}
+
+        # ------------------------------------------------------------------
+        # Per-variant model / quantization overrides
+        # ------------------------------------------------------------------
+        # This enables experiments where (for example) CHEAP is a smaller fp16 model
+        # rather than a 4-bit quantized version of the same base model.
+        self.model_name_by_variant: Dict[str, str] = {v: self.model_name for v in self.variants}
+        for k, v in (variant_models or {}).items():
+            try:
+                nk = _normalize_variant(str(k))
+            except Exception:
+                continue
+            if nk in self.model_name_by_variant and v:
+                self.model_name_by_variant[nk] = str(v)
+
+        self.quantization_override_by_variant: Dict[str, str] = {}
+        for k, v in (variant_quantization or {}).items():
+            try:
+                nk = _normalize_variant(str(k))
+            except Exception:
+                continue
+            if nk in self.variants and v:
+                self.quantization_override_by_variant[nk] = str(v)
         self.slo_dict = {}
 
         self.load_strategy = (load_strategy or "auto").lower()
@@ -2362,11 +2529,14 @@ class MultiVariantService:
 
             # Actually load variant (no global lock held)
             try:
+                model_name = self.model_name_by_variant.get(variant, self.model_name)
+                quant_override = self.quantization_override_by_variant.get(variant)
                 srv = SingleVariantServer(
-                    model_name=self.model_name,
+                    model_name=model_name,
                     variant=variant,
                     device=self.device,
                     dtype=self.dtype,
+                    quantization_override=quant_override,
                     enable_batching=self.enable_batching,
                     max_batch_size=self.max_batch_size,
                     batch_wait_ms=self.batch_wait_ms,

@@ -233,6 +233,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     p.add_argument("--dtype", type=str, default="auto", choices=["auto", "float16", "bfloat16"])
 
+    # Optional per-variant overrides.
+    # A common use-case is making CHEAP a smaller fp16 model (e.g., Llama-3B) rather than
+    # a 4-bit quantized version of the same base model.
+    p.add_argument(
+        "--cheap_model",
+        type=str,
+        default=None,
+        help="Optional override HF model id for variant=cheap (e.g., meta-llama/Llama-3.2-3B-Instruct).",
+    )
+    p.add_argument(
+        "--cheap_quantization",
+        type=str,
+        default=None,
+        choices=["fp16", "bf16", "int8", "int4", "none"],
+        help="Optional override quantization for variant=cheap. If --cheap_model is set and this is omitted, defaults to fp16.",
+    )
+
 
     # Serving mode
     p.add_argument(
@@ -623,6 +640,18 @@ def main() -> None:
 
     if args.backend == "hf":
         if args.service == "multi":
+            # Optional per-variant overrides (e.g., make CHEAP a smaller fp16 model).
+            variant_models = {}
+            variant_quant = {}
+            if args.cheap_model:
+                variant_models["cheap"] = str(args.cheap_model)
+                # Convenience: if a separate cheap model is provided, default to fp16 unless
+                # the user explicitly requests int8/int4.
+                if args.cheap_quantization is None:
+                    variant_quant["cheap"] = "fp16"
+            if args.cheap_quantization:
+                variant_quant["cheap"] = str(args.cheap_quantization)
+
             server = MultiVariantService(
                 model_name=args.model,
                 variants=tuple(args.multi_variants),
@@ -637,6 +666,8 @@ def main() -> None:
                 dispatcher_policy=str(args.dispatcher_policy),
                 device=effective_device,
                 dtype=args.dtype,
+                variant_models=variant_models or None,
+                variant_quantization=variant_quant or None,
                 enable_batching=effective_enable_batching,
                 max_batch_size=args.max_batch_size,
                 batch_wait_ms=args.batch_wait_ms,
@@ -657,11 +688,23 @@ def main() -> None:
                 dispatcher_max_sticky_adapter_batches=int(args.dispatcher_max_sticky_adapter_batches),
             )
         else:
+            # Optional CHEAP override for single-variant runs.
+            model_name = args.model
+            quant_override = None
+            if str(args.variant).lower() == "cheap":
+                if args.cheap_model:
+                    model_name = str(args.cheap_model)
+                    if args.cheap_quantization is None:
+                        quant_override = "fp16"
+                if args.cheap_quantization:
+                    quant_override = str(args.cheap_quantization)
+
             server = SingleVariantServer(
-                model_name=args.model,
+                model_name=model_name,
                 variant=args.variant,
                 device=effective_device,
                 dtype=args.dtype,
+                quantization_override=quant_override,
                 enable_batching=effective_enable_batching,
                 max_batch_size=args.max_batch_size,
                 batch_wait_ms=args.batch_wait_ms,
