@@ -1,0 +1,23 @@
+{
+  "description": "Bandit router with adapters enabled (synthetic-friendly).",
+  "command": [
+    "--service", "multi",
+    "--router_mode", "bandit",
+    "--multi_variants", "cheap", "med", "base",
+    "--prompt_mode", "slo",
+    "--processed_dir", "data/processed",
+    "--load_test_split", "val",
+    "--num_requests", "200",
+    "--concurrencies", "4",
+    "--slo_calibration_concurrency", "4",
+
+    "--enable_adapters",
+    "--adapter_allow_missing",
+    "--adapter_synthetic_load_ms", "20",
+    "--adapter_synthetic_switch_ms", "5",
+
+    "--bandit_delta", "0.05",
+    "--bandit_lambda", "0.5",
+    "--bandit_eta", "0.05"
+  ]
+}

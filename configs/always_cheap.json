@@ -1,0 +1,14 @@
+{
+  "description": "Always route to cheap variant.",
+  "command": [
+    "--service", "multi",
+    "--router_mode", "always_cheap",
+    "--multi_variants", "cheap", "med", "base",
+    "--prompt_mode", "slo",
+    "--processed_dir", "data/processed",
+    "--load_test_split", "val",
+    "--num_requests", "200",
+    "--concurrencies", "4",
+    "--slo_calibration_concurrency", "4"
+  ]
+}

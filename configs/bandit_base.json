@@ -1,0 +1,17 @@
+{
+  "description": "Bandit router (primal-dual contextual bandit) baseline config.",
+  "command": [
+    "--service", "multi",
+    "--router_mode", "bandit",
+    "--multi_variants", "cheap", "med", "base",
+    "--prompt_mode", "slo",
+    "--processed_dir", "data/processed",
+    "--load_test_split", "val",
+    "--num_requests", "200",
+    "--concurrencies", "4",
+    "--slo_calibration_concurrency", "4",
+    "--bandit_delta", "0.05",
+    "--bandit_lambda", "0.5",
+    "--bandit_eta", "0.05"
+  ]
+}

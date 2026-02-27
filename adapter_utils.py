@@ -194,6 +194,10 @@ class AdapterManager:
         eviction_policy: str = "lru",
         synthetic_load_ms: float = 0.0,
         synthetic_switch_ms: float = 0.0,
+        # If True, allow "synthetic" adapters without PEFT installed and/or
+        # without adapter directories on disk. This keeps the caching + overhead
+        # accounting path runnable for experiments (e.g., adapter churn sweeps).
+        allow_missing_adapters: bool = False,
     ):
         self.base_model = base_model
         self.adapter_registry = adapter_registry
@@ -201,6 +205,7 @@ class AdapterManager:
         self.eviction_policy = (eviction_policy or "lru").lower().strip()
         self.synthetic_load_ms = float(max(0.0, synthetic_load_ms))
         self.synthetic_switch_ms = float(max(0.0, synthetic_switch_ms))
+        self.allow_missing_adapters = bool(allow_missing_adapters)
 
         # Lightweight online statistics (used for router features / setup-cost prediction).
         # These are best-effort and not meant to be perfectly synchronized across threads.
@@ -302,8 +307,26 @@ class AdapterManager:
             return AdapterLoadResult(adapter_id=adapter_id, cache_hit=True, load_ms=0.0, evicted=[])
 
         adapter_dir = self.adapter_registry.resolve(adapter_id)
-        if not adapter_dir:
-            raise FileNotFoundError(f"Adapter '{adapter_id}' not found under {self.adapter_registry.adapter_root}")
+        if (not adapter_dir) or (self.allow_missing_adapters and not peft_available()):
+            if not self.allow_missing_adapters:
+                raise FileNotFoundError(f"Adapter '{adapter_id}' not found under {self.adapter_registry.adapter_root}")
+
+            # Synthetic adapter load (no PEFT / no files required).
+            t0 = time.perf_counter()
+            if self.synthetic_load_ms > 0:
+                time.sleep(self.synthetic_load_ms / 1000.0)
+            t1 = time.perf_counter()
+
+            load_ms = float(max(0.0, (t1 - t0) * 1000.0))
+            try:
+                self.ewma_load_ms = self._ewma_update(self.ewma_load_ms, load_ms, self._num_load_samples)
+                self._num_load_samples += 1
+            except Exception:
+                pass
+
+            self._touch(adapter_id)
+            evicted = self._evict_if_needed()
+            return AdapterLoadResult(adapter_id=adapter_id, cache_hit=False, load_ms=load_ms, evicted=evicted)
 
         peft = require_peft()
         t0 = time.perf_counter()

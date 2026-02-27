@@ -1,9 +1,17 @@
 # metrics.py
-"""Metrics calculation + SLO compliance.
+"""metrics.py
+
+Metrics calculation + SLO compliance.
+
+Blueprint alignment (paper-facing):
+- **Primary SLO event** uses TTFT + **E2E**, where E2E is measured server-side
+  as ``total_latency_ms`` (queue-inclusive Option A).
+- We still track TPOT for diagnostics, but it is *not* part of the primary
+  violation definition.
 
 Patch highlights (paper reliability):
 - SLO calibration profiles for p90/p95/p99 (sensitivity analysis).
-- Robust handling of server-side TTFT definitions (Option A already encoded in server.py).
+- Robust handling of server-side TTFT definitions (Option A is encoded in server.py).
 """
 
 from __future__ import annotations
@@ -28,7 +36,7 @@ def calibrate_slos(request_metrics: List, percentile: float = 95.0) -> Dict:
         percentile: Percentile to use (e.g., 95.0)
 
     Returns:
-        Dict[str, Dict[str, float]] keyed by difficulty with ttft_ms/tpot_ms.
+        Dict[str, Dict[str, float]] keyed by difficulty with ttft_ms/total_ms.
     """
 
     if not request_metrics:
@@ -39,21 +47,36 @@ def calibrate_slos(request_metrics: List, percentile: float = 95.0) -> Dict:
         if not getattr(m, "success", False):
             continue
         diff = getattr(m, "difficulty", "medium")
-        by_diff.setdefault(diff, {"ttft": [], "tpot": []})
+        by_diff.setdefault(diff, {"ttft": [], "total": [], "tpot": []})
         by_diff[diff]["ttft"].append(float(getattr(m, "ttft_ms", 0.0) or 0.0))
+
+        # E2E is the server-side queue-inclusive total latency.
+        inf = getattr(m, "inference_metrics", {}) or {}
+        total_ms = float(inf.get("total_latency_ms", 0.0) or 0.0)
+        if total_ms <= 0.0:
+            # Backward compat: fall back to client-side measurement.
+            total_ms = float(getattr(m, "e2e_latency_ms", 0.0) or 0.0)
+        by_diff[diff]["total"].append(float(total_ms))
+
+        # Keep TPOT around for diagnostics.
         by_diff[diff]["tpot"].append(float(getattr(m, "tpot_ms", 0.0) or 0.0))
 
     calibrated: Dict[str, Dict[str, float]] = {}
     for diff, values in by_diff.items():
         ttft_vals = [v for v in values["ttft"] if v > 0]
+        total_vals = [v for v in values["total"] if v > 0]
         tpot_vals = [v for v in values["tpot"] if v > 0]
 
         ttft_p = float(np.percentile(ttft_vals, percentile)) if ttft_vals else 0.0
+        total_p = float(np.percentile(total_vals, percentile)) if total_vals else 0.0
         tpot_p = float(np.percentile(tpot_vals, percentile)) if tpot_vals else 0.0
 
         # Round up for cleaner, slightly-conservative SLOs.
         calibrated[diff] = {
             "ttft_ms": float(np.ceil(ttft_p)),
+            # Primary E2E threshold
+            "total_ms": float(np.ceil(total_p)),
+            # Diagnostics only (not used in primary violation definition)
             "tpot_ms": float(np.ceil(tpot_p)),
         }
 
@@ -94,9 +117,10 @@ class MetricsCalculator:
 
     # Default SLOs used only if calibration is disabled/missing.
     DEFAULT_SLOS = {
-        "easy": {"ttft_ms": 150, "tpot_ms": 1000},
-        "medium": {"ttft_ms": 250, "tpot_ms": 1000},
-        "hard": {"ttft_ms": 400, "tpot_ms": 1500},
+        # Defaults are intentionally loose; the paper should report *calibrated* SLOs.
+        "easy": {"ttft_ms": 150, "total_ms": 1500},
+        "medium": {"ttft_ms": 250, "total_ms": 2000},
+        "hard": {"ttft_ms": 400, "total_ms": 3000},
     }
 
     def __init__(self, request_metrics: List, slo_dict: Optional[Dict] = None):
@@ -125,7 +149,13 @@ class MetricsCalculator:
 
         ttft_values = [float(m.ttft_ms) for m in self.metrics if float(getattr(m, "ttft_ms", 0.0) or 0.0) > 0]
         tpot_values = [float(m.tpot_ms) for m in self.metrics if float(getattr(m, "tpot_ms", 0.0) or 0.0) > 0]
-        e2e_values = [float(getattr(m, "e2e_latency_ms", 0.0) or 0.0) for m in self.metrics]
+        # E2E definition (paper): server-side queue-inclusive total latency.
+        e2e_values = [
+            float((getattr(m, "inference_metrics", {}) or {}).get("total_latency_ms", 0.0) or 0.0)
+            for m in self.metrics
+        ]
+        # Backward compat fallback.
+        e2e_values = [v if v > 0.0 else float(getattr(m, "e2e_latency_ms", 0.0) or 0.0) for v, m in zip(e2e_values, self.metrics)]
         queue_values = [float(getattr(m, "queue_wait_time_ms", 0.0) or 0.0) for m in self.metrics]
 
         ttft_p = self.calculate_percentiles(ttft_values)
@@ -230,6 +260,17 @@ class MetricsCalculator:
         total_cost_units = 0.0
         total_cost_units_slo_ok = 0.0
         total_cost_units_qa_ok = 0.0
+        # Cost breakdown (if provided by the server)
+        total_token_cost_units = 0.0
+        total_adapter_overhead_units = 0.0
+        total_swap_overhead_units = 0.0
+        swap_loaded_reqs = 0
+        # Adapter cache diagnostics
+        adapter_requests = 0
+        adapter_cache_hits = 0
+        adapter_cache_misses = 0
+        adapter_load_ms_sum = 0.0
+        adapter_switch_ms_sum = 0.0
         cost_mult_sum = 0.0
         cost_mult_count = 0
         total_tokens_sum = 0
@@ -267,6 +308,52 @@ class MetricsCalculator:
                 cm = _variant_cost_multiplier(inf)
                 cu = _cost_units(inf)
                 total_cost_units += float(cu)
+
+                # Cost breakdown when available
+                try:
+                    tcu = inf.get("token_cost_units", None)
+                    if tcu is None:
+                        # Fall back to token-only reconstruction when field is missing.
+                        tcu = float(cm) * float(int(inf.get("total_tokens", 0) or 0))
+                    total_token_cost_units += float(tcu or 0.0)
+                except Exception:
+                    pass
+                try:
+                    total_adapter_overhead_units += float(inf.get("adapter_overhead_units", 0.0) or 0.0)
+                except Exception:
+                    pass
+                try:
+                    total_swap_overhead_units += float(inf.get("swap_overhead_units", 0.0) or 0.0)
+                except Exception:
+                    pass
+                try:
+                    if bool(inf.get("swap_loaded", False)):
+                        swap_loaded_reqs += 1
+                except Exception:
+                    pass
+
+                # Adapter cache stats
+                try:
+                    adapter_id = str(inf.get("adapter_id", "") or "")
+                except Exception:
+                    adapter_id = ""
+                if adapter_id:
+                    adapter_requests += 1
+                    try:
+                        if bool(inf.get("adapter_cache_hit", False)):
+                            adapter_cache_hits += 1
+                        else:
+                            adapter_cache_misses += 1
+                    except Exception:
+                        pass
+                    try:
+                        adapter_load_ms_sum += float(inf.get("adapter_load_ms", 0.0) or 0.0)
+                    except Exception:
+                        pass
+                    try:
+                        adapter_switch_ms_sum += float(inf.get("adapter_switch_ms", 0.0) or 0.0)
+                    except Exception:
+                        pass
                 cost_mult_sum += float(cm)
                 cost_mult_count += 1
                 try:
@@ -283,11 +370,34 @@ class MetricsCalculator:
             slo = self.slo_dict.get(diff, self.slo_dict.get("medium", self.DEFAULT_SLOS["medium"]))
 
             ttft = float(getattr(m, "ttft_ms", 0.0) or 0.0)
+            # E2E is server-side total latency.
+            total_ms = float((inf or {}).get("total_latency_ms", 0.0) or 0.0)
+            if total_ms <= 0.0:
+                total_ms = float(getattr(m, "e2e_latency_ms", 0.0) or 0.0)
+            # Diagnostics only.
             tpot = float(getattr(m, "tpot_ms", 0.0) or 0.0)
 
             ttft_ok = ttft <= float(slo.get("ttft_ms", 0.0) or 0.0)
-            tpot_ok = tpot <= float(slo.get("tpot_ms", 0.0) or 0.0)
-            slo_pass = bool(ttft_ok and tpot_ok)
+            total_budget_ms = slo.get("total_ms", None)
+            if total_budget_ms is None:
+                # Backward compat: if only TPOT is provided, derive a conservative total.
+                # Prefer logged max_tokens, then fall back to observed output length.
+                try:
+                    tpot_budget_ms = float(slo.get("tpot_ms", 1e9) or 1e9)
+                except Exception:
+                    tpot_budget_ms = 1e9
+                try:
+                    max_tokens_est = int(inf.get("max_tokens", 0) or 0)
+                    if max_tokens_est <= 0:
+                        max_tokens_est = int(inf.get("max_new_tokens", 0) or 0)
+                    if max_tokens_est <= 0:
+                        max_tokens_est = int(inf.get("output_length", inf.get("output_tokens", 0)) or 0)
+                except Exception:
+                    max_tokens_est = 0
+                total_budget_ms = float(slo.get("ttft_ms", 0.0) or 0.0) + float(tpot_budget_ms) * float(max(0, max_tokens_est))
+
+            total_ok = total_ms <= float(total_budget_ms or 0.0)
+            slo_pass = bool(ttft_ok and total_ok)
 
             out_toks = int(inf.get("output_length", inf.get("output_tokens", 0)) or 0)
             if slo_pass:
@@ -317,9 +427,12 @@ class MetricsCalculator:
                         "ttft_ms": ttft,
                         "ttft_slo": float(slo.get("ttft_ms", 0.0) or 0.0),
                         "ttft_ok": ttft_ok,
+                        "total_ms": float(total_ms),
+                        "total_slo": float(total_budget_ms or 0.0),
+                        "total_ok": bool(total_ok),
+                        # Diagnostics
                         "tpot_ms": tpot,
                         "tpot_slo": float(slo.get("tpot_ms", 0.0) or 0.0),
-                        "tpot_ok": tpot_ok,
                     }
                 )
 
@@ -349,6 +462,30 @@ class MetricsCalculator:
         cost_units_per_sec = float(total_cost_units) / max(float(total_duration), 1e-9)
         cost_per_goodput_token = float(total_cost_units) / max(float(goodput_out_tokens), 1.0)
         cost_per_qa_goodput_token = float(total_cost_units) / max(float(qa_goodput_out_tokens), 1.0)
+
+        # Bandit diagnostics (useful for E6 label-budget + delayed-label experiments)
+        bandit_update_events = 0
+        bandit_quality_label_used = 0
+        bandit_pending_stored = 0
+        for m in self.metrics:
+            if not getattr(m, "success", False):
+                continue
+            inf = _inf(m)
+            if not isinstance(inf, dict):
+                continue
+            bu = inf.get("bandit_update")
+            if not isinstance(bu, dict):
+                continue
+            if bool(bu.get("updated", False)):
+                bandit_update_events += 1
+            if bool(bu.get("quality_label_used", False)):
+                bandit_quality_label_used += 1
+            if bool(bu.get("pending_stored", False)):
+                bandit_pending_stored += 1
+
+        bandit_update_event_rate = float(bandit_update_events) / max(float(successful), 1.0)
+        bandit_quality_label_used_rate = float(bandit_quality_label_used) / max(float(successful), 1.0)
+        bandit_pending_store_rate = float(bandit_pending_stored) / max(float(successful), 1.0)
 
         return {
             "summary": {
@@ -381,6 +518,27 @@ class MetricsCalculator:
                 "avg_cost_multiplier": float(avg_cost_multiplier),
                 "token_weighted_cost_multiplier": float(token_weighted_cost_multiplier),
                 "total_cost_units": float(total_cost_units),
+                "total_token_cost_units": float(total_token_cost_units),
+                "total_adapter_overhead_units": float(total_adapter_overhead_units),
+                "total_swap_overhead_units": float(total_swap_overhead_units),
+                "total_overhead_units": float(total_adapter_overhead_units + total_swap_overhead_units),
+                "overhead_fraction_of_cost": float(
+                    (total_adapter_overhead_units + total_swap_overhead_units) / total_cost_units
+                    if total_cost_units > 0
+                    else 0.0
+                ),
+                "swap_loaded_requests": int(swap_loaded_reqs),
+                "swap_loaded_rate": float(swap_loaded_reqs / successful if successful > 0 else 0.0),
+                # Adapter cache diagnostics
+                "adapter_requests": int(adapter_requests),
+                "adapter_cache_hit_rate": float(adapter_cache_hits / adapter_requests if adapter_requests > 0 else 0.0),
+                "adapter_cache_miss_rate": float(adapter_cache_misses / adapter_requests if adapter_requests > 0 else 0.0),
+                "avg_adapter_load_ms": float(adapter_load_ms_sum / adapter_requests if adapter_requests > 0 else 0.0),
+                "avg_adapter_switch_ms": float(adapter_switch_ms_sum / adapter_requests if adapter_requests > 0 else 0.0),
+                # Bandit diagnostics
+                "bandit_update_event_rate": float(bandit_update_event_rate),
+                "bandit_quality_label_used_rate": float(bandit_quality_label_used_rate),
+                "bandit_pending_store_rate": float(bandit_pending_store_rate),
                 "cost_units_per_sec": float(cost_units_per_sec),
                 "total_cost_units_slo_compliant": float(total_cost_units_slo_ok),
                 "total_cost_units_quality_adjusted": float(total_cost_units_qa_ok),
@@ -487,11 +645,11 @@ class MetricsCalculator:
                 parts = []
                 if not v.get("ttft_ok", True):
                     parts.append(f"TTFT: {v['ttft_ms']:.1f}ms > {v['ttft_slo']}ms SLO")
-                if not v.get("tpot_ok", True):
-                    parts.append(f"TPOT: {v['tpot_ms']:.1f}ms > {v['tpot_slo']}ms SLO")
+            if not v.get("total_ok", True):
+                parts.append(f"E2E: {v['total_ms']:.1f}ms > {v['total_slo']}ms SLO")
                 if not parts:
                     parts.append(f"TTFT: {v['ttft_ms']:.1f}ms > {v['ttft_slo']}ms SLO")
-                    parts.append(f"TPOT: {v['tpot_ms']:.1f}ms > {v['tpot_slo']}ms SLO")
+                parts.append(f"E2E: {v['total_ms']:.1f}ms > {v['total_slo']}ms SLO")
                 print(f"  {i}. Request {v.get('request_id')} ({v.get('difficulty')}): " + " | ".join(parts))
 
         print("\n" + "=" * 80)

@@ -1,4 +1,4 @@
-# Paper-ready methodology: SLO calibration (Option A TTFT)
+# Paper-ready methodology: SLO calibration (Option A TTFT + E2E total)
 
 This bundle is intended to support paper-quality reporting for **SLO-aware inference** (routing / adaptive compression) by making latency measurement and SLO calibration explicit, reproducible, and aligned with common serving practice.
 
@@ -36,7 +36,11 @@ Notes:
 - TTFT is dominated by prefill + first decode; TPOT reflects steady-state decoding.
 
 ### Total latency
-Server-side `total_latency_ms` is aligned with the same service boundary and includes `scheduler_wait_ms`.
+Server-side **E2E total latency** (`total_latency_ms`) is aligned with the same service boundary and includes `scheduler_wait_ms`.
+
+**Primary SLO event (paper):** a request violates the latency SLO if
+- **TTFT_A > TTFT_SLO** **OR**
+- **E2E_total > total_SLO**
 
 Client-side end-to-end latency is additionally computed by the load generator (`e2e_latency_ms`), which also includes client thread scheduling effects.
 
@@ -57,7 +61,8 @@ From the combined non-test pool, we create an internal `train`/`val` split using
 We follow a standard serving methodology:
 
 1. **Calibration run** at **concurrency = 1** (unloaded baseline).
-2. Compute per-difficulty thresholds using TTFT_A (`ttft_ms`) and TPOT (`tpot_ms`) at selected percentiles.
+2. Compute per-difficulty thresholds using TTFT_A (`ttft_ms`) and **E2E total latency** (`total_latency_ms`) at selected percentiles.
+   - TPOT is still recorded for diagnostics but is **not** part of the primary violation definition.
 3. Save calibrated SLOs to `slo_thresholds.json`.
 4. Run additional concurrencies using the fixed thresholds to measure degradation under load.
 
@@ -74,9 +79,12 @@ For robustness / sensitivity analysis:
 ## 4) How to report results in the paper
 
 Recommended tables/plots:
-- TTFT and TPOT distribution (p50/p90/p95/p99) vs concurrency.
+- TTFT and E2E(total) distribution (p50/p90/p95/p99) vs concurrency.
+- TPOT distribution (diagnostic) vs concurrency.
 - SLO compliance (%) vs concurrency for p95 (primary), with p90/p99 as sensitivity.
 - Breakdown plots for TTFT components (scheduler_wait_ms / lock_wait_ms / ttft_model_ms) to show where latency comes from.
+
+If you include an E2E plot, use `total_latency_ms` (server-side, queue-inclusive) to match the SLO event.
 
 When discussing queueing effects, emphasize that **Option A TTFT is service-facing** and intentionally includes queue and tokenization to match user-perceived latency.
 

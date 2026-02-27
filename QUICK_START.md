@@ -127,7 +127,7 @@ results/baseline_med/
     └── Per-request logs (one JSON per line):
         - request_id, submit_time, start_time, end_time
         - e2e_latency_ms, queue_wait_time_ms
-        - inference_metrics (ttft, tpot, output_length)
+        - inference_metrics (ttft, total_latency_ms, tpot, output_length)
 ```
 
 ## 7. Interpret Key Metrics
@@ -141,15 +141,17 @@ results/baseline_med/
 - Lower is better (< 200ms is excellent)
 - Baseline MED: ~190ms at concurrency 1
 
-### TPOT P95 (milliseconds)
+### E2E Total P95/P99 (milliseconds)
+- End-to-end total latency measured server-side as `total_latency_ms`
+- Lower is better (captures queuing + model time)
+
+### TPOT P95 (milliseconds, diagnostic)
 - Time per output token at 95th percentile
-- Lower is better (< 30ms is good)
-- Baseline MED: ~20ms at concurrency 1
+- Useful for diagnosing whether tail latency is dominated by per-token slowdown vs queuing
 
 ### SLO Compliance (%)
 - Percentage of requests meeting SLO targets
-- Target: TTFT < 200-500ms depending on difficulty
-- Baseline MED: ~98% at concurrency 1
+- Primary event: **TTFT or E2E(total) violation** (difficulty-specific thresholds)
 
 ### Accuracy / EM
 - Exact match on test set

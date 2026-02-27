@@ -78,6 +78,9 @@ class ClosedLoopLoadGenerator:
         data_loader: List[Dict[str, Any]],
         prompt_mode: str = "slo",
         seed: int = 0,
+        # If False, do NOT send gold/quality labels to the server.
+        # This enables realistic "delayed label" experiments where labels arrive later.
+        send_labels_to_server: bool = True,
     ):
         self.inference_func = inference_func
         self.max_concurrency = int(max_concurrency)
@@ -85,6 +88,7 @@ class ClosedLoopLoadGenerator:
         self.data_loader = data_loader
         self.prompt_mode = (prompt_mode or "slo").lower().strip()
         self.seed = int(seed)
+        self.send_labels_to_server = bool(send_labels_to_server)
 
         self.request_metrics: List[RequestMetrics] = []
         self._lock = threading.Lock()
@@ -95,6 +99,7 @@ class ClosedLoopLoadGenerator:
         logger.info(f"  Data pool size: {len(self.data_loader)}")
         logger.info(f"  Prompt mode: {self.prompt_mode}")
         logger.info(f"  Seed: {self.seed}")
+        logger.info(f"  Send labels to server: {self.send_labels_to_server}")
 
     def _select_example(self, request_id: int) -> Dict[str, Any]:
         # Deterministic selection that changes with seed.
@@ -116,13 +121,29 @@ class ClosedLoopLoadGenerator:
 
             # Call server.generate; keep backward-compatible fallbacks.
             try:
-                _pred_text, inference_metrics = self.inference_func(
+                call_kwargs = dict(
                     prompt=prompt,
                     max_tokens=max_tokens,
                     dataset_type=dataset_type,
                     difficulty=difficulty,
                     prompt_mode=self.prompt_mode,
                     concurrency=self.max_concurrency,
+                    request_id=int(request_id),
+                )
+
+                # Optional adapter overrides (used by adapter-churn experiments).
+                if ex.get("adapter_id") is not None:
+                    call_kwargs["adapter_id"] = ex.get("adapter_id")
+                if ex.get("adapter_rank") is not None:
+                    call_kwargs["adapter_rank"] = ex.get("adapter_rank")
+
+                # Gold labels: only send when requested.
+                if self.send_labels_to_server:
+                    call_kwargs["gold_answer"] = str(ex.get("answer", ""))
+                    call_kwargs["label_source"] = "gold"
+
+                _pred_text, inference_metrics = self.inference_func(
+                    **call_kwargs,
                 )
             except TypeError:
                 _pred_text, inference_metrics = self.inference_func(
@@ -130,6 +151,9 @@ class ClosedLoopLoadGenerator:
                     max_tokens=max_tokens,
                     dataset_type=dataset_type,
                     difficulty=difficulty,
+                    request_id=int(request_id),
+                    gold_answer=(str(ex.get("answer", "")) if self.send_labels_to_server else None),
+                    label_source=("gold" if self.send_labels_to_server else None),
                 )
 
             # ----------------------------
@@ -141,13 +165,17 @@ class ClosedLoopLoadGenerator:
                 truth = ex.get("answer", "")
                 ok, extracted, fmt_ok = EvaluationMetrics.is_correct(_pred_text, str(truth), dataset_type)
                 ok_p, extracted_p, fmt_ok_p = EvaluationMetrics.is_correct_parseable(_pred_text, str(truth), dataset_type)
+                # Preserve server-side correctness if already present (e.g., bandit labels).
+                if "correct" not in inference_metrics:
+                    inference_metrics["correct"] = int(bool(ok))
+                if "format_ok" not in inference_metrics:
+                    inference_metrics["format_ok"] = int(bool(fmt_ok))
+                if "extracted_answer" not in inference_metrics:
+                    inference_metrics["extracted_answer"] = extracted
+
+                # Always record parseable metrics (sensitivity analysis)
                 inference_metrics.update(
                     {
-                        # strict (paper primary)
-                        "correct": int(bool(ok)),
-                        "format_ok": int(bool(fmt_ok)),
-                        "extracted_answer": extracted,
-                        # parseable (sensitivity)
                         "correct_parseable": int(bool(ok_p)),
                         "format_ok_parseable": int(bool(fmt_ok_p)),
                         "extracted_answer_parseable": extracted_p,

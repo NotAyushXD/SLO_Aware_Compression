@@ -10,6 +10,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from collections import deque
 
+import numpy as np
 import torch
 from transformers import (
     AutoModelForCausalLM,
@@ -32,7 +33,11 @@ from answer_utils import (
     extract_gsm8k_parseable,
     extract_gsm8k_strict,
     extract_mmlu_answer,
+    numbers_equal,
 )
+
+# SLO-safe contextual bandit router (paper contribution)
+from bandit_router import BanditAction, BanditRouter, BanditRouterConfig
 
 # Optional PEFT / LoRA adapter support (paper portfolio extension)
 from adapter_utils import (
@@ -558,6 +563,9 @@ class SingleVariantServer:
         adapter_eviction_policy: str = "lru",
         adapter_synthetic_load_ms: float = 0.0,
         adapter_synthetic_switch_ms: float = 0.0,
+        adapter_allow_missing: bool = False,
+        # Convert overhead milliseconds into token-equivalent cost units.
+        overhead_ms_to_cost_units: float = 0.1,
     ):
         self.model_name = model_name
         self.variant_requested = variant
@@ -595,6 +603,10 @@ class SingleVariantServer:
         self.adapter_eviction_policy = (adapter_eviction_policy or "lru").lower().strip()
         self.adapter_synthetic_load_ms = float(max(0.0, adapter_synthetic_load_ms))
         self.adapter_synthetic_switch_ms = float(max(0.0, adapter_synthetic_switch_ms))
+        self.adapter_allow_missing = bool(adapter_allow_missing)
+
+        # Cost model (shared across variants): how many "cost units" per 1ms of overhead.
+        self.overhead_ms_to_cost_units = float(max(0.0, overhead_ms_to_cost_units))
 
         # Tokenizer (cheap)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -767,7 +779,7 @@ class SingleVariantServer:
         self._adapter_registry: Optional[AdapterRegistry] = None
         self._adapter_manager: Optional[AdapterManager] = None
         if self.enable_adapters:
-            if not peft_available():
+            if (not peft_available()) and (not self.adapter_allow_missing):
                 raise RuntimeError(
                     "--enable_adapters was set but `peft` is not installed. "
                     "Install with: pip install peft"
@@ -780,6 +792,7 @@ class SingleVariantServer:
                 eviction_policy=self.adapter_eviction_policy,
                 synthetic_load_ms=self.adapter_synthetic_load_ms,
                 synthetic_switch_ms=self.adapter_synthetic_switch_ms,
+                allow_missing_adapters=self.adapter_allow_missing,
             )
             logger.info(
                 f"Adapters enabled: policy={self.adapter_policy} adapter_root={self.adapter_root} "
@@ -1440,6 +1453,11 @@ class SingleVariantServer:
         cost_mult = float(VARIANT_COST_MULTIPLIERS.get(str(variant_eff), 1.0))
 
         metrics_list: List[Dict] = []
+        batch_size = int(max(1, len(out_lens)))
+        # Adapter setup happens once per batch; allocate to each request.
+        adapter_setup_ms_batch = float(adapter_metrics.get("adapter_setup_ms", 0.0) or 0.0)
+        adapter_overhead_ms_alloc = adapter_setup_ms_batch / float(batch_size)
+        adapter_overhead_units_alloc = float(self.overhead_ms_to_cost_units) * float(adapter_overhead_ms_alloc)
         for out_len, raw_text, postprocessed, postprocess_candidate, prompt_tokens in zip(
             out_lens,
             raw_texts,
@@ -1454,7 +1472,8 @@ class SingleVariantServer:
 
             throughput = (float(out_len) / total_gen_time) if total_gen_time > 0 else 0.0
             total_tokens = int(max(0, int(prompt_tokens))) + int(max(0, int(out_len)))
-            cost_units = float(cost_mult) * float(total_tokens)
+            token_cost_units = float(cost_mult) * float(total_tokens)
+            total_cost_units = float(token_cost_units) + float(adapter_overhead_units_alloc)
 
             metrics_list.append(
                 {
@@ -1479,7 +1498,16 @@ class SingleVariantServer:
                     "total_latency_ms": float(total_latency_s * 1000.0),
                     "tokenize_ms": tokenize_ms,
                     "cost_multiplier": float(cost_mult),
-                    "cost_units": float(cost_units),
+                    # Cost breakdown (token-equivalent cost units)
+                    "token_cost_units": float(token_cost_units),
+                    "adapter_overhead_ms_alloc": float(adapter_overhead_ms_alloc),
+                    "adapter_overhead_units": float(adapter_overhead_units_alloc),
+                    # Multi-variant service may add swap_overhead_units.
+                    "swap_overhead_units": 0.0,
+                    "total_cost_units": float(total_cost_units),
+                    # Backwards-compatible name: now total cost (tokens + overhead).
+                    "cost_units": float(total_cost_units),
+                    "batch_size": int(batch_size),
                     # queue_wait_ms / scheduler_wait_ms filled by caller
                     "variant": self.variant,
                     "variant_effective": getattr(self, "variant_effective", self.variant),
@@ -1520,6 +1548,13 @@ class SingleVariantServer:
         # Adapters (optional)
         adapter_id: Optional[str] = None,
         adapter_rank: Optional[int] = None,
+        # Optional experiment / logging fields (ignored for generation)
+        request_id: Optional[int] = None,
+        gold_answer: Optional[str] = None,
+        label: Optional[int] = None,
+        label_source: Optional[str] = None,
+        label_budget_p: Optional[float] = None,
+        **kwargs: Any,
     ) -> Tuple[str, Dict]:
         """Generate completion text plus metrics."""
 
@@ -1835,6 +1870,13 @@ class SingleVariantServer:
         # Attach client-side concurrency hint (used for router training features).
         metrics["concurrency"] = int(concurrency)
 
+        # Optional logging join key (used for bandit delayed labels).
+        if request_id is not None:
+            try:
+                metrics["request_id"] = int(request_id)
+            except Exception:
+                metrics["request_id"] = request_id
+
         # Option A: ttft_ms already equals ttft_infer_ms for direct calls.
         return text, metrics
 
@@ -2063,7 +2105,36 @@ class MultiVariantService:
         adapter_eviction_policy: str = "lru",
         adapter_synthetic_load_ms: float = 0.0,
         adapter_synthetic_switch_ms: float = 0.0,
+        adapter_allow_missing: bool = False,
         dispatcher_max_sticky_adapter_batches: int = 4,
+        # Convert overhead milliseconds into token-equivalent cost units.
+        overhead_ms_to_cost_units: float = 0.1,
+        # Deterministic seed for routing / label subsampling.
+        router_seed: int = 0,
+        # ------------------------------
+        # Bandit router (SLO-safe contextual bandit)
+        # ------------------------------
+        bandit_delta: float = 0.05,
+        bandit_alpha: float = 1.0,
+        bandit_beta_r: float = 2.0,
+        bandit_beta_q: float = 2.0,
+        bandit_eps_r: float = 0.0,
+        bandit_eps_q: float = 0.0,
+        bandit_beta_u: float = 0.2,
+        bandit_label_budget_p: float = 1.0,
+        bandit_checkpoint_path: Optional[str] = None,
+        bandit_checkpoint_every: int = 500,
+        bandit_require_latency_safe: bool = True,
+        bandit_use_conservative_fallback: bool = True,
+        bandit_use_primal_dual: bool = True,
+        bandit_use_overhead_cost: bool = True,
+        bandit_use_system_features: bool = True,
+        bandit_use_adapter_features: bool = True,
+        bandit_variant_load_synthetic_ms: float = 1000.0,
+        bandit_adapter_ids: Optional[str] = None,
+        bandit_rank_tiers: Optional[str] = None,
+        bandit_state_path: Optional[str] = None,
+        bandit_update_enabled: bool = True,
     ):
         self.model_name = model_name
         self.device = device
@@ -2085,7 +2156,18 @@ class MultiVariantService:
         self.adapter_eviction_policy = (adapter_eviction_policy or "lru").lower().strip()
         self.adapter_synthetic_load_ms = float(max(0.0, adapter_synthetic_load_ms))
         self.adapter_synthetic_switch_ms = float(max(0.0, adapter_synthetic_switch_ms))
+        self.adapter_allow_missing = bool(adapter_allow_missing)
         self.dispatcher_max_sticky_adapter_batches = int(max(1, dispatcher_max_sticky_adapter_batches))
+
+        # Cost model: convert overhead milliseconds into token-equivalent cost units.
+        self.overhead_ms_to_cost_units = float(max(0.0, overhead_ms_to_cost_units))
+
+        # Variant token-cost multipliers (used by bandit scoring + cost accounting).
+        # Keep this in sync with VARIANT_COST_MULTIPLIERS.
+        self.cost_multipliers = VARIANT_COST_MULTIPLIERS
+
+        # Deterministic seed for routing-related randomness.
+        self.router_seed = int(router_seed)
 
         self.router_mode = (router_mode or "difficulty").lower()
 
@@ -2130,9 +2212,9 @@ class MultiVariantService:
         self.risk_quality_epsilon = float(risk_quality_epsilon)
         self.risk_quality_alpha = float(risk_quality_alpha)
         self._risk_router = None
-        if self.router_mode in {"risk"}:
+        if self.router_mode in {"risk"} or self.router_mode.startswith("bandit"):
             if not risk_router_dir:
-                raise ValueError("--risk_router_dir is required when router_mode is risk.")
+                raise ValueError("--risk_router_dir is required when router_mode is risk or bandit.")
             from risk_router import RiskRouter
 
             rdir = os.path.abspath(os.path.expanduser(risk_router_dir))
@@ -2141,6 +2223,65 @@ class MultiVariantService:
                 self._risk_router.quality_alpha = float(self.risk_quality_alpha)
             except Exception:
                 pass
+
+        # ------------------------------
+        # Bandit router (SLO-safe contextual bandit)
+        # ------------------------------
+        self._bandit_router: Optional[BanditRouter] = None
+        self._bandit_router_update_enabled = bool(bandit_update_enabled)
+        self._bandit_variant_load_synth_ms = float(max(0.0, bandit_variant_load_synthetic_ms))
+        # EWMA of observed variant swap/load times (ms)
+        self._bandit_variant_load_ema_ms: Dict[str, float] = {
+            v: float(self._bandit_variant_load_synth_ms) for v in self.variants
+        }
+        self._bandit_variant_load_ema_alpha = 0.1
+
+        # Action space configuration (adapters + rank tiers)
+        self._bandit_adapter_ids_cfg = bandit_adapter_ids
+        self._bandit_rank_tiers_cfg = bandit_rank_tiers
+
+        if self.router_mode.startswith("bandit"):
+            # Feature dim = LearnedRouter base feature dim (43) + optional system features
+            base_dim = 43
+            extra_dim = 0
+            if bool(bandit_use_system_features):
+                # swap_mode, gpu_free_frac, loaded_indicator per variant, batch_wait_ms, max_loaded_variants, queue_depth_sum
+                extra_dim = 1 + 1 + len(self.variants) + 1 + 1 + 1
+            feat_dim = int(base_dim + extra_dim)
+
+            cfg = BanditRouterConfig(
+                delta=float(bandit_delta),
+                alpha=float(bandit_alpha),
+                beta_r=float(bandit_beta_r),
+                beta_q=float(bandit_beta_q),
+                eps_r=float(bandit_eps_r),
+                eps_q=float(bandit_eps_q),
+                beta_u=float(bandit_beta_u),
+                overhead_ms_to_cost_units=float(self.overhead_ms_to_cost_units),
+                require_action_latency_safe=bool(bandit_require_latency_safe),
+                use_conservative_fallback=bool(bandit_use_conservative_fallback),
+                use_primal_dual=bool(bandit_use_primal_dual),
+                use_overhead_cost=bool(bandit_use_overhead_cost),
+                use_system_features=bool(bandit_use_system_features),
+                use_adapter_features=bool(bandit_use_adapter_features),
+                seed=int(self.router_seed),
+                label_budget_p=float(bandit_label_budget_p),
+                checkpoint_path=str(bandit_checkpoint_path) if bandit_checkpoint_path else None,
+                checkpoint_every=int(max(1, bandit_checkpoint_every)),
+            )
+
+            if bandit_state_path:
+                loaded = BanditRouter.load(str(bandit_state_path))
+                if int(getattr(loaded, "feature_dim", -1)) != int(feat_dim):
+                    raise ValueError(
+                        f"Bandit state feature_dim mismatch: state has {loaded.feature_dim}, expected {feat_dim}. "
+                        "(Did you change system-feature flags?)"
+                    )
+                # Keep the learned parameters, but apply current-run config overrides.
+                loaded.config = cfg
+                self._bandit_router = loaded
+            else:
+                self._bandit_router = BanditRouter(feature_dim=feat_dim, config=cfg)
 
         # Validate adapter dependency early.
         if self.enable_adapters and not peft_available():
@@ -2356,6 +2497,36 @@ class MultiVariantService:
     def set_slo_dict(self, slo_dict: Dict[str, Dict[str, float]]) -> None:
         self.slo_dict = slo_dict or {}
 
+    # Bandit controls (used by evaluation scripts to freeze learning)
+    def set_bandit_update_enabled(self, enabled: bool) -> None:
+        """Enable/disable online bandit updates.
+
+        This does not change routing decisions, only whether the router updates
+        its online models after each request.
+        """
+        self._bandit_router_update_enabled = bool(enabled)
+
+    def save_bandit_state(self, base_path: str) -> bool:
+        """Save the current bandit router state (if any)."""
+        if self._bandit_router is None:
+            return False
+        self._bandit_router.save(str(base_path))
+        return True
+
+    def ingest_quality_label(self, join_key: str, quality_label: int) -> Dict[str, Any]:
+        """Ingest a delayed quality label into the bandit router.
+
+        join_key is typically the request_id (stringified) so it can be joined
+        against offline judge outputs.
+        """
+
+        if self._bandit_router is None:
+            return {"updated": False, "error": "bandit_router_not_initialized"}
+        try:
+            return self._bandit_router.ingest_quality_label(str(join_key), int(quality_label))
+        except Exception as e:
+            return {"updated": False, "error": str(e)}
+
     def get_queue_depth(self, variant: Optional[str] = None) -> int:
         with self._lock:
             if variant is None:
@@ -2471,51 +2642,75 @@ class MultiVariantService:
                 return srv
         return None
     def _ensure_loaded(self, variant: str) -> SingleVariantServer:
-        """Ensure a SingleVariantServer for `variant` exists.
+        """Ensure a SingleVariantServer for `variant` exists."""
 
-        Uses an event-based ...
+        srv, _meta = self._ensure_loaded_with_metrics(variant)
+        return srv
+
+    def _ensure_loaded_with_metrics(self, variant: str) -> Tuple[SingleVariantServer, Dict[str, Any]]:
+        """Ensure a SingleVariantServer for `variant` exists and return swap metrics.
+
+        Returns
+        -------
+        (srv, meta)
+          meta contains:
+            - swap_loaded: bool (this call performed a load)
+            - swap_load_ms: float (0 if not loaded)
+            - swap_evicted_variants: list[str]
+
+        Notes
+        -----
+        If another thread is currently loading the same variant, this call will
+        wait and then return swap_loaded=False (the wait time is captured in the
+        request's scheduler_wait_ms rather than swap_load_ms).
         """
         variant = _normalize_variant(variant)
         if variant not in self.variants:
             raise ValueError(f"Variant '{variant}' not in enabled variants {self.variants}")
 
         while True:
-            # Fast path / coordination
             with self._lock:
                 existing = self._servers.get(variant)
                 if existing is not None:
                     self._touch_lru_locked(variant)
-                    return existing
+                    return existing, {
+                        "swap_loaded": False,
+                        "swap_load_ms": 0.0,
+                        "swap_evicted_variants": [],
+                    }
 
                 ev = self._load_events.get(variant)
                 if ev is not None:
                     wait_ev = ev
                 else:
-                    # This thread becomes the loader for this variant
                     ev = threading.Event()
                     self._load_events[variant] = ev
                     wait_ev = None
 
-                    # Evict to capacity (pin-safe)
-                    victims = []
+                    victims: List[SingleVariantServer] = []
+                    victim_names: List[str] = []
                     cap = int(self.max_loaded_variants or 1)
                     while len(self._servers) >= cap:
                         victim = self._evict_one_locked()
                         if victim is None:
-                            # Cannot evict anything (everything pinned)
                             self._load_events.pop(variant, None)
                             ev.set()
                             raise RuntimeError(
                                 f"Cannot load '{variant}': all loaded variants are pinned (loaded={list(self._servers.keys())})."
                             )
                         victims.append(victim)
+                        try:
+                            victim_names.append(str(getattr(victim, "variant", "")))
+                        except Exception:
+                            victim_names.append("")
 
             if wait_ev is not None:
-                # Another loader is working; wait and retry
                 wait_ev.wait()
                 continue
 
-            # Loader branch: clean up victims outside the lock
+            # Loader branch: measure swap overhead outside the lock.
+            t0 = time.perf_counter()
+
             for s in victims:
                 try:
                     s.cleanup()
@@ -2527,7 +2722,6 @@ class MultiVariantService:
                 except Exception:
                     pass
 
-            # Actually load variant (no global lock held)
             try:
                 model_name = self.model_name_by_variant.get(variant, self.model_name)
                 quant_override = self.quantization_override_by_variant.get(variant)
@@ -2551,6 +2745,8 @@ class MultiVariantService:
                     adapter_eviction_policy=self.adapter_eviction_policy,
                     adapter_synthetic_load_ms=self.adapter_synthetic_load_ms,
                     adapter_synthetic_switch_ms=self.adapter_synthetic_switch_ms,
+                    adapter_allow_missing=bool(getattr(self, "adapter_allow_missing", False)),
+                    overhead_ms_to_cost_units=getattr(self, "overhead_ms_to_cost_units", 0.1),
                 )
             except Exception:
                 with self._lock:
@@ -2559,13 +2755,28 @@ class MultiVariantService:
                         ev.set()
                 raise
 
+            swap_load_ms = float((time.perf_counter() - t0) * 1000.0)
+
             with self._lock:
                 self._servers[variant] = srv
                 self._touch_lru_locked(variant)
                 ev = self._load_events.pop(variant, None)
                 if ev:
                     ev.set()
-                return srv
+
+                # Update EWMA for bandit cost estimation
+                try:
+                    prev = float(self._bandit_variant_load_ema_ms.get(variant, self._bandit_variant_load_synth_ms))
+                    a = float(getattr(self, "_bandit_variant_load_ema_alpha", 0.1))
+                    self._bandit_variant_load_ema_ms[variant] = (1.0 - a) * prev + a * float(swap_load_ms)
+                except Exception:
+                    pass
+
+                return srv, {
+                    "swap_loaded": True,
+                    "swap_load_ms": float(swap_load_ms),
+                    "swap_evicted_variants": victim_names,
+                }
 
     # -------------------------
     # Routing
@@ -2653,7 +2864,8 @@ class MultiVariantService:
         )
 
         # Best-effort existence check: if adapter directory missing, fall back to base.
-        if adapter_id_use and self.adapter_root:
+        # For synthetic adapter experiments (adapter_allow_missing=True), keep the id.
+        if adapter_id_use and self.adapter_root and (not bool(getattr(self, "adapter_allow_missing", False))):
             expected = os.path.join(os.path.abspath(os.path.expanduser(self.adapter_root)), adapter_id_use)
             if not os.path.isdir(expected):
                 adapter_id_use = ""
@@ -2911,18 +3123,264 @@ class MultiVariantService:
             )
             adapter_state = self._snapshot_adapter_state_locked(adapter_id=adapter_id_use, adapter_rank=adapter_rank_use)
 
-            chosen, reason, meta = self.choose_variant(
-                dataset_type=dataset_type,
-                difficulty=difficulty,
-                prompt_mode=prompt_mode,
-                max_tokens=max_tokens,
-                prompt_tokens=prompt_tokens,
-                concurrency=concurrency,
-                queue_depths=queue_depths,
-                adapter_id=adapter_id_use,
-                adapter_rank=adapter_rank_use,
-                adapter_state=adapter_state,
-            )
+            # ------------------------------
+            # Bandit routing (variant + adapter + rank)
+            # ------------------------------
+            if self.router_mode.startswith("bandit") and self._bandit_router is not None and self._risk_router is not None:
+                # Baseline action: use the risk router (strong, SLO-aware baseline) with the
+                # standard adapter policy resolution.
+                base_variant, base_reason, base_meta = self._risk_router.route(
+                    dataset_type=dataset_type,
+                    difficulty=difficulty,
+                    max_tokens=int(max_tokens or 0),
+                    prompt_tokens=int(prompt_tokens or 0),
+                    concurrency=int(concurrency or 1),
+                    queue_depths=queue_depths,
+                    adapter_id=adapter_id_use,
+                    adapter_rank=adapter_rank_use,
+                    adapter_state=adapter_state,
+                    allowed_variants=self.variants,
+                    slo_dict=self.slo_dict or {},
+                    latency_delta=float(self.risk_latency_delta),
+                    quality_epsilon=float(self.risk_quality_epsilon),
+                )
+                baseline_action = BanditAction(
+                    variant=str(base_variant),
+                    adapter_id=str(adapter_id_use or ""),
+                    adapter_rank=(int(adapter_rank_use) if adapter_rank_use is not None else None),
+                )
+
+                # System snapshot for bandit features/cost estimation
+                try:
+                    free_gb, total_gb = _cuda_mem_gb()
+                    gpu_free_frac = float(free_gb) / float(total_gb) if float(total_gb) > 0 else 0.0
+                except Exception:
+                    gpu_free_frac = 0.0
+                swap_mode = 1 if (self.max_loaded_variants is not None and int(self.max_loaded_variants) < len(self.variants)) else 0
+                variant_loaded = {v: (1 if v in self._servers else 0) for v in self.variants}
+                system_snapshot = {
+                    "swap_mode": int(swap_mode),
+                    "gpu_free_frac": float(max(0.0, min(1.0, gpu_free_frac))),
+                    "variant_loaded": variant_loaded,
+                    "batch_wait_ms": float(getattr(self, "batch_wait_ms", 0.0) or 0.0),
+                    "max_loaded_variants": int(self.max_loaded_variants or len(self.variants)),
+                    "queue_depth_sum": int(sum(int(x) for x in queue_depths.values())),
+                }
+
+                # Build candidate action set.
+                actions: List[BanditAction] = []
+                adapter_state_map: Dict[Tuple[str, Optional[int]], Optional[Dict[str, Any]]] = {}
+
+                # Adapter ids
+                adapter_ids: List[str] = []
+                if not self.enable_adapters:
+                    adapter_ids = [""]
+                else:
+                    if explicit_adapter is not None:
+                        adapter_ids = [str(explicit_adapter or "")]
+                    else:
+                        raw = str(self._bandit_adapter_ids_cfg or "").strip()
+                        if raw:
+                            adapter_ids = [a.strip() for a in raw.split(",") if a.strip()]
+                        else:
+                            # Default: allow "none" and the policy-selected adapter (if any).
+                            adapter_ids = []
+                            if adapter_id_use:
+                                adapter_ids.append(str(adapter_id_use))
+                        # Always include "no adapter" as a candidate.
+                        if "" not in adapter_ids:
+                            adapter_ids = [""] + adapter_ids
+
+                    # Filter to adapters that exist on disk (if adapter_root is set)
+                    if self.adapter_root:
+                        filtered_ids: List[str] = []
+                        for aid in adapter_ids:
+                            if not aid:
+                                filtered_ids.append("")
+                                continue
+                            ap = os.path.join(self.adapter_root, aid)
+                            if os.path.isdir(ap):
+                                filtered_ids.append(aid)
+                        adapter_ids = filtered_ids or [""]
+
+                # Rank tiers
+                rank_tiers_default = list(self.adapter_rank_tiers)
+                if self._bandit_rank_tiers_cfg:
+                    try:
+                        rank_tiers_default = [int(x.strip()) for x in str(self._bandit_rank_tiers_cfg).split(",") if x.strip()]
+                    except Exception:
+                        rank_tiers_default = list(self.adapter_rank_tiers)
+
+                for aid in adapter_ids:
+                    if not aid:
+                        actions.extend([BanditAction(variant=v, adapter_id="", adapter_rank=None) for v in self.variants])
+                        adapter_state_map[("", None)] = None
+                    else:
+                        if explicit_rank is not None:
+                            tiers = [int(explicit_rank)]
+                        else:
+                            tiers = rank_tiers_default
+                        for rnk in tiers:
+                            akey = (aid, int(rnk))
+                            if akey not in adapter_state_map:
+                                adapter_state_map[akey] = self._snapshot_adapter_state_locked(adapter_id=aid, adapter_rank=int(rnk))
+                            actions.extend([BanditAction(variant=v, adapter_id=aid, adapter_rank=int(rnk)) for v in self.variants])
+
+                # Feature + cost per action
+                features_by_action: Dict[str, np.ndarray] = {}
+                cost_hat_by_action: Dict[str, float] = {}
+                action_info: Dict[str, Dict[str, Any]] = {}
+
+                # Latency guard budgets
+                ttft_budget_ms, total_budget_ms = self._get_latency_budgets_ms(difficulty, int(max_tokens or 0))
+
+                for a in actions + [baseline_action]:
+                    k = a.key()
+                    ast = adapter_state_map.get((a.adapter_id, a.adapter_rank))
+                    # Ensure we have adapter state for the baseline action even if it's not
+                    # part of the configured exploration adapter set.
+                    if ast is None and (a.adapter_id or "") != "":
+                        try:
+                            ast = self._snapshot_adapter_state_locked(
+                                adapter_id=str(a.adapter_id or ""),
+                                adapter_rank=(int(a.adapter_rank) if a.adapter_rank is not None else None),
+                            )
+                            adapter_state_map[(str(a.adapter_id or ""), int(a.adapter_rank) if a.adapter_rank is not None else None)] = ast
+                        except Exception:
+                            ast = None
+
+                    # Base (43D) feature vector used by the learned/risk routers
+                    base_x = self._risk_router.extract_features(
+                        dataset_type=dataset_type,
+                        difficulty=difficulty,
+                        max_tokens=int(max_tokens or 0),
+                        prompt_tokens=int(prompt_tokens or 0),
+                        concurrency=int(concurrency or 1),
+                        queue_depths=queue_depths,
+                        adapter_id=str(a.adapter_id or ""),
+                        adapter_rank=(int(a.adapter_rank) if a.adapter_rank is not None else None),
+                        adapter_state=ast,
+                    )
+
+                    # Optional adapter feature ablation
+                    if not bool(self._bandit_router.config.use_adapter_features):
+                        try:
+                            base_x = np.asarray(base_x, dtype=np.float32).reshape(-1)
+                            base_x = base_x.copy()
+                            base_x[22:] = 0.0
+                        except Exception:
+                            pass
+
+                    full_x = np.asarray(base_x, dtype=np.float32).reshape(-1)
+                    # Optional system features
+                    if bool(self._bandit_router.config.use_system_features):
+                        extra: List[float] = []
+                        extra.append(float(system_snapshot.get("swap_mode", 0)))
+                        extra.append(float(system_snapshot.get("gpu_free_frac", 0.0)))
+                        lv = system_snapshot.get("variant_loaded", {})
+                        for v in self.variants:
+                            extra.append(float(1.0 if lv.get(v, 0) else 0.0))
+                        extra.append(float(system_snapshot.get("batch_wait_ms", 0.0)) / 1000.0)
+                        mlv = float(system_snapshot.get("max_loaded_variants", len(self.variants)) or len(self.variants))
+                        extra.append(float(mlv) / 10.0)
+                        extra.append(float(system_snapshot.get("queue_depth_sum", 0.0)) / 100.0)
+                        full_x = np.concatenate([full_x, np.asarray(extra, dtype=np.float32)], axis=0)
+
+                    features_by_action[k] = full_x
+
+                    # Cost estimate for scoring
+                    try:
+                        cost_mult = float(self.cost_multipliers.get(a.variant, 1.0))
+                    except Exception:
+                        cost_mult = 1.0
+                    # Token component: use max_tokens as a conservative proxy for expected output length
+                    total_tokens_est = int(max(0, int(prompt_tokens or 0))) + int(max(0, int(max_tokens or 0)))
+                    token_cost_hat = float(cost_mult) * float(total_tokens_est)
+                    overhead_hat_units = 0.0
+                    if bool(self._bandit_router.config.use_overhead_cost):
+                        # Adapter overhead (setup estimate)
+                        try:
+                            if ast and a.variant in ast:
+                                overhead_hat_units += float(self.overhead_ms_to_cost_units) * float(ast[a.variant].get("setup_est_ms", 0.0) or 0.0)
+                        except Exception:
+                            pass
+                        # Variant swap/load overhead if not loaded
+                        try:
+                            if int(system_snapshot.get("swap_mode", 0)) == 1 and int(variant_loaded.get(a.variant, 0)) == 0:
+                                est_ms = float(self._bandit_variant_load_ema_ms.get(a.variant, self._bandit_variant_load_synth_ms))
+                                overhead_hat_units += float(self.overhead_ms_to_cost_units) * float(est_ms)
+                        except Exception:
+                            pass
+                    cost_hat_by_action[k] = float(token_cost_hat + overhead_hat_units)
+
+                    # Optional latency-safe guard from risk router (conformal upper bounds)
+                    latency_safe = True
+                    ttft_ub = None
+                    total_ub = None
+                    try:
+                        feat43 = np.asarray(base_x, dtype=np.float32).reshape(1, -1)
+                        ttft_pred = float(self._risk_router.predict_ttft_ms(a.variant, feat43))
+                        total_pred = float(self._risk_router.predict_total_ms(a.variant, feat43))
+                        ttft_q = float(self._risk_router.conformal_q(a.variant, "ttft", delta=float(self.risk_latency_delta)))
+                        total_q = float(self._risk_router.conformal_q(a.variant, "total", delta=float(self.risk_latency_delta)))
+                        ttft_ub = float(ttft_pred + ttft_q)
+                        total_ub = float(total_pred + total_q)
+                        latency_safe = bool(ttft_ub <= float(ttft_budget_ms) and total_ub <= float(total_budget_ms))
+                    except Exception:
+                        latency_safe = True
+
+                    action_info[k] = {
+                        "latency_safe": bool(latency_safe),
+                        "ttft_ub": (float(ttft_ub) if ttft_ub is not None else None),
+                        "total_ub": (float(total_ub) if total_ub is not None else None),
+                    }
+
+                chosen_action, bandit_meta = self._bandit_router.route(
+                    actions=actions,
+                    features_by_action=features_by_action,
+                    cost_hat_by_action=cost_hat_by_action,
+                    baseline_action=baseline_action,
+                    action_info=action_info,
+                )
+
+                chosen = str(chosen_action.variant)
+                reason = "bandit"
+                meta = {
+                    "baseline": {"variant": str(base_variant), "reason": str(base_reason), "meta": base_meta},
+                    "system_snapshot": system_snapshot,
+                    "action_info": action_info.get(chosen_action.key(), {}),
+                }
+                # Merge in bandit meta (already JSON-serializable)
+                try:
+                    meta.update(bandit_meta or {})
+                except Exception:
+                    meta["bandit_meta_unparsed"] = str(bandit_meta)
+
+                # Store the decision-time feature vector for the chosen action (used for online updates).
+                try:
+                    x_list = features_by_action.get(chosen_action.key())
+                    if x_list is not None:
+                        meta["bandit_x"] = [float(v) for v in np.asarray(x_list).reshape(-1).tolist()]
+                except Exception:
+                    pass
+
+                # Override adapter choice with the bandit's selected action.
+                adapter_id_use = str(chosen_action.adapter_id or "")
+                adapter_rank_use = int(chosen_action.adapter_rank) if chosen_action.adapter_rank is not None else None
+                adapter_state = self._snapshot_adapter_state_locked(adapter_id=adapter_id_use, adapter_rank=adapter_rank_use)
+            else:
+                chosen, reason, meta = self.choose_variant(
+                    dataset_type=dataset_type,
+                    difficulty=difficulty,
+                    prompt_mode=prompt_mode,
+                    max_tokens=max_tokens,
+                    prompt_tokens=prompt_tokens,
+                    concurrency=concurrency,
+                    queue_depths=queue_depths,
+                    adapter_id=adapter_id_use,
+                    adapter_rank=adapter_rank_use,
+                    adapter_state=adapter_state,
+                )
 
             # Always include adapter context in router_meta for training/analysis.
             try:
@@ -2982,6 +3440,12 @@ class MultiVariantService:
         except Exception:
             concurrency = 1
         concurrency = max(1, int(concurrency))
+
+        # Optional experiment fields (used for bandit logging / delayed labels)
+        request_id = kwargs.pop("request_id", None)
+        gold_answer = kwargs.pop("gold_answer", None)
+        explicit_label = kwargs.pop("label", None)
+        label_source = kwargs.pop("label_source", None)
 
         # Align max_tokens with SingleVariantServer defaults
         if max_tokens is None:
@@ -3127,12 +3591,132 @@ class MultiVariantService:
         req.output_metrics["router_reason"] = reason
         req.output_metrics["router_path"] = path
         req.output_metrics["router_attempts"] = req.attempts
+
+        # Aggregate cost across attempts (e.g., format retries / escalation).
+        try:
+            attempts = list(req.attempts or [])
+            total_cost = float(sum(float(a.get("cost_units", 0.0) or 0.0) for a in attempts))
+            total_token_cost = float(sum(float(a.get("token_cost_units", 0.0) or 0.0) for a in attempts))
+            total_adapter_ov = float(sum(float(a.get("adapter_overhead_units", 0.0) or 0.0) for a in attempts))
+            total_swap_ov = float(sum(float(a.get("swap_overhead_units", 0.0) or 0.0) for a in attempts))
+            any_slo_violation = bool(any(bool(a.get("slo_violation", False)) for a in attempts))
+            any_risk_violation = int(any(int(a.get("risk_violation", 0) or 0) for a in attempts))
+            if "cost_units" in req.output_metrics:
+                req.output_metrics["cost_units_last_attempt"] = req.output_metrics.get("cost_units")
+            req.output_metrics["cost_units"] = float(total_cost)
+            req.output_metrics["token_cost_units"] = float(total_token_cost)
+            req.output_metrics["adapter_overhead_units"] = float(total_adapter_ov)
+            req.output_metrics["swap_overhead_units"] = float(total_swap_ov)
+            req.output_metrics["total_cost_units"] = float(total_cost)
+            # SLO / risk summary across attempts
+            req.output_metrics["slo_violation_any"] = bool(any_slo_violation)
+            req.output_metrics["risk_violation_any"] = int(any_risk_violation)
+            # For compatibility, also surface as top-level signals.
+            req.output_metrics["slo_violation"] = bool(any_slo_violation)
+            req.output_metrics["risk_violation"] = int(any_risk_violation)
+        except Exception:
+            pass
         req.output_metrics["router_escalated"] = len(req.attempts) > 1
         req.output_metrics["router_final_variant"] = req.output_metrics.get("variant")
         req.output_metrics["router_num_attempts"] = len(req.attempts)
         req.output_metrics["router_queue_depths"] = getattr(req, "router_queue_depths", {})
         req.output_metrics["router_meta"] = getattr(req, "router_meta", {})
         req.output_metrics["concurrency"] = int(concurrency)
+
+        # Optional join key for offline logs (used for delayed labels).
+        if request_id is not None:
+            try:
+                req.output_metrics["request_id"] = int(request_id)
+            except Exception:
+                req.output_metrics["request_id"] = request_id
+            try:
+                req.output_metrics["router_meta"]["request_id"] = req.output_metrics["request_id"]
+            except Exception:
+                pass
+
+        # Compute / attach quality label if provided (gold answer or explicit label).
+        quality_label: Optional[int] = None
+        label_src = None
+        if explicit_label is not None:
+            try:
+                quality_label = 1 if int(explicit_label) != 0 else 0
+                label_src = str(label_source or "explicit")
+            except Exception:
+                quality_label = None
+        elif gold_answer is not None:
+            try:
+                dt = str(dataset_type or "").lower()
+                pred_text = str(req.output_text or "")
+                if dt == "mmlu":
+                    pred = extract_mmlu_answer(pred_text)
+                    gold = str(gold_answer).strip().upper()
+                    if pred is None:
+                        quality_label = 0
+                    else:
+                        quality_label = 1 if str(pred).strip().upper() == gold else 0
+                    label_src = str(label_source or "gold")
+                elif dt == "gsm8k":
+                    pred_num = extract_gsm8k_strict(pred_text) or extract_gsm8k_parseable(pred_text)
+                    gold_num = extract_gsm8k_strict(str(gold_answer)) or extract_gsm8k_parseable(str(gold_answer))
+                    if pred_num is None or gold_num is None:
+                        quality_label = None
+                    else:
+                        quality_label = 1 if bool(numbers_equal(str(pred_num), str(gold_num))) else 0
+                    label_src = str(label_source or "gold")
+                else:
+                    quality_label = None
+            except Exception:
+                quality_label = None
+
+        if quality_label is not None:
+            req.output_metrics["correct"] = int(quality_label)
+            req.output_metrics["label_source"] = str(label_src or "unknown")
+
+        # Bandit online update (if enabled)
+        if self.router_mode.startswith("bandit") and self._bandit_router is not None:
+            req.output_metrics["bandit_update_enabled"] = bool(self._bandit_router_update_enabled)
+            if self._bandit_router_update_enabled:
+                try:
+                    # Skip updates if this request escalated to a different variant.
+                    escalated = bool(req.output_metrics.get("router_escalated", False))
+
+                    # Action chosen by the bandit at decision time
+                    act_dict = None
+                    try:
+                        act_dict = (req.output_metrics.get("router_meta") or {}).get("bandit", {}).get("chosen_action")
+                    except Exception:
+                        act_dict = None
+                    if isinstance(act_dict, dict):
+                        action = BanditAction.from_dict(act_dict)
+                    else:
+                        action = BanditAction(
+                            variant=str(req.output_metrics.get("router_attempts", [{}])[0].get("variant", req.output_metrics.get("variant", "base"))),
+                            adapter_id=str(getattr(req, "adapter_id", "") or ""),
+                            adapter_rank=int(getattr(req, "adapter_rank", 0)) if getattr(req, "adapter_rank", None) is not None else None,
+                        )
+
+                    # Decision-time feature vector stored in router_meta
+                    x_list = (req.output_metrics.get("router_meta") or {}).get("bandit_x")
+                    if x_list is None:
+                        raise ValueError("missing bandit_x in router_meta")
+                    x = np.asarray(x_list, dtype=np.float32).reshape(-1)
+
+                    cost = float(req.output_metrics.get("cost_units", 0.0) or 0.0)
+                    risk_violation = int(req.output_metrics.get("risk_violation", 0) or 0)
+                    label_key = str(request_id) if request_id is not None else action.key()
+
+                    upd = self._bandit_router.update(
+                        action=action,
+                        x=x,
+                        cost=cost,
+                        risk_violation=risk_violation,
+                        quality_label=quality_label,
+                        label_key=label_key,
+                        escalated=escalated,
+                    )
+                    req.output_metrics["bandit_update"] = upd
+                except Exception as e:
+                    req.output_metrics["bandit_update"] = {"updated": False, "error": str(e)}
 
         return req.output_text or "", req.output_metrics
 
@@ -3327,7 +3911,7 @@ class MultiVariantService:
                     self._pins[variant] = self._pins.get(variant, 0) + 1
 
                 # Ensure loaded (may evict/load)
-                srv = self._ensure_loaded(variant)
+                srv, load_meta = self._ensure_loaded_with_metrics(variant)
 
                 infer_start = time.perf_counter()
 
@@ -3346,6 +3930,41 @@ class MultiVariantService:
                 )
 
                 for r, out, m in zip(batch, outputs, metrics_list):
+                    # Swap / load metadata (if variant swapping is enabled)
+                    try:
+                        swap_loaded = bool(load_meta.get("swap_loaded", False))
+                        swap_load_ms = float(load_meta.get("swap_load_ms", 0.0) or 0.0)
+                        swap_evicted = list(load_meta.get("swap_evicted_variants", []) or [])
+                    except Exception:
+                        swap_loaded, swap_load_ms, swap_evicted = False, 0.0, []
+
+                    m["swap_loaded"] = bool(swap_loaded)
+                    m["swap_load_ms"] = float(swap_load_ms)
+                    m["swap_evicted_variants"] = swap_evicted
+
+                    # Allocate swap overhead to each request in the batch.
+                    bsz = int(max(1, len(batch)))
+                    swap_overhead_ms_alloc = float(swap_load_ms) / float(bsz)
+                    swap_overhead_units = float(self.overhead_ms_to_cost_units) * float(swap_overhead_ms_alloc)
+                    m["swap_overhead_ms_alloc"] = float(swap_overhead_ms_alloc)
+                    m["swap_overhead_units"] = float(swap_overhead_units)
+
+                    # Recompute total cost units by adding swap overhead to the server-reported base cost.
+                    try:
+                        base_total = float(m.get("total_cost_units", m.get("cost_units", 0.0)) or 0.0)
+                        # Fill breakdown fields when missing (backwards compatibility).
+                        if m.get("adapter_overhead_units", None) is None:
+                            m["adapter_overhead_units"] = 0.0
+                        if m.get("token_cost_units", None) is None:
+                            try:
+                                m["token_cost_units"] = float(max(0.0, base_total - float(m.get("adapter_overhead_units", 0.0) or 0.0)))
+                            except Exception:
+                                m["token_cost_units"] = float(base_total)
+                        total_cost_units = float(base_total) + float(swap_overhead_units)
+                        m["total_cost_units"] = float(total_cost_units)
+                        m["cost_units"] = float(total_cost_units)
+                    except Exception:
+                        pass
                     # MultiVariant dispatch wait
                     sched_wait_ms = (infer_start - r.enqueue_t) * 1000.0
                     m["scheduler_wait_ms"] = sched_wait_ms
@@ -3363,6 +3982,39 @@ class MultiVariantService:
                     except Exception:
                         pass
 
+                    # SLO budgets + violation indicators
+                    try:
+                        ttft_budget_ms, total_budget_ms = self._get_latency_budgets_ms(r.difficulty, r.max_tokens)
+                        m["slo_ttft_budget_ms"] = float(ttft_budget_ms)
+                        m["slo_total_budget_ms"] = float(total_budget_ms)
+
+                        # TPOT budget (raw SLO threshold)
+                        prof = None
+                        try:
+                            if isinstance(self.slo_dict, dict):
+                                prof = self.slo_dict.get(r.difficulty) or self.slo_dict.get("default")
+                        except Exception:
+                            prof = None
+                        tpot_budget_ms = float((prof or {}).get("tpot_ms", 1e9) or 1e9)
+                        m["slo_tpot_budget_ms"] = float(tpot_budget_ms)
+
+                        ttft_ms = float(m.get("ttft_ms", 0.0) or 0.0)
+                        total_ms = float(m.get("total_latency_ms", 0.0) or 0.0)
+                        tpot_ms = float(m.get("tpot_ms", 0.0) or 0.0)
+                        ttft_v = bool(ttft_ms > float(ttft_budget_ms))
+                        total_v = bool(total_ms > float(total_budget_ms))
+                        tpot_v = bool(tpot_ms > float(tpot_budget_ms))
+                        m["slo_ttft_violation"] = bool(ttft_v)
+                        m["slo_total_violation"] = bool(total_v)
+                        m["slo_tpot_violation"] = bool(tpot_v)
+                        # Primary SLO event (blueprint): TTFT or E2E(total) violation.
+                        # NOTE: E2E is measured server-side as `total_latency_ms` (queue-inclusive Option A).
+                        m["slo_violation"] = bool(ttft_v or total_v)
+                        # Convenience for bandit updates (risk label)
+                        m["risk_violation"] = int(1 if (ttft_v or total_v) else 0)
+                    except Exception:
+                        pass
+
                     # Record attempt
                     r.attempts.append(
                         {
@@ -3374,6 +4026,15 @@ class MultiVariantService:
                             "tpot_ms": m.get("tpot_ms"),
                             "total_latency_ms": m.get("total_latency_ms"),
                             "output_tokens": m.get("output_tokens"),
+                            # Cost breakdown
+                            "cost_units": m.get("cost_units"),
+                            "token_cost_units": m.get("token_cost_units"),
+                            "adapter_overhead_units": m.get("adapter_overhead_units"),
+                            "swap_overhead_units": m.get("swap_overhead_units"),
+                            "swap_loaded": m.get("swap_loaded"),
+                            # SLO / risk signals
+                            "slo_violation": m.get("slo_violation"),
+                            "risk_violation": m.get("risk_violation"),
                         }
                     )
 

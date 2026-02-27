@@ -3,7 +3,7 @@
 This bundle contains patched versions of the baseline scripts to produce paper-grade, reproducible results for:
 - Accuracy evaluation (GSM8K + MMLU)
 - SLO-mode quality guardrail (SLO prompting should not collapse correctness)
-- Closed-loop load testing with micro-batching, TTFT/TPOT measurement, and dynamic SLO calibration
+- Closed-loop load testing with micro-batching, TTFT/**E2E(total)** measurement, and dynamic SLO calibration
 
 ## What changed (high level)
 
@@ -26,6 +26,8 @@ This bundle contains patched versions of the baseline scripts to produce paper-g
 - Calibrates SLO thresholds from a baseline run (default `concurrency=1`).
 - Saves percentile profiles **p90/p95/p99** to `slo_thresholds.json`.
 - Uses **p95 as primary** for reported compliance; p90/p99 are saved for sensitivity analysis.
+- **Primary violation definition (paper):** TTFT **or** E2E(total) exceeds the calibrated thresholds.
+  - E2E(total) is measured server-side as `total_latency_ms` (queue-inclusive).
 
 ### 3) Reproducibility + split integrity (preprocessing.py)
 - Preserves official test splits (no leakage into calibration).
@@ -64,6 +66,52 @@ python run_baseline_evaluation.py \
   --seed 42 \
   --output_dir ./runs/multi_variant_smoke
 ```
+
+## New experimental knobs (paper add-ons)
+
+### Nonstationary load schedules (E2)
+Run a phase schedule (overrides `--concurrencies`):
+```bash
+python run_baseline_evaluation.py \
+  --service multi --router_mode bandit \
+  --multi_variants cheap med base \
+  --prompt_mode slo \
+  --num_requests 200 \
+  --concurrency_schedule "1:100,8:200,2:100" \
+  --output_dir ./runs/nonstationary
+```
+Then plot time-series from `requests_schedule.jsonl`:
+```bash
+python scripts/analysis/plot_timeseries.py \
+  --requests_jsonl ./runs/nonstationary/requests_schedule.jsonl \
+  --out_dir ./runs/nonstationary/plots
+```
+
+### Delayed labels (Step 3)
+Run without sending gold labels to the server (bandit stores pending join_keys):
+```bash
+python run_baseline_evaluation.py \
+  --service multi --router_mode bandit \
+  --server_label_mode none \
+  --output_dir ./runs/delayed_labels
+```
+
+Later, ingest a judge file (JSONL/CSV) into the saved bandit state:
+```bash
+python scripts/replay_delayed_labels.py \
+  --bandit_state_path ./runs/delayed_labels/bandit_state \
+  --judge_file ./judge_outputs.jsonl
+```
+
+### Adapter churn + cache sweeps (E4)
+Enable synthetic adapters (no PEFT / no on-disk adapter artifacts required):
+```bash
+python run_baseline_evaluation.py \
+  --enable_adapters --adapter_allow_missing \
+  --adapter_synthetic_load_ms 20 --adapter_synthetic_switch_ms 5 \
+  --output_dir ./runs/adapters
+```
+Then run sweeps via `scripts/experiments/e4_adapter_churn.py`.
 
 ## How to run
 

@@ -106,6 +106,36 @@ def _effective_enable_batching(prompt_mode: str, enable_batching_flag: Optional[
     return bool(enable_batching_flag)
 
 
+def _parse_concurrency_schedule(spec: Optional[str]) -> Optional[List[Tuple[int, int]]]:
+    """Parse a nonstationary concurrency schedule.
+
+    Format: "<conc>:<num_requests>,<conc>:<num_requests>,..." (commas or semicolons).
+    Returns a list of (concurrency, num_requests) phases.
+    """
+
+    if not spec:
+        return None
+    spec = str(spec).strip()
+    if not spec:
+        return None
+
+    phases: List[Tuple[int, int]] = []
+    parts = [p.strip() for p in spec.replace(";", ",").split(",") if p.strip()]
+    for p in parts:
+        if ":" not in p:
+            continue
+        a, b = p.split(":", 1)
+        try:
+            conc = int(a.strip())
+            nreq = int(b.strip())
+        except Exception:
+            continue
+        if conc <= 0 or nreq <= 0:
+            continue
+        phases.append((conc, nreq))
+    return phases or None
+
+
 
 
 def _build_stratified_pool(
@@ -274,8 +304,23 @@ def parse_args() -> argparse.Namespace:
             "learned_ttft",
             "learned_total",
             "risk",
+            "bandit",
         ],
         help="Routing policy for multi-variant serving.",
+    )
+
+    # Reproducibility / cost model knobs
+    p.add_argument(
+        "--router_seed",
+        type=int,
+        default=0,
+        help="Deterministic seed for routing-related randomness (bandit label subsampling, etc.).",
+    )
+    p.add_argument(
+        "--overhead_ms_to_cost_units",
+        type=float,
+        default=0.1,
+        help="Convert overhead milliseconds into token-equivalent cost units (applied to adapter/swap overheads).",
     )
     p.add_argument(
         "--router_fixed_variant",
@@ -296,7 +341,7 @@ def parse_args() -> argparse.Namespace:
         "--risk_router_dir",
         type=str,
         default=None,
-        help="Path to risk-router bundle artifacts (trained with scripts/train_risk_router.py). Required for --router_mode risk.",
+        help="Path to risk-router bundle artifacts (trained with scripts/train_risk_router.py). Required for --router_mode risk or bandit.",
     )
     p.add_argument(
         "--risk_latency_delta",
@@ -315,6 +360,108 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.05,
         help="Confidence level α for the quality risk bound (Clopper-Pearson).",
+    )
+
+    # ------------------------------------------------------------------
+    # Bandit router knobs (SLO-safe contextual bandit)
+    # ------------------------------------------------------------------
+    p.add_argument("--bandit_delta", type=float, default=0.05, help="Risk budget δ (target violation rate) for the bandit.")
+    p.add_argument("--bandit_alpha", type=float, default=1.0, help="Quality weight α in the bandit objective.")
+    p.add_argument("--bandit_beta_r", type=float, default=2.0, help="Risk bound multiplier β_r (conservative screen).")
+    p.add_argument("--bandit_beta_q", type=float, default=2.0, help="Quality bound multiplier β_q (conservative screen).")
+    p.add_argument("--bandit_eps_r", type=float, default=0.0, help="Risk tolerance ε_r vs baseline (conservative screen).")
+    p.add_argument("--bandit_eps_q", type=float, default=0.0, help="Quality tolerance ε_q vs baseline (conservative screen).")
+    p.add_argument("--bandit_beta_u", type=float, default=0.2, help="Exploration bonus multiplier β_u.")
+    p.add_argument(
+        "--bandit_label_budget_p",
+        type=float,
+        default=1.0,
+        help="Fraction of requests with observed quality labels (simulated delayed labels).",
+    )
+    p.add_argument(
+        "--bandit_checkpoint_path",
+        type=str,
+        default=None,
+        help="If set, periodically checkpoint bandit state to this path prefix.",
+    )
+    p.add_argument(
+        "--bandit_checkpoint_every",
+        type=int,
+        default=500,
+        help="Checkpoint every N bandit updates.",
+    )
+    p.add_argument(
+        "--bandit_state_path",
+        type=str,
+        default=None,
+        help="Load an existing bandit state (path prefix used by BanditRouter.save).",
+    )
+    p.add_argument(
+        "--bandit_learn_requests",
+        type=int,
+        default=0,
+        help="Number of labeled requests to run for the bandit learning phase before evaluation.",
+    )
+    p.add_argument(
+        "--bandit_learn_concurrency",
+        type=int,
+        default=None,
+        help="Concurrency for the bandit learning phase (defaults to --slo_calibration_concurrency).",
+    )
+    p.add_argument(
+        "--bandit_keep_learning_during_eval",
+        action="store_true",
+        help="If set, do NOT freeze bandit updates after the learning phase.",
+    )
+    p.add_argument(
+        "--bandit_adapter_ids",
+        type=str,
+        default=None,
+        help="Comma-separated adapter_ids to include in bandit action space (plus implicit none).",
+    )
+    p.add_argument(
+        "--bandit_rank_tiers",
+        type=str,
+        default=None,
+        help="Comma-separated rank tiers to include in bandit action space.",
+    )
+    p.add_argument(
+        "--bandit_variant_load_synthetic_ms",
+        type=float,
+        default=1000.0,
+        help="Synthetic prior for variant swap/load overhead (ms) before EWMA is populated.",
+    )
+
+    # Bandit safety/feature toggles
+    p.add_argument(
+        "--bandit_disable_latency_guard",
+        action="store_true",
+        help="If set, do not require actions to be latency-safe under conformal bounds.",
+    )
+    p.add_argument(
+        "--bandit_disable_conservative_fallback",
+        action="store_true",
+        help="If set, disable conservative fallback to the baseline policy.",
+    )
+    p.add_argument(
+        "--bandit_disable_primal_dual",
+        action="store_true",
+        help="If set, disable the primal-dual virtual queue update.",
+    )
+    p.add_argument(
+        "--bandit_disable_overhead_cost",
+        action="store_true",
+        help="If set, do not include adapter/swap overhead in the bandit cost estimate.",
+    )
+    p.add_argument(
+        "--bandit_disable_system_features",
+        action="store_true",
+        help="If set, do not append system-load features to the bandit context.",
+    )
+    p.add_argument(
+        "--bandit_disable_adapter_features",
+        action="store_true",
+        help="If set, zero out adapter-related features in the bandit context.",
     )
 
     # Dispatcher policy (scheduler)
@@ -398,6 +545,11 @@ def parse_args() -> argparse.Namespace:
         help="Optional extra (simulated) adapter switch overhead in ms per activation.",
     )
     p.add_argument(
+        "--adapter_allow_missing",
+        action="store_true",
+        help="Allow 'synthetic' adapters without PEFT installed and/or without adapter dirs on disk (for churn/cache experiments).",
+    )
+    p.add_argument(
         "--dispatcher_max_sticky_adapter_batches",
         type=int,
         default=4,
@@ -462,6 +614,18 @@ def parse_args() -> argparse.Namespace:
                    help="Best-effort flag for vLLM to disable CUDA graphs (may help debugging).")
     p.add_argument("--prompt_mode", type=str, default="accuracy", choices=["accuracy", "slo"])
 
+    # Paper: delayed / partial feedback experiments.
+    # - gold  : send gold labels to the server (enables online bandit quality updates).
+    # - none  : do NOT send labels to the server; correctness is still computed client-side
+    #           and can be ingested later via scripts/replay_delayed_labels.py.
+    p.add_argument(
+        "--server_label_mode",
+        type=str,
+        default="gold",
+        choices=["gold", "none"],
+        help="Whether to send gold quality labels to the server during load tests (default: gold).",
+    )
+
     p.add_argument("--preprocess", action="store_true", help="Run dataset preprocessing")
     p.add_argument("--data_dir", type=str, default="data/raw")
     p.add_argument("--processed_dir", type=str, default="data/processed")
@@ -496,6 +660,16 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--concurrencies", type=int, nargs="+", default=[1, 2, 4])
 
+    # Nonstationary load: phase schedule (E2). If set, overrides --concurrencies.
+    # Format: "<conc>:<num_requests>,<conc>:<num_requests>,..." (commas or semicolons).
+    # Example: --concurrency_schedule "1:100,8:200,2:100"
+    p.add_argument(
+        "--concurrency_schedule",
+        type=str,
+        default=None,
+        help="Optional nonstationary phase schedule; overrides --concurrencies.",
+    )
+
     p.add_argument("--skip_accuracy_eval", action="store_true")
 
     # Batching flags: allow explicit on/off, else default to (prompt_mode == slo)
@@ -526,12 +700,12 @@ def main() -> None:
         if args.learned_router_dir is None:
             raise ValueError("--learned_router_dir is required for learned router modes.")
 
-    # risk router artifacts are required for risk mode
-    if args.router_mode == "risk":
+    # risk router artifacts are required for risk + bandit modes
+    if args.router_mode in {"risk", "bandit"}:
         if args.service != "multi":
-            raise ValueError("risk router mode requires --service multi.")
+            raise ValueError("risk/bandit router modes require --service multi.")
         if args.risk_router_dir is None:
-            raise ValueError("--risk_router_dir is required for --router_mode risk.")
+            raise ValueError("--risk_router_dir is required for --router_mode risk or bandit.")
 
 
     out_dir = Path(args.output_dir)
@@ -685,7 +859,32 @@ def main() -> None:
                 adapter_eviction_policy=str(args.adapter_eviction_policy),
                 adapter_synthetic_load_ms=float(args.adapter_synthetic_load_ms),
                 adapter_synthetic_switch_ms=float(args.adapter_synthetic_switch_ms),
+                adapter_allow_missing=bool(args.adapter_allow_missing),
                 dispatcher_max_sticky_adapter_batches=int(args.dispatcher_max_sticky_adapter_batches),
+                overhead_ms_to_cost_units=float(args.overhead_ms_to_cost_units),
+                router_seed=int(args.router_seed),
+                # Bandit router knobs (only used when router_mode=bandit)
+                bandit_delta=float(args.bandit_delta),
+                bandit_alpha=float(args.bandit_alpha),
+                bandit_beta_r=float(args.bandit_beta_r),
+                bandit_beta_q=float(args.bandit_beta_q),
+                bandit_eps_r=float(args.bandit_eps_r),
+                bandit_eps_q=float(args.bandit_eps_q),
+                bandit_beta_u=float(args.bandit_beta_u),
+                bandit_label_budget_p=float(args.bandit_label_budget_p),
+                bandit_checkpoint_path=(str(args.bandit_checkpoint_path) if args.bandit_checkpoint_path else None),
+                bandit_checkpoint_every=int(args.bandit_checkpoint_every),
+                bandit_state_path=(str(args.bandit_state_path) if args.bandit_state_path else None),
+                bandit_require_latency_safe=(not bool(args.bandit_disable_latency_guard)),
+                bandit_use_conservative_fallback=(not bool(args.bandit_disable_conservative_fallback)),
+                bandit_use_primal_dual=(not bool(args.bandit_disable_primal_dual)),
+                bandit_use_overhead_cost=(not bool(args.bandit_disable_overhead_cost)),
+                bandit_use_system_features=(not bool(args.bandit_disable_system_features)),
+                bandit_use_adapter_features=(not bool(args.bandit_disable_adapter_features)),
+                bandit_variant_load_synthetic_ms=float(args.bandit_variant_load_synthetic_ms),
+                bandit_adapter_ids=args.bandit_adapter_ids,
+                bandit_rank_tiers=args.bandit_rank_tiers,
+                bandit_update_enabled=True,
             )
         else:
             # Optional CHEAP override for single-variant runs.
@@ -719,6 +918,8 @@ def main() -> None:
                 adapter_eviction_policy=str(args.adapter_eviction_policy),
                 adapter_synthetic_load_ms=float(args.adapter_synthetic_load_ms),
                 adapter_synthetic_switch_ms=float(args.adapter_synthetic_switch_ms),
+                adapter_allow_missing=bool(args.adapter_allow_missing),
+                overhead_ms_to_cost_units=float(args.overhead_ms_to_cost_units),
             )
     else:
         if args.service == "multi":
@@ -775,7 +976,7 @@ def main() -> None:
         and (not args.disable_slo_calibration)
         and (slo_profiles is None)
         and isinstance(server, MultiVariantService)
-        and (args.router_calibration_mode == "base")
+        and (args.router_calibration_mode == "base" or args.router_mode == "bandit")
     ):
         calib_conc = int(args.slo_calibration_concurrency)
         logger.info(
@@ -789,13 +990,14 @@ def main() -> None:
             data_loader=load_pool,
             prompt_mode=args.prompt_mode,
             seed=args.seed,
+            send_labels_to_server=(args.server_label_mode == "gold"),
         )
         req_metrics_calib = lg_calib.run_load_test()
         slo_profiles = calibrate_slo_profiles(req_metrics_calib, percentiles=args.slo_calibration_percentiles)
         _write_json(
             slo_thresholds_path,
             {
-                "definition": "TTFT_OptionA_queue_inclusive",
+                    "definition": "TTFT_OptionA_queue_inclusive + E2E(total_latency_ms)",
                 "calibration_concurrency": calib_conc,
                 "percentiles": args.slo_calibration_percentiles,
                 "primary": args.slo_primary_percentile,
@@ -806,6 +1008,111 @@ def main() -> None:
         # Save calibration request traces for debugging / appendix.
         lg_calib.save_results(str(out_dir / f"requests_calibration_base_concurrency_{calib_conc}.jsonl"))
 
+    # If we have calibrated (or loaded) SLO profiles, apply them to the server
+    # before any bandit learning/evaluation.
+    if isinstance(server, MultiVariantService) and slo_profiles is not None:
+        try:
+            slo_for_report = slo_profiles.get(primary_key) or next(iter(slo_profiles.values()))
+            server.set_slo_dict(slo_for_report)
+        except Exception:
+            pass
+
+    # Fallback calibration for single-variant runs (or if profiles are still missing).
+    if (
+        (not args.skip_load_test)
+        and (not args.disable_slo_calibration)
+        and (slo_profiles is None)
+        and (not isinstance(server, MultiVariantService))
+    ):
+        calib_conc = int(args.slo_calibration_concurrency)
+        logger.info(
+            f"[CALIBRATION] Single-variant: calibrating SLO profiles at concurrency={calib_conc}"
+        )
+        lg_calib = ClosedLoopLoadGenerator(
+            inference_func=server.generate,
+            max_concurrency=calib_conc,
+            num_requests=args.num_requests,
+            data_loader=load_pool,
+            prompt_mode=args.prompt_mode,
+            seed=args.seed,
+            send_labels_to_server=(args.server_label_mode == "gold"),
+        )
+        req_metrics_calib = lg_calib.run_load_test()
+        slo_profiles = calibrate_slo_profiles(req_metrics_calib, percentiles=args.slo_calibration_percentiles)
+        _write_json(
+            slo_thresholds_path,
+            {
+                "definition": "TTFT_OptionA_queue_inclusive + E2E(total_latency_ms)",
+                "calibration_concurrency": calib_conc,
+                "percentiles": args.slo_calibration_percentiles,
+                "primary": args.slo_primary_percentile,
+                "profiles": slo_profiles,
+                "calibration_mode": "single_variant_fallback",
+            },
+        )
+        lg_calib.save_results(str(out_dir / f"requests_calibration_concurrency_{calib_conc}.jsonl"))
+
+    # ------------------------------------------------------------------
+    # Bandit learning phase (online updates), then freeze for evaluation.
+    # ------------------------------------------------------------------
+    if args.router_mode == "bandit" and isinstance(server, MultiVariantService):
+        learn_n = int(getattr(args, "bandit_learn_requests", 0) or 0)
+        if learn_n > 0:
+            learn_conc = int(args.bandit_learn_concurrency or args.slo_calibration_concurrency or 1)
+            logger.info(
+                f"[LEARNING] Bandit learning: {learn_n} requests at concurrency={learn_conc} "
+                f"(label_budget_p={args.bandit_label_budget_p})."
+            )
+            try:
+                server.set_bandit_update_enabled(True)
+            except Exception:
+                pass
+
+            learn_dir = out_dir / "bandit_learning"
+            learn_dir.mkdir(parents=True, exist_ok=True)
+            lg_learn = ClosedLoopLoadGenerator(
+                inference_func=server.generate,
+                max_concurrency=learn_conc,
+                num_requests=learn_n,
+                data_loader=train_data if train_data is not None else load_pool,
+                prompt_mode=args.prompt_mode,
+                seed=args.seed,
+                send_labels_to_server=(args.server_label_mode == "gold"),
+            )
+            learn_metrics = lg_learn.run_load_test(
+                dataset_type=args.dataset,
+                difficulty=args.difficulty,
+                max_tokens=args.max_tokens,
+            )
+            lg_learn.save_results(str(learn_dir / f"requests_bandit_learn_concurrency_{learn_conc}.jsonl"))
+            try:
+                learn_report = MetricsCalculator(learn_metrics, slo_dict=(server.slo_dict or {})).compute_all_metrics()
+                _write_json(str(learn_dir / f"metrics_bandit_learn_concurrency_{learn_conc}.json"), learn_report)
+            except Exception:
+                pass
+
+            # Save bandit router state for reproducibility
+            try:
+                save_prefix = args.bandit_checkpoint_path or str(learn_dir / "bandit_state")
+                if server.save_bandit_state(save_prefix):
+                    logger.info(f"[LEARNING] Saved bandit state to: {save_prefix}.json/.npz")
+            except Exception:
+                pass
+
+        # Freeze updates during evaluation unless explicitly requested.
+        if not bool(getattr(args, "bandit_keep_learning_during_eval", False)):
+            if args.bandit_state_path is not None or int(getattr(args, "bandit_learn_requests", 0) or 0) > 0:
+                try:
+                    server.set_bandit_update_enabled(False)
+                    logger.info("[EVAL] Bandit updates frozen for evaluation.")
+                except Exception:
+                    pass
+            else:
+                logger.warning(
+                    "[EVAL] router_mode=bandit with no --bandit_state_path and no --bandit_learn_requests; "
+                    "bandit will keep learning during evaluation unless you provide a learning phase or a saved state."
+                )
+
     if args.skip_load_test:
         logger.info("Skipping load tests (--skip_load_test).")
     else:
@@ -814,71 +1121,110 @@ def main() -> None:
             val_data = [{"dataset": "gsm8k", "prompt": "1+1?", "answer": "2", "difficulty": "easy"}]
             load_pool = val_data
 
-        for conc in args.concurrencies:
-            conc = int(conc)
-            print(f"\n>>> Testing with concurrency={conc}")
+        # Choose SLO dict for reporting (fixed across phases/concurrencies).
+        slo_for_report = None
+        if not args.disable_slo_calibration:
+            if slo_profiles is not None:
+                slo_for_report = slo_profiles.get(primary_key) or next(iter(slo_profiles.values()))
 
-            lg = ClosedLoopLoadGenerator(
-                inference_func=server.generate,
-                max_concurrency=conc,
-                num_requests=args.num_requests,
-                data_loader=load_pool,
-                prompt_mode=args.prompt_mode,
-                seed=args.seed,
-            )
-            req_metrics = lg.run_load_test()
+        # If using multi-variant routing, update the router's SLO targets.
+        if isinstance(server, MultiVariantService) and slo_for_report is not None:
+            server.set_slo_dict(slo_for_report)
 
-            # Calibrate thresholds from a specific baseline concurrency.
-            if (
-                (not args.disable_slo_calibration)
-                and (slo_profiles is None)
-                and (conc == int(args.slo_calibration_concurrency))
-            ):
-                logger.info(
-                    f"Calibrating SLOs from concurrency={conc} at percentiles {args.slo_calibration_percentiles}"
+        schedule = _parse_concurrency_schedule(args.concurrency_schedule)
+        if schedule is not None:
+            logger.info(f"Running nonstationary load schedule with {len(schedule)} phases: {schedule}")
+            all_req_metrics = []
+
+            for phase_idx, (conc, nreq) in enumerate(schedule, 1):
+                conc = int(conc)
+                nreq = int(nreq)
+                print(f"\n>>> Phase {phase_idx}/{len(schedule)}: concurrency={conc} num_requests={nreq}")
+
+                lg = ClosedLoopLoadGenerator(
+                    inference_func=server.generate,
+                    max_concurrency=conc,
+                    num_requests=nreq,
+                    data_loader=load_pool,
+                    prompt_mode=args.prompt_mode,
+                    seed=args.seed + phase_idx,  # diversify per phase while remaining deterministic
+                    send_labels_to_server=(args.server_label_mode == "gold"),
                 )
-                slo_profiles = calibrate_slo_profiles(req_metrics, percentiles=args.slo_calibration_percentiles)
-                _write_json(
-                    slo_thresholds_path,
-                    {
-                        "definition": "TTFT_OptionA_queue_inclusive",
-                        "calibration_concurrency": conc,
-                        "percentiles": args.slo_calibration_percentiles,
-                        "primary": args.slo_primary_percentile,
-                        "profiles": slo_profiles,
-                    },
+                req_metrics = lg.run_load_test()
+                all_req_metrics.extend(req_metrics)
+
+                mc = MetricsCalculator(req_metrics, slo_dict=slo_for_report)
+                report = mc.print_report(title=f"LOAD TEST RESULTS (Phase {phase_idx}, Concurrency {conc})")
+
+                # Sensitivity: report compliance under p90/p95/p99
+                sensitivity: Dict[str, float] = {}
+                if (not args.disable_slo_calibration) and slo_profiles is not None:
+                    for k, slo in slo_profiles.items():
+                        sensitivity[k] = float(
+                            MetricsCalculator(req_metrics, slo_dict=slo).compute_all_metrics()["summary"]["slo_compliance"]
+                        )
+                report["slo_profile_used"] = primary_key
+                report["slo_sensitivity"] = sensitivity
+                report["phase"] = phase_idx
+                report["phase_concurrency"] = conc
+                report["phase_num_requests"] = nreq
+
+                metrics_path = str(out_dir / f"metrics_phase_{phase_idx}_concurrency_{conc}.json")
+                _write_json(metrics_path, report)
+                lg.save_results(str(out_dir / f"requests_phase_{phase_idx}_concurrency_{conc}.jsonl"))
+
+            # Combined artifacts for time-series analysis
+            try:
+                all_req_metrics = sorted(all_req_metrics, key=lambda m: float(getattr(m, "end_time", 0.0) or 0.0))
+            except Exception:
+                pass
+            combined_path = str(out_dir / "requests_schedule.jsonl")
+            with open(combined_path, "w") as f:
+                for m in all_req_metrics:
+                    f.write(json.dumps(m.to_dict()) + "\n")
+            logger.info(f"Saved combined schedule trace to: {combined_path}")
+
+            try:
+                overall = MetricsCalculator(all_req_metrics, slo_dict=slo_for_report).compute_all_metrics()
+                overall["slo_profile_used"] = primary_key
+                _write_json(str(out_dir / "metrics_schedule.json"), overall)
+            except Exception:
+                pass
+        else:
+            for conc in args.concurrencies:
+                conc = int(conc)
+                print(f"\n>>> Testing with concurrency={conc}")
+
+                lg = ClosedLoopLoadGenerator(
+                    inference_func=server.generate,
+                    max_concurrency=conc,
+                    num_requests=args.num_requests,
+                    data_loader=load_pool,
+                    prompt_mode=args.prompt_mode,
+                    seed=args.seed,
+                    send_labels_to_server=(args.server_label_mode == "gold"),
                 )
+                req_metrics = lg.run_load_test()
 
-            # Choose SLO dict for reporting
-            slo_for_report = None
-            if args.disable_slo_calibration:
-                slo_for_report = None
-            else:
-                if slo_profiles is not None:
-                    slo_for_report = slo_profiles.get(primary_key) or next(iter(slo_profiles.values()))
+                mc = MetricsCalculator(req_metrics, slo_dict=slo_for_report)
+                report = mc.print_report(title=f"LOAD TEST RESULTS (Concurrency {conc})")
 
+                # Sensitivity: report compliance under p90/p95/p99
+                sensitivity: Dict[str, float] = {}
+                if (not args.disable_slo_calibration) and slo_profiles is not None:
+                    for k, slo in slo_profiles.items():
+                        sensitivity[k] = float(
+                            MetricsCalculator(req_metrics, slo_dict=slo).compute_all_metrics()["summary"]["slo_compliance"]
+                        )
 
-            # If using multi-variant routing, update the router's SLO targets.
-            if isinstance(server, MultiVariantService) and slo_for_report is not None:
-                server.set_slo_dict(slo_for_report)
+                report["slo_profile_used"] = primary_key
+                report["slo_sensitivity"] = sensitivity
 
-            mc = MetricsCalculator(req_metrics, slo_dict=slo_for_report)
-            report = mc.print_report(title=f"LOAD TEST RESULTS (Concurrency {conc})")
+                metrics_path = str(out_dir / f"metrics_concurrency_{conc}.json")
+                _write_json(metrics_path, report)
 
-            # Sensitivity: report compliance under p90/p95/p99
-            sensitivity: Dict[str, float] = {}
-            if (not args.disable_slo_calibration) and slo_profiles is not None:
-                for k, slo in slo_profiles.items():
-                    sensitivity[k] = float(MetricsCalculator(req_metrics, slo_dict=slo).compute_all_metrics()["summary"]["slo_compliance"])
-
-            report["slo_profile_used"] = primary_key
-            report["slo_sensitivity"] = sensitivity
-
-            metrics_path = str(out_dir / f"metrics_concurrency_{conc}.json")
-            _write_json(metrics_path, report)
-
-            requests_path = str(out_dir / f"requests_concurrency_{conc}.jsonl")
-            lg.save_results(requests_path)
+                requests_path = str(out_dir / f"requests_concurrency_{conc}.jsonl")
+                lg.save_results(requests_path)
 
     # ------------------------------------------------------------------
     # STEP 4: EVALUATE ACCURACY
