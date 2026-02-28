@@ -136,6 +136,100 @@ def _parse_concurrency_schedule(spec: Optional[str]) -> Optional[List[Tuple[int,
     return phases or None
 
 
+def _parse_data_schedule(spec: Optional[str]) -> Optional[List[Tuple[str, str, int]]]:
+    """Parse a nonstationary *data* schedule (domain/length shift).
+
+    Format: "<selector>:<num_requests>,<selector>:<num_requests>,..." where
+    selector is "dataset=<name>" or "length=<short|long>".
+
+    Examples:
+      --data_schedule "dataset=gsm8k:200,dataset=mmlu:200"
+      --data_schedule "length=short:200,length=long:200"
+
+    Returns a list of (kind, value, num_requests) phases.
+    """
+
+    if not spec:
+        return None
+    spec = str(spec).strip()
+    if not spec:
+        return None
+
+    phases: List[Tuple[str, str, int]] = []
+    parts = [p.strip() for p in spec.replace(";", ",").split(",") if p.strip()]
+    for p in parts:
+        if ":" not in p:
+            continue
+        sel, nreq_s = p.split(":", 1)
+        sel = sel.strip()
+        nreq_s = nreq_s.strip()
+        if "=" not in sel:
+            continue
+        kind, value = sel.split("=", 1)
+        kind = kind.strip().lower()
+        value = value.strip().lower()
+        try:
+            nreq = int(nreq_s)
+        except Exception:
+            continue
+        if nreq <= 0:
+            continue
+        if kind not in {"dataset", "length"}:
+            continue
+        phases.append((kind, value, nreq))
+    return phases or None
+
+
+def _length_buckets(examples: List[Dict[str, Any]], seed: int = 0) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
+    """Split examples into (short, long) buckets by median input_length.
+
+    If input_length is missing, we approximate it by whitespace token count.
+    Returns (short, long, threshold).
+    """
+
+    if not examples:
+        return [], [], 0
+
+    lens: List[int] = []
+    for ex in examples:
+        try:
+            l = int(ex.get("input_length", 0) or 0)
+        except Exception:
+            l = 0
+        if l <= 0:
+            # fallback: whitespace tokens (best-effort)
+            try:
+                l = int(len(str(ex.get("prompt", "") or "").split()))
+            except Exception:
+                l = 0
+        lens.append(max(0, l))
+
+    if not lens:
+        return list(examples), [], 0
+
+    # Median threshold
+    thr = int(sorted(lens)[len(lens) // 2])
+    short: List[Dict[str, Any]] = []
+    long: List[Dict[str, Any]] = []
+    for ex, l in zip(examples, lens):
+        if int(l) <= int(thr):
+            short.append(ex)
+        else:
+            long.append(ex)
+
+    # If degenerate, fall back to deterministic split.
+    if not short or not long:
+        rng = random.Random(int(seed))
+        exs = list(examples)
+        rng.shuffle(exs)
+        mid = len(exs) // 2
+        short = exs[:mid]
+        long = exs[mid:]
+        thr = int(thr) if thr > 0 else int(mid)
+
+    return short, long, int(thr)
+
+
 
 
 def _build_stratified_pool(
@@ -414,6 +508,14 @@ def parse_args() -> argparse.Namespace:
         help="If set, do NOT freeze bandit updates after the learning phase.",
     )
     p.add_argument(
+        "--bandit_force_freeze",
+        action="store_true",
+        help=(
+            "Freeze bandit updates from the start of load tests (frozen-policy baseline / ablation). "
+            "This is useful for E5 (domain/length shift) to compare online adaptation vs a frozen policy."
+        ),
+    )
+    p.add_argument(
         "--bandit_adapter_ids",
         type=str,
         default=None,
@@ -670,6 +772,22 @@ def parse_args() -> argparse.Namespace:
         help="Optional nonstationary phase schedule; overrides --concurrencies.",
     )
 
+    # Domain/length shift schedule (E5). Mutually exclusive with --concurrency_schedule.
+    # Format: "dataset=<gsm8k|mmlu>:<nreq>,dataset=<...>:<nreq>" OR
+    #         "length=<short|long>:<nreq>,length=<...>:<nreq>".
+    p.add_argument(
+        "--data_schedule",
+        type=str,
+        default=None,
+        help="Optional nonstationary data schedule for domain/length shift (E5).",
+    )
+    p.add_argument(
+        "--data_schedule_concurrency",
+        type=int,
+        default=None,
+        help="Concurrency to use when running --data_schedule phases (defaults to the first value in --concurrencies).",
+    )
+
     p.add_argument("--skip_accuracy_eval", action="store_true")
 
     # Batching flags: allow explicit on/off, else default to (prompt_mode == slo)
@@ -769,6 +887,9 @@ def main() -> None:
             "skip_load_test": args.skip_load_test,
             "num_requests": args.num_requests,
             "concurrencies": args.concurrencies,
+            "concurrency_schedule": args.concurrency_schedule,
+            "data_schedule": getattr(args, "data_schedule", None),
+            "data_schedule_concurrency": getattr(args, "data_schedule_concurrency", None),
             "skip_accuracy_eval": args.skip_accuracy_eval,
             "enable_batching": effective_enable_batching,
             "max_batch_size": args.max_batch_size,
@@ -778,6 +899,7 @@ def main() -> None:
             "slo_calibration_percentiles": args.slo_calibration_percentiles,
             "slo_primary_percentile": args.slo_primary_percentile,
             "ttft_definition": "OptionA_queue_inclusive",
+            "bandit_force_freeze": bool(getattr(args, "bandit_force_freeze", False)),
         },
     )
 
@@ -942,6 +1064,15 @@ def main() -> None:
         )
         server = VLLMVariantServer(model_name=vllm_model, variant=args.variant, config=vcfg)
 
+    # Optional: force-freeze bandit updates (frozen-policy baseline / ablation).
+    # Must happen before any learning/load phases.
+    if bool(getattr(args, "bandit_force_freeze", False)) and isinstance(server, MultiVariantService):
+        try:
+            server.set_bandit_update_enabled(False)
+            logger.info("[BANDIT] bandit_force_freeze=True -> bandit updates disabled.")
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     # STEP 3: RUN LOAD TESTS
     # ------------------------------------------------------------------
@@ -1079,11 +1210,9 @@ def main() -> None:
                 seed=args.seed,
                 send_labels_to_server=(args.server_label_mode == "gold"),
             )
-            learn_metrics = lg_learn.run_load_test(
-                dataset_type=args.dataset,
-                difficulty=args.difficulty,
-                max_tokens=args.max_tokens,
-            )
+            # ClosedLoopLoadGenerator.run_load_test() takes no arguments.
+            # (The dataset mix and difficulty come from the provided data pool.)
+            learn_metrics = lg_learn.run_load_test()
             lg_learn.save_results(str(learn_dir / f"requests_bandit_learn_concurrency_{learn_conc}.jsonl"))
             try:
                 learn_report = MetricsCalculator(learn_metrics, slo_dict=(server.slo_dict or {})).compute_all_metrics()
@@ -1132,9 +1261,15 @@ def main() -> None:
             server.set_slo_dict(slo_for_report)
 
         schedule = _parse_concurrency_schedule(args.concurrency_schedule)
+        data_schedule = _parse_data_schedule(getattr(args, "data_schedule", None))
+
+        if schedule is not None and data_schedule is not None:
+            raise ValueError("--concurrency_schedule and --data_schedule are mutually exclusive. Use one at a time.")
+
         if schedule is not None:
             logger.info(f"Running nonstationary load schedule with {len(schedule)} phases: {schedule}")
-            all_req_metrics = []
+            all_req_metrics: List[Any] = []
+            all_req_rows: List[Dict[str, Any]] = []
 
             for phase_idx, (conc, nreq) in enumerate(schedule, 1):
                 conc = int(conc)
@@ -1152,6 +1287,17 @@ def main() -> None:
                 )
                 req_metrics = lg.run_load_test()
                 all_req_metrics.extend(req_metrics)
+
+                # Add phase metadata for time-series analysis.
+                for m in req_metrics:
+                    try:
+                        d = m.to_dict()
+                    except Exception:
+                        continue
+                    d["phase"] = int(phase_idx)
+                    d["phase_concurrency"] = int(conc)
+                    d["phase_num_requests"] = int(nreq)
+                    all_req_rows.append(d)
 
                 mc = MetricsCalculator(req_metrics, slo_dict=slo_for_report)
                 report = mc.print_report(title=f"LOAD TEST RESULTS (Phase {phase_idx}, Concurrency {conc})")
@@ -1178,10 +1324,15 @@ def main() -> None:
                 all_req_metrics = sorted(all_req_metrics, key=lambda m: float(getattr(m, "end_time", 0.0) or 0.0))
             except Exception:
                 pass
+            # Combined artifacts for time-series analysis
+            try:
+                all_req_rows = sorted(all_req_rows, key=lambda r: float(r.get("end_time", 0.0) or 0.0))
+            except Exception:
+                pass
             combined_path = str(out_dir / "requests_schedule.jsonl")
             with open(combined_path, "w") as f:
-                for m in all_req_metrics:
-                    f.write(json.dumps(m.to_dict()) + "\n")
+                for r in all_req_rows:
+                    f.write(json.dumps(r) + "\n")
             logger.info(f"Saved combined schedule trace to: {combined_path}")
 
             try:
@@ -1190,6 +1341,120 @@ def main() -> None:
                 _write_json(str(out_dir / "metrics_schedule.json"), overall)
             except Exception:
                 pass
+        elif data_schedule is not None:
+            # ------------------------------------------------------------------
+            # Nonstationary data schedule (E5): fixed concurrency, changing request mix.
+            # ------------------------------------------------------------------
+            conc = int(getattr(args, "data_schedule_concurrency", None) or (args.concurrencies[0] if args.concurrencies else 1))
+
+            # Precompute pools for selectors.
+            dataset_pools: Dict[str, List[Dict[str, Any]]] = {}
+            for ex in load_pool:
+                ds = str(ex.get("dataset") or "unknown").lower().strip()
+                dataset_pools.setdefault(ds, []).append(ex)
+
+            short_pool, long_pool, thr = _length_buckets(load_pool, seed=int(args.seed))
+            logger.info(
+                f"Running data schedule with {len(data_schedule)} phases @ concurrency={conc}. "
+                f"Length split threshold (median input_length) ~ {thr}."
+            )
+
+            all_req_metrics: List[Any] = []
+            all_req_rows: List[Dict[str, Any]] = []
+
+            for phase_idx, (kind, value, nreq) in enumerate(data_schedule, 1):
+                kind = str(kind)
+                value = str(value)
+                nreq = int(nreq)
+
+                # Phase-specific request pool.
+                if kind == "dataset":
+                    phase_pool = dataset_pools.get(value) or []
+                    if not phase_pool:
+                        logger.warning(f"[DATA_SCHEDULE] No examples for dataset='{value}'. Falling back to full pool.")
+                        phase_pool = load_pool
+                elif kind == "length":
+                    if value == "short":
+                        phase_pool = short_pool or load_pool
+                    elif value == "long":
+                        phase_pool = long_pool or load_pool
+                    else:
+                        logger.warning(f"[DATA_SCHEDULE] Unknown length bucket '{value}'. Using full pool.")
+                        phase_pool = load_pool
+                else:
+                    phase_pool = load_pool
+
+                print(f"\n>>> Phase {phase_idx}/{len(data_schedule)}: {kind}={value} num_requests={nreq} (conc={conc})")
+
+                lg = ClosedLoopLoadGenerator(
+                    inference_func=server.generate,
+                    max_concurrency=conc,
+                    num_requests=nreq,
+                    data_loader=phase_pool,
+                    prompt_mode=args.prompt_mode,
+                    seed=args.seed + phase_idx,
+                    send_labels_to_server=(args.server_label_mode == "gold"),
+                )
+                req_metrics = lg.run_load_test()
+                all_req_metrics.extend(req_metrics)
+
+                for m in req_metrics:
+                    try:
+                        d = m.to_dict()
+                    except Exception:
+                        continue
+                    d["phase"] = int(phase_idx)
+                    d["phase_concurrency"] = int(conc)
+                    d["phase_num_requests"] = int(nreq)
+                    d["phase_selector_kind"] = str(kind)
+                    d["phase_selector_value"] = str(value)
+                    d["phase_length_threshold"] = int(thr)
+                    all_req_rows.append(d)
+
+                mc = MetricsCalculator(req_metrics, slo_dict=slo_for_report)
+                report = mc.print_report(title=f"LOAD TEST RESULTS (Phase {phase_idx}, {kind}={value}, Concurrency {conc})")
+
+                sensitivity: Dict[str, float] = {}
+                if (not args.disable_slo_calibration) and slo_profiles is not None:
+                    for k, slo in slo_profiles.items():
+                        sensitivity[k] = float(
+                            MetricsCalculator(req_metrics, slo_dict=slo).compute_all_metrics()["summary"]["slo_compliance"]
+                        )
+
+                report["slo_profile_used"] = primary_key
+                report["slo_sensitivity"] = sensitivity
+                report["phase"] = phase_idx
+                report["phase_concurrency"] = conc
+                report["phase_num_requests"] = nreq
+                report["phase_selector_kind"] = str(kind)
+                report["phase_selector_value"] = str(value)
+                report["phase_length_threshold"] = int(thr)
+
+                metrics_path = str(out_dir / f"metrics_phase_{phase_idx}_{kind}_{value}_concurrency_{conc}.json")
+                _write_json(metrics_path, report)
+                lg.save_results(str(out_dir / f"requests_phase_{phase_idx}_{kind}_{value}_concurrency_{conc}.jsonl"))
+
+            try:
+                all_req_rows = sorted(all_req_rows, key=lambda r: float(r.get("end_time", 0.0) or 0.0))
+            except Exception:
+                pass
+            combined_path = str(out_dir / "requests_schedule.jsonl")
+            with open(combined_path, "w") as f:
+                for r in all_req_rows:
+                    f.write(json.dumps(r) + "\n")
+            logger.info(f"Saved combined schedule trace to: {combined_path}")
+
+            try:
+                overall = MetricsCalculator(all_req_metrics, slo_dict=slo_for_report).compute_all_metrics()
+                overall["slo_profile_used"] = primary_key
+                overall["schedule_type"] = "data"
+                overall["data_schedule"] = [
+                    {"kind": k, "value": v, "num_requests": int(n)} for (k, v, n) in data_schedule
+                ]
+                _write_json(str(out_dir / "metrics_schedule.json"), overall)
+            except Exception:
+                pass
+
         else:
             for conc in args.concurrencies:
                 conc = int(conc)

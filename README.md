@@ -74,6 +74,7 @@ Run a phase schedule (overrides `--concurrencies`):
 ```bash
 python run_baseline_evaluation.py \
   --service multi --router_mode bandit \
+  --risk_router_dir router_models/risk_router_bundle \
   --multi_variants cheap med base \
   --prompt_mode slo \
   --num_requests 200 \
@@ -87,11 +88,76 @@ python scripts/analysis/plot_timeseries.py \
   --out_dir ./runs/nonstationary/plots
 ```
 
+### Offered-load sweep (E3)
+Run a concurrency sweep (multi-seed + CI + plots):
+```bash
+python scripts/experiments/e3_offered_load_sweep.py \
+  --configs ours=configs/bandit_base.json \
+  --concurrencies 1 2 4 8 \
+  --seeds 0 1 2 3 4 \
+  --num_requests 200 \
+  --out_root outputs/e3_offered_load
+```
+Add the paper ablation (remove system-state features):
+```bash
+python scripts/experiments/e3_offered_load_sweep.py \
+  --configs ours=configs/bandit_base.json \
+  --add_no_system_state_ablation \
+  --concurrencies 1 2 4 8 \
+  --seeds 0 1 2 3 4 \
+  --num_requests 200 \
+  --out_root outputs/e3_offered_load
+```
+
+### Domain/length shift mid-run (E5)
+This uses the `--data_schedule` mechanism in `run_baseline_evaluation.py`.
+
+Dataset/domain shift (gsm8k → mmlu) comparing **online** vs **frozen**:
+```bash
+python scripts/experiments/e5_domain_length_shift.py \
+  --config configs/bandit_base.json \
+  --shift_mode dataset --phase1_value gsm8k --phase2_value mmlu \
+  --phase_requests 200 200 --concurrency 4 \
+  --warmup_requests 200 --warmup_concurrency 4 \
+  --seeds 0 1 2 3 4 \
+  --out_root outputs/e5_shift
+```
+Length shift (short → long):
+```bash
+python scripts/experiments/e5_domain_length_shift.py \
+  --config configs/bandit_base.json \
+  --shift_mode length \
+  --phase_requests 200 200 --concurrency 4 \
+  --seeds 0 1 2 3 4 \
+  --out_root outputs/e5_shift
+```
+Each seed run produces time-series plots under `.../analysis/`.
+
+### Calibration + threshold sensitivity (E7)
+Reliability diagrams + ECE tables from request logs (multi-seed):
+```bash
+python scripts/experiments/e7_calibration.py \
+  --configs ours=configs/bandit_base.json \
+  --concurrency 4 --num_requests 300 \
+  --seeds 0 1 2 3 4 \
+  --out_root outputs/e7_calibration
+```
+
+### One-command figure regeneration
+After running E1–E7 (or any subset), regenerate figures from saved artifacts:
+```bash
+python analysis/make_all.py \
+  --outputs_root outputs \
+  --fig_dir figures \
+  --tables_dir tables
+```
+
 ### Delayed labels (Step 3)
 Run without sending gold labels to the server (bandit stores pending join_keys):
 ```bash
 python run_baseline_evaluation.py \
   --service multi --router_mode bandit \
+  --risk_router_dir router_models/risk_router_bundle \
   --server_label_mode none \
   --output_dir ./runs/delayed_labels
 ```
@@ -114,6 +180,34 @@ python run_baseline_evaluation.py \
 Then run sweeps via `scripts/experiments/e4_adapter_churn.py`.
 
 ## How to run
+
+### Train router artifacts (required for `--router_mode risk` and `--router_mode bandit`)
+Bandit/risk modes require a trained `--risk_router_dir` bundle.
+
+1) Collect multi-variant traces (Train+Val):
+```bash
+python scripts/train_learned_router.py \
+  --model gpt2 \
+  --collect_only \
+  --output_root router_models
+```
+This writes `router_models/trainval_traces.jsonl`.
+
+2) Train RiskRouter bundle:
+```bash
+python scripts/train_risk_router.py \
+  --trace_jsonl router_models/trainval_traces.jsonl \
+  --output_dir router_models/risk_router_bundle
+```
+
+3) (Optional) Train LearnedRouter bundles (quality + latency predictors):
+```bash
+python scripts/train_learned_router.py \
+  --model gpt2 \
+  --output_root router_models
+```
+
+After this, `configs/bandit_base.json` should work out-of-the-box (it already points to `router_models/risk_router_bundle`).
 
 ### Quick smoke suite
 ```bash

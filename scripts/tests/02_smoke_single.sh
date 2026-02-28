@@ -6,7 +6,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-MODEL="${MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
+MODEL="${MODEL:-gpt2}"
 VARIANT="${VARIANT:-med}"
 DEVICE="${DEVICE:-auto}"
 DTYPE="${DTYPE:-auto}"

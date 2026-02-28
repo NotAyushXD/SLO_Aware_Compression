@@ -63,6 +63,8 @@ class RequestMetrics:
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
+        # Stable ID used to join delayed labels later
+        d["join_key"] = str(self.request_id)
         d["e2e_latency_ms"] = self.e2e_latency_ms
         d["queue_wait_time_ms"] = self.queue_wait_time_ms
         d["inference_time_ms"] = self.inference_time_ms

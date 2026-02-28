@@ -45,6 +45,31 @@ def _rolling_mean(xs: List[float], w: int) -> List[float]:
     return out
 
 
+def _rolling_ratio(num: List[float], den: List[float], w: int) -> List[float]:
+    """Rolling ratio (sum(num)/sum(den)) over a sliding window."""
+    if w <= 1:
+        out: List[float] = []
+        for a, b in zip(num, den):
+            out.append(float(a) / float(b) if float(b) > 0 else 0.0)
+        return out
+    out: List[float] = []
+    n_sum = 0.0
+    d_sum = 0.0
+    buf: List[Tuple[float, float]] = []
+    for a, b in zip(num, den):
+        a = float(a)
+        b = float(b)
+        buf.append((a, b))
+        n_sum += a
+        d_sum += b
+        if len(buf) > w:
+            a0, b0 = buf.pop(0)
+            n_sum -= a0
+            d_sum -= b0
+        out.append(n_sum / d_sum if d_sum > 0 else 0.0)
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--requests_jsonl", type=str, required=True)
@@ -69,9 +94,13 @@ def main() -> None:
     t = list(range(len(rows)))
 
     violations: List[float] = []
+    correct: List[float] = []
+    success: List[float] = []
     Qs: List[float] = []
     Q_present = False
     variants: List[str] = []
+    datasets: List[str] = []
+    phases: List[int] = []
 
     for r in rows:
         inf = r.get("inference_metrics", {}) or {}
@@ -99,7 +128,23 @@ def main() -> None:
 
         variants.append(str(inf.get("variant", "")) or "")
 
+        try:
+            success.append(1.0 if int(inf.get("success", 0) or 0) != 0 else 0.0)
+        except Exception:
+            success.append(0.0)
+        try:
+            correct.append(1.0 if int(inf.get("correct", 0) or 0) != 0 else 0.0)
+        except Exception:
+            correct.append(0.0)
+
+        datasets.append(str(r.get("dataset_type", r.get("dataset", "")) or ""))
+        try:
+            phases.append(int(r.get("phase", 0) or 0))
+        except Exception:
+            phases.append(0)
+
     viol_roll = _rolling_mean(violations, int(args.window))
+    acc_roll = _rolling_ratio(correct, success, int(args.window))
 
     # 1) Violation rate
     plt.figure()
@@ -109,6 +154,25 @@ def main() -> None:
     plt.title("SLO/Risk violation rate over time")
     plt.tight_layout()
     plt.savefig(out_dir / "violation_rate_timeseries.png", dpi=200)
+    plt.close()
+
+    # 1b) Rolling accuracy
+    plt.figure()
+    plt.plot(t, acc_roll)
+    plt.xlabel("request index")
+    plt.ylabel(f"rolling accuracy among successes (window={args.window})")
+    plt.title("Quality over time (accuracy)")
+    # Phase boundary markers (if present)
+    try:
+        last = phases[0]
+        for i, p in enumerate(phases):
+            if p != last:
+                plt.axvline(i, linestyle="--", linewidth=1, alpha=0.6)
+                last = p
+    except Exception:
+        pass
+    plt.tight_layout()
+    plt.savefig(out_dir / "accuracy_timeseries.png", dpi=200)
     plt.close()
 
     # 2) Q_t
@@ -146,6 +210,30 @@ def main() -> None:
         plt.legend()
         plt.tight_layout()
         plt.savefig(out_dir / "action_mix_timeseries.png", dpi=200)
+        plt.close()
+
+    # 4) Dataset mix (if multiple domains)
+    uniq_ds = sorted(list({d for d in datasets if d}))
+    if len(uniq_ds) >= 2:
+        w = int(args.window)
+        series = {u: [] for u in uniq_ds}
+        buf: List[str] = []
+        for d in datasets:
+            buf.append(d)
+            if len(buf) > w:
+                buf.pop(0)
+            denom = float(len(buf))
+            for u in uniq_ds:
+                series[u].append(sum(1 for x in buf if x == u) / denom)
+        plt.figure()
+        for u in uniq_ds:
+            plt.plot(t, series[u], label=u)
+        plt.xlabel("request index")
+        plt.ylabel(f"rolling dataset proportion (window={args.window})")
+        plt.title("Request mix over time")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(out_dir / "dataset_mix_timeseries.png", dpi=200)
         plt.close()
 
 

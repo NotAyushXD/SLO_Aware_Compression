@@ -2137,8 +2137,9 @@ class MultiVariantService:
         bandit_update_enabled: bool = True,
     ):
         self.model_name = model_name
-        self.device = device
-        self.dtype = dtype
+        # Match SingleVariantServer behavior: support device="auto" and dtype="auto".
+        self.device = "cuda" if (device == "auto" and torch.cuda.is_available()) else device
+        self.dtype = _resolve_dtype(dtype, self.device)
 
         # Adapter portfolio configuration (optional)
         self.enable_adapters = bool(enable_adapters)
@@ -2183,6 +2184,21 @@ class MultiVariantService:
                 batch_wait_ms = int(max(0.0, float(batch_timeout_s)) * 1000)
             except Exception:
                 pass
+
+        # --------------------------------------------------------------
+        # Resolve enabled variants *early*.
+        #
+        # Several downstream components (e.g., bandit cost/feature setup) need
+        # `self.variants` during initialization. Keep this block before any
+        # router-specific setup that references `self.variants`.
+        # --------------------------------------------------------------
+        requested_variants = variants or ["cheap", "med", "base"]
+        requested_variants = [_normalize_variant(v) for v in requested_variants]
+
+        supported = [v for v in requested_variants if self._is_variant_supported(v)]
+        if "base" not in supported:
+            supported.append("base")
+        self.variants = [v for v in self.VARIANT_ORDER if v in supported]
 
         self.fixed_variant = _normalize_variant(fixed_variant) if fixed_variant else None
 
@@ -2298,14 +2314,6 @@ class MultiVariantService:
         self.dispatcher_batch_wait_s = float(max(0.0, dispatcher_batch_wait_s))
         self.dispatcher_max_sticky_batches = int(max(1, dispatcher_max_sticky_batches))
         self.dispatcher_starvation_ms = float(max(0.0, dispatcher_starvation_ms))
-
-        requested_variants = variants or ["cheap", "med", "base"]
-        requested_variants = [_normalize_variant(v) for v in requested_variants]
-
-        supported = [v for v in requested_variants if self._is_variant_supported(v)]
-        if "base" not in supported:
-            supported.append("base")
-        self.variants = [v for v in self.VARIANT_ORDER if v in supported]
 
         if self.fixed_variant and self.fixed_variant not in self.variants:
             logger.warning(
@@ -3129,7 +3137,7 @@ class MultiVariantService:
             if self.router_mode.startswith("bandit") and self._bandit_router is not None and self._risk_router is not None:
                 # Baseline action: use the risk router (strong, SLO-aware baseline) with the
                 # standard adapter policy resolution.
-                base_variant, base_reason, base_meta = self._risk_router.route(
+                base_dec = self._risk_router.route(
                     dataset_type=dataset_type,
                     difficulty=difficulty,
                     max_tokens=int(max_tokens or 0),
@@ -3144,6 +3152,13 @@ class MultiVariantService:
                     latency_delta=float(self.risk_latency_delta),
                     quality_epsilon=float(self.risk_quality_epsilon),
                 )
+                # RiskRouter returns a RiskRouterDecision; unpack for backward compatibility.
+                base_variant = str(getattr(base_dec, 'variant', 'base'))
+                base_reason = str(getattr(base_dec, 'reason', ''))
+                try:
+                    base_meta = base_dec.to_dict()  # type: ignore[attr-defined]
+                except Exception:
+                    base_meta = {'decision': str(base_dec)}
                 baseline_action = BanditAction(
                     variant=str(base_variant),
                     adapter_id=str(adapter_id_use or ""),

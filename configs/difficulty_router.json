@@ -1,14 +1,27 @@
 {
   "description": "Difficulty-based router baseline.",
   "command": [
-    "--service", "multi",
-    "--router_mode", "difficulty",
-    "--multi_variants", "cheap", "med", "base",
-    "--prompt_mode", "slo",
-    "--processed_dir", "data/processed",
-    "--load_test_split", "val",
-    "--num_requests", "200",
-    "--concurrencies", "4",
-    "--slo_calibration_concurrency", "4"
+    "--model",
+    "gpt2",
+    "--service",
+    "multi",
+    "--router_mode",
+    "difficulty",
+    "--multi_variants",
+    "cheap",
+    "med",
+    "base",
+    "--prompt_mode",
+    "slo",
+    "--processed_dir",
+    "data/processed",
+    "--load_test_split",
+    "val",
+    "--num_requests",
+    "200",
+    "--concurrencies",
+    "4",
+    "--slo_calibration_concurrency",
+    "4"
   ]
 }

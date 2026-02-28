@@ -11,7 +11,7 @@ if ! python -c "import vllm" >/dev/null 2>&1; then
   exit 0
 fi
 
-MODEL="${MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
+MODEL="${MODEL:-gpt2}"
 DEVICE="${DEVICE:-auto}"
 DTYPE="${DTYPE:-float16}"
 OUTROOT="${OUTROOT:-runs/tests}"

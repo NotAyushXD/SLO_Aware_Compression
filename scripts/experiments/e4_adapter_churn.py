@@ -14,7 +14,7 @@ and set synthetic overhead:
 Usage:
   python scripts/experiments/e4_adapter_churn.py \
     --config configs/bandit_with_adapters.json \
-    --base_requests_jsonl data/processed/gsm8k_val.jsonl \
+    --base_requests_jsonl data/processed/val_data.jsonl \
     --churn_rates 0.0 0.25 0.5 1.0 \
     --cache_sizes 1 2 4 8 \
     --adapter_ids a0 a1 a2 a3 a4 a5 a6 a7 \
@@ -91,7 +91,7 @@ def _extract(metrics: Dict[str, Any]) -> Dict[str, float]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, required=True)
-    ap.add_argument("--base_requests_jsonl", type=str, required=True)
+    ap.add_argument("--base_requests_jsonl", type=str, default="data/processed/val_data.jsonl", help="Base JSONL pool to augment with adapter_id. Defaults to data/processed/val_data.jsonl")
     ap.add_argument("--churn_rates", type=float, nargs="+", required=True)
     ap.add_argument("--cache_sizes", type=int, nargs="+", required=True)
     ap.add_argument("--adapter_ids", type=str, nargs="+", default=["a0", "a1", "a2", "a3"]) 
