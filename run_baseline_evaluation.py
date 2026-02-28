@@ -361,10 +361,36 @@ def parse_args() -> argparse.Namespace:
     # A common use-case is making CHEAP a smaller fp16 model (e.g., Llama-3B) rather than
     # a 4-bit quantized version of the same base model.
     p.add_argument(
+        "--base_model",
+        type=str,
+        default=None,
+        help="Optional override HF model id for variant=base (default: --model).",
+    )
+    p.add_argument(
+        "--med_model",
+        type=str,
+        default=None,
+        help="Optional override HF model id for variant=med (default: --model).",
+    )
+    p.add_argument(
         "--cheap_model",
         type=str,
         default=None,
         help="Optional override HF model id for variant=cheap (e.g., meta-llama/Llama-3.2-3B-Instruct).",
+    )
+    p.add_argument(
+        "--base_quantization",
+        type=str,
+        default=None,
+        choices=["fp16", "bf16", "int8", "int4", "none"],
+        help="Optional override quantization for variant=base (default: fp16/bf16 depending on --dtype).",
+    )
+    p.add_argument(
+        "--med_quantization",
+        type=str,
+        default=None,
+        choices=["fp16", "bf16", "int8", "int4", "none"],
+        help="Optional override quantization for variant=med (default: int8 on CUDA if supported).",
     )
     p.add_argument(
         "--cheap_quantization",
@@ -382,6 +408,40 @@ def parse_args() -> argparse.Namespace:
         default="single",
         choices=["single", "multi"],
         help="Inference service type: single-variant or multi-variant (task-adaptive routing).",
+    )
+
+    # MultiVariant residency / swap knobs (important on constrained GPUs like Kaggle T4)
+    p.add_argument(
+        "--load_strategy",
+        type=str,
+        default="auto",
+        help=(
+            "MultiVariantService load strategy. 'auto' probes what fits; any other value disables probing and "
+            "respects --max_loaded_variants/--preload_variants. Useful values: auto, resident, hybrid, swap."
+        ),
+    )
+    p.add_argument(
+        "--max_loaded_variants",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of model variants to keep resident in GPU memory (None lets the service pick). "
+            "On Kaggle T4, try 1 or 2 if you OOM when using 3 variants."
+        ),
+    )
+    p.add_argument(
+        "--preload_variants",
+        nargs="*",
+        default=None,
+        help=(
+            "Optional list of variants to preload at startup (e.g., --preload_variants cheap base). "
+            "If omitted, service preloads a reasonable set based on strategy."
+        ),
+    )
+    p.add_argument(
+        "--warmup",
+        action="store_true",
+        help="If set, run a short deterministic warmup after loading each variant (reduces first-request spikes).",
     )
 
     # Router knobs (used when --service multi)
@@ -939,12 +999,20 @@ def main() -> None:
             # Optional per-variant overrides (e.g., make CHEAP a smaller fp16 model).
             variant_models = {}
             variant_quant = {}
+            if args.base_model:
+                variant_models["base"] = str(args.base_model)
+            if args.med_model:
+                variant_models["med"] = str(args.med_model)
             if args.cheap_model:
                 variant_models["cheap"] = str(args.cheap_model)
                 # Convenience: if a separate cheap model is provided, default to fp16 unless
                 # the user explicitly requests int8/int4.
                 if args.cheap_quantization is None:
                     variant_quant["cheap"] = "fp16"
+            if args.base_quantization:
+                variant_quant["base"] = str(args.base_quantization)
+            if args.med_quantization:
+                variant_quant["med"] = str(args.med_quantization)
             if args.cheap_quantization:
                 variant_quant["cheap"] = str(args.cheap_quantization)
 
@@ -970,6 +1038,10 @@ def main() -> None:
                 ema_alpha=args.router_ema_alpha,
                 max_retries=args.router_max_retries,
                 lazy_load_base=bool(args.router_lazy_load_base),
+                load_strategy=str(args.load_strategy),
+                max_loaded_variants=args.max_loaded_variants,
+                preload_variants=args.preload_variants,
+                warmup=bool(args.warmup),
                 enable_adapters=bool(args.enable_adapters),
                 adapter_root=args.adapter_root,
                 adapter_policy=str(args.adapter_policy),
@@ -1012,13 +1084,24 @@ def main() -> None:
             # Optional CHEAP override for single-variant runs.
             model_name = args.model
             quant_override = None
-            if str(args.variant).lower() == "cheap":
+            v = str(args.variant).lower().strip()
+            if v == "cheap":
                 if args.cheap_model:
                     model_name = str(args.cheap_model)
                     if args.cheap_quantization is None:
                         quant_override = "fp16"
                 if args.cheap_quantization:
                     quant_override = str(args.cheap_quantization)
+            elif v == "med":
+                if args.med_model:
+                    model_name = str(args.med_model)
+                if args.med_quantization:
+                    quant_override = str(args.med_quantization)
+            elif v == "base":
+                if args.base_model:
+                    model_name = str(args.base_model)
+                if args.base_quantization:
+                    quant_override = str(args.base_quantization)
 
             server = SingleVariantServer(
                 model_name=model_name,

@@ -470,7 +470,7 @@ def _group_by_example(records: List[Dict[str, Any]], variants: List[str]) -> Dic
             continue
         grouped.setdefault(gid, {})[r["variant"]] = r
 
-    # Keep only complete triplets.
+    # Keep only complete groups (one row per requested variant).
     keep: Dict[int, Dict[str, Dict[str, Any]]] = {}
     for gid, d in grouped.items():
         if all(v in d for v in variants):
@@ -579,6 +579,65 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--model", dest="model_name", required=True)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="auto")
+
+    # Optional per-variant override knobs (useful on constrained GPUs)
+    ap.add_argument(
+        "--base_model",
+        type=str,
+        default=None,
+        help=(
+            "Optional HF model id/path to use for the BASE variant during trace collection. "
+            "If omitted, BASE uses --model." 
+        ),
+    )
+    ap.add_argument(
+        "--med_model",
+        type=str,
+        default=None,
+        help=(
+            "Optional HF model id/path to use for the MED variant during trace collection. "
+            "If omitted, MED uses --model." 
+        ),
+    )
+    ap.add_argument(
+        "--cheap_model",
+        type=str,
+        default=None,
+        help=(
+            "Optional HF model id/path to use for the CHEAP variant during trace collection. "
+            "If omitted, CHEAP uses the same model_name as base with quantization."
+        ),
+    )
+    ap.add_argument(
+        "--base_quantization",
+        type=str,
+        default=None,
+        choices=["int4", "int8", "fp16", "bf16", "none"],
+        help=(
+            "Optional quantization override for BASE during trace collection. "
+            "If omitted, BASE defaults to fp16/bf16 (depending on --dtype)."
+        ),
+    )
+    ap.add_argument(
+        "--med_quantization",
+        type=str,
+        default=None,
+        choices=["int4", "int8", "fp16", "bf16", "none"],
+        help=(
+            "Optional quantization override for MED during trace collection. "
+            "If omitted, MED defaults to int8 on CUDA (or fp16 fallback if int8 is unsupported)."
+        ),
+    )
+    ap.add_argument(
+        "--cheap_quantization",
+        type=str,
+        default=None,
+        choices=["int4", "int8", "fp16", "bf16", "none"],
+        help=(
+            "Optional quantization override for CHEAP during trace collection. "
+            "On some Kaggle images, int4 can be flaky; try --cheap_quantization int8."
+        ),
+    )
     ap.add_argument("--processed_dir", default="data/processed")
     ap.add_argument("--prompt_mode", default="slo", choices=["slo", "accuracy"])
     ap.add_argument("--output_root", default="router_models")
@@ -590,6 +649,16 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--concurrencies", nargs="+", type=int, default=[1, 2, 4, 8])
     ap.add_argument("--seed", type=int, default=42)
+
+    ap.add_argument(
+        "--variants",
+        nargs="+",
+        default=["cheap", "med", "base"],
+        help=(
+            "Which variants to include when collecting traces / training routers. "
+            "Example: --variants cheap base (useful on Kaggle T4 to save VRAM/time)."
+        ),
+    )
 
     ap.add_argument("--max_batch_size", type=int, default=8)
     ap.add_argument("--batch_wait_ms", type=int, default=8)
@@ -705,7 +774,23 @@ def main() -> None:
 
     slo_dict = _load_slo_dict(args.slo_thresholds_path, profile_key=args.slo_profile)
 
-    variants = ["cheap", "med", "base"]
+    # Variants to include for trace collection/training.
+    # Useful on Kaggle/Colab to reduce VRAM/time (e.g., --variants cheap base).
+    def _norm_variant(v: str) -> str:
+        v = str(v or "").lower().strip()
+        if v in {"medium", "mid"}:
+            return "med"
+        if v in {"small", "lite", "light"}:
+            return "cheap"
+        if v in {"large", "full"}:
+            return "base"
+        return v
+
+    requested_variants = [_norm_variant(v) for v in (args.variants or []) if str(v).strip()]
+    order = ["cheap", "med", "base"]
+    variants = [v for v in order if v in requested_variants] if requested_variants else order
+    if not variants:
+        variants = ["base"]
 
     # -----------------------------
     # 1) Collect traces (train+val)
@@ -729,9 +814,36 @@ def main() -> None:
         time_budget_s = float(args.time_budget_hours or 0.0) * 3600.0
         start_time = time.time()
 
+        # Per-variant model/quantization overrides.
+        # Common Kaggle setup:
+        #   - base/med: meta-llama/Llama-3.1-8B-Instruct (fp16 / int8)
+        #   - cheap: meta-llama/Llama-3.2-3B (fp16 or int8)
+        variant_models: Dict[str, str] = {}
+        if args.base_model:
+            variant_models["base"] = str(args.base_model)
+        if args.med_model:
+            variant_models["med"] = str(args.med_model)
+        if args.cheap_model:
+            variant_models["cheap"] = str(args.cheap_model)
+
+        variant_quant: Dict[str, str] = {}
+        if args.base_quantization:
+            variant_quant["base"] = str(args.base_quantization)
+        if args.med_quantization:
+            variant_quant["med"] = str(args.med_quantization)
+        if args.cheap_quantization:
+            variant_quant["cheap"] = str(args.cheap_quantization)
+
+        # Convenience: if a separate cheap model is provided and no quantization override is set,
+        # default to fp16 (rather than the "cheap" default mapping, which is int4).
+        if args.cheap_model and (not args.cheap_quantization):
+            variant_quant.setdefault("cheap", "fp16")
+
         service = MultiVariantService(
             model_name=args.model_name,
             variants=variants,
+            variant_models=variant_models,
+            variant_quantization=variant_quant or None,
             device=args.device,
             dtype=args.dtype,
             router_mode="always_base",  # ignored during collection (we force variants)
@@ -799,11 +911,11 @@ def main() -> None:
             )
             return
 
-    # Sanity: expect ~3 rows per example (one per variant).
+    # Sanity: expect ~1 row per (example, variant).
     grouped_all = _group_by_example(records, variants)
-    print(f"[sanity] complete triplets={len(grouped_all)} examples")
+    print(f"[sanity] complete groups={len(grouped_all)} examples (variants={variants})")
     if len(grouped_all) == 0:
-        raise RuntimeError("No complete (cheap,med,base) triplets found in collected traces.")
+        raise RuntimeError(f"No complete groups found in collected traces for variants={variants}.")
 
     # Useful for long/expensive trace collection runs: allow exiting right after saving traces.
     if args.collect_only:
@@ -885,9 +997,28 @@ def main() -> None:
         from evaluation import HeldOutEvaluator
 
         for mode in ["learned_ttft", "learned_total"]:
+            variant_models: Dict[str, str] = {}
+            if args.base_model:
+                variant_models["base"] = str(args.base_model)
+            if args.med_model:
+                variant_models["med"] = str(args.med_model)
+            if args.cheap_model:
+                variant_models["cheap"] = str(args.cheap_model)
+
+            variant_quant: Dict[str, str] = {}
+            if args.base_quantization:
+                variant_quant["base"] = str(args.base_quantization)
+            if args.med_quantization:
+                variant_quant["med"] = str(args.med_quantization)
+            if args.cheap_quantization:
+                variant_quant["cheap"] = str(args.cheap_quantization)
+            if args.cheap_model and (not args.cheap_quantization):
+                variant_quant.setdefault("cheap", "fp16")
             service = MultiVariantService(
                 model_name=args.model_name,
                 variants=variants,
+                variant_models=variant_models,
+                variant_quantization=variant_quant or None,
                 device=args.device,
                 dtype=args.dtype,
                 router_mode=mode,
