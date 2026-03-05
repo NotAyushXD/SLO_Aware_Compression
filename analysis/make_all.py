@@ -277,17 +277,37 @@ def _plot_e1_frontier(e1_dir: Path, fig_dir: Path) -> None:
         return
     data = _read_json(summ)
 
+    # Supported formats:
+    #   (A) Current script output: {"results": [ {delta, accuracy:{mean,...}, cost_per_request:{mean,...}, ...}, ... ]}
+    #   (B) Legacy: {label: {points:[{cost,quality,...}]}}
+
     plt.figure()
-    for label, d in data.items():
-        pts = d.get("points", []) or []
-        xs = [float(p.get("cost", 0.0) or 0.0) for p in pts]
-        ys = [float(p.get("quality", 0.0) or 0.0) for p in pts]
+
+    if isinstance(data, dict) and isinstance(data.get("results"), list):
+        pts = data.get("results") or []
+        xs = [float(((p.get("cost_per_request") or {}).get("mean") or 0.0)) for p in pts]
+        ys = [float(((p.get("accuracy") or {}).get("mean") or 0.0)) for p in pts]
+        labels = [str(p.get("delta", "")) for p in pts]
         if xs and ys:
-            plt.plot(xs, ys, marker="o", label=label)
+            plt.scatter(xs, ys)
+            for lab, x, y in zip(labels, xs, ys):
+                if lab:
+                    plt.annotate(lab, (x, y))
+    else:
+        for label, d in (data or {}).items():
+            if not isinstance(d, dict):
+                continue
+            pts = d.get("points", []) or []
+            xs = [float(p.get("cost", 0.0) or 0.0) for p in pts]
+            ys = [float(p.get("quality", 0.0) or 0.0) for p in pts]
+            if xs and ys:
+                plt.plot(xs, ys, marker="o", label=str(label))
+        if isinstance(data, dict) and len(data.keys()) > 1:
+            plt.legend()
+
     plt.xlabel("cost per request (cost_units)")
     plt.ylabel("quality (accuracy)")
     plt.title("E1 Pareto frontier (δ sweep)")
-    plt.legend()
     plt.tight_layout()
     plt.savefig(fig_dir / "e1_frontier.png", dpi=200)
     plt.close()
@@ -381,18 +401,19 @@ def _plot_e6_label_budget(e6_dir: Path, fig_dir: Path) -> None:
     if not summ.exists():
         return
     data = _read_json(summ)
-    results = (data.get("results") or {})
-    if not results:
+    results = (data.get("results") or [])
+    if not isinstance(results, list) or not results:
         return
 
-    # Plot accuracy vs label_budget_p (mean)
-    ps = sorted([float(p) for p in results.keys()])
-    acc = []
-    viol = []
-    for p in ps:
-        d = results.get(str(p), results.get(p, {})) or {}
-        acc.append(float(d.get("accuracy", {}).get("mean", 0.0) or 0.0))
-        viol.append(float(d.get("violation_rate", {}).get("mean", 0.0) or 0.0))
+    ps = [float(r.get("label_budget_p", 0.0) or 0.0) for r in results]
+    acc = [float(((r.get("accuracy") or {}).get("mean") or 0.0)) for r in results]
+    viol = [float(((r.get("violation_rate") or {}).get("mean") or 0.0)) for r in results]
+
+    # Sort by p for nicer plots
+    order = sorted(range(len(ps)), key=lambda i: ps[i])
+    ps = [ps[i] for i in order]
+    acc = [acc[i] for i in order]
+    viol = [viol[i] for i in order]
 
     plt.figure()
     plt.plot(ps, acc, marker="o")

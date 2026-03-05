@@ -49,6 +49,8 @@ from metrics import MetricsCalculator, calibrate_slo_profiles
 from preprocessing import DataPreprocessor
 from server import SingleVariantServer, MultiVariantService
 
+from reproducibility import collect_env_info, set_global_seed
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -503,6 +505,15 @@ def parse_args() -> argparse.Namespace:
         default=0.05,
         help="Latency risk level δ for conformal upper bounds (violation rate target).",
     )
+
+    # Convenience alias: one δ to rule them all.
+    # Many experiments want a single violation budget shared across risk-router baselines and bandit.
+    p.add_argument(
+        "--delta",
+        type=float,
+        default=None,
+        help="If set, overrides BOTH --risk_latency_delta and --bandit_delta with this value.",
+    )
     p.add_argument(
         "--risk_quality_epsilon",
         type=float,
@@ -776,6 +787,13 @@ def parse_args() -> argparse.Namespace:
                    help="Best-effort flag for vLLM to disable CUDA graphs (may help debugging).")
     p.add_argument("--prompt_mode", type=str, default="accuracy", choices=["accuracy", "slo"])
 
+    # Reproducibility
+    p.add_argument(
+        "--deterministic_torch",
+        action="store_true",
+        help="Best-effort Torch deterministic mode (may reduce performance and/or raise errors on unsupported ops).",
+    )
+
     # Paper: delayed / partial feedback experiments.
     # - gold  : send gold labels to the server (enables online bandit quality updates).
     # - none  : do NOT send labels to the server; correctness is still computed client-side
@@ -871,6 +889,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    # ------------------------------------------------------------------
+    # Reproducibility: set global seeds early.
+    # ------------------------------------------------------------------
+    set_global_seed(int(args.seed), deterministic_torch=bool(getattr(args, "deterministic_torch", False)))
+
+    # If a unified δ is provided, keep all router components consistent.
+    if getattr(args, "delta", None) is not None:
+        args.risk_latency_delta = float(args.delta)
+        args.bandit_delta = float(args.delta)
+
     # learned router artifacts are required for learned_* modes
     if args.router_mode in {"learned_ttft", "learned_total"}:
         if args.service != "multi":
@@ -888,6 +916,12 @@ def main() -> None:
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save minimal environment metadata for provenance (paper-grade reproducibility).
+    try:
+        _write_json(str(out_dir / "env.json"), collect_env_info())
+    except Exception:
+        pass
 
     _log_env()
 
@@ -923,45 +957,14 @@ def main() -> None:
     logger.info("  TTFT definition: Option A (queue-inclusive)" )
     logger.info("=" * 80)
 
-    # Save config for reproducibility
-    _write_json(
-        str(out_dir / "config.json"),
-        {
-            "model": args.model,
-            "backend": args.backend,
-            "vllm_model_override": args.vllm_model_override,
-            "vllm_quantization": args.vllm_quantization,
-            "vllm_gpu_memory_utilization": args.vllm_gpu_memory_utilization,
-            "vllm_max_model_len": args.vllm_max_model_len,
-            "vllm_max_num_seqs": args.vllm_max_num_seqs,
-            "vllm_enforce_eager": bool(args.vllm_enforce_eager),
-            "variant": args.variant,
-            "device_arg": args.device,
-            "device_effective": effective_device,
-            "dtype": args.dtype,
-            "prompt_mode": args.prompt_mode,
-            "seed": args.seed,
-            "data_dir": args.data_dir,
-            "processed_dir": args.processed_dir,
-            "data_subset": args.data_subset,
-            "skip_load_test": args.skip_load_test,
-            "num_requests": args.num_requests,
-            "concurrencies": args.concurrencies,
-            "concurrency_schedule": args.concurrency_schedule,
-            "data_schedule": getattr(args, "data_schedule", None),
-            "data_schedule_concurrency": getattr(args, "data_schedule_concurrency", None),
-            "skip_accuracy_eval": args.skip_accuracy_eval,
-            "enable_batching": effective_enable_batching,
-            "max_batch_size": args.max_batch_size,
-            "batch_wait_ms": args.batch_wait_ms,
-            "disable_slo_calibration": args.disable_slo_calibration,
-            "slo_calibration_concurrency": args.slo_calibration_concurrency,
-            "slo_calibration_percentiles": args.slo_calibration_percentiles,
-            "slo_primary_percentile": args.slo_primary_percentile,
-            "ttft_definition": "OptionA_queue_inclusive",
-            "bandit_force_freeze": bool(getattr(args, "bandit_force_freeze", False)),
-        },
-    )
+    # Save the full resolved argument namespace for strict reproducibility.
+    # Hand-picking fields is error-prone and can silently drop key router params.
+    cfg = vars(args).copy()
+    cfg["argv"] = list(sys.argv)
+    cfg["device_effective"] = effective_device
+    cfg["enable_batching_effective"] = bool(effective_enable_batching)
+    cfg["ttft_definition"] = "OptionA_queue_inclusive"
+    _write_json(str(out_dir / "config.json"), cfg)
 
     # ------------------------------------------------------------------
     # STEP 1: LOAD DATA

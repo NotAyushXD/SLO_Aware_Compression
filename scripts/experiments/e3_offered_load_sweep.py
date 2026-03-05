@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 
-from scripts.experiments.utils import load_config_command, run_baseline_eval
+from scripts.experiments.utils import extract_frontier_point, load_config_command, run_baseline_eval
 
 
 def _mean_ci(xs: List[float]) -> Tuple[float, float, float]:
@@ -57,28 +57,9 @@ def _read_json(path: Path) -> Dict[str, Any]:
 
 
 def _extract_point(metrics: Dict[str, Any], conc: int) -> Dict[str, float]:
-    summary = metrics.get("summary", {}) or {}
-    e2e = metrics.get("e2e_latency", {}) or {}
-    ttft = metrics.get("ttft", {}) or {}
-
-    slo_compliance = float(summary.get("slo_compliance", 0.0) or 0.0)
-    viol = max(0.0, min(1.0, 1.0 - slo_compliance))
-
-    def _f(x: Any) -> float:
-        try:
-            return float(x)
-        except Exception:
-            return 0.0
-
-    return {
-        "concurrency": float(conc),
-        "p99_e2e_ms": _f(e2e.get("p99")),
-        "p99_ttft_ms": _f(ttft.get("p99")),
-        "violation_rate": viol,
-        "accuracy": _f(summary.get("accuracy")),
-        "cost_per_request": _f(summary.get("cost_per_request")),
-        "goodput_cost": _f(summary.get("goodput_cost")),
-    }
+    pt = extract_frontier_point(metrics)
+    pt["concurrency"] = float(conc)
+    return pt
 
 
 def _parse_configs(items: List[str]) -> List[Tuple[str, str]]:

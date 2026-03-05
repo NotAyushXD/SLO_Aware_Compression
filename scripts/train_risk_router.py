@@ -42,6 +42,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.dummy import DummyClassifier
 
+from reproducibility import collect_env_info, set_global_seed
+
 
 def _read_jsonl(path: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
@@ -364,6 +366,9 @@ def build_calibration_arrays(
 def main() -> None:
     args = parse_args()
 
+    # Reproducibility: seed Python/NumPy/Torch (best-effort).
+    set_global_seed(int(args.seed))
+
     records = _read_jsonl(args.trace_jsonl)
     if not records:
         raise RuntimeError("Trace JSONL is empty; did trace collection run?")
@@ -405,6 +410,12 @@ def main() -> None:
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save minimal environment metadata for provenance.
+    try:
+        (out_dir / "env.json").write_text(json.dumps(collect_env_info(), indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
     with open(out_dir / "quality_models.pkl", "wb") as f:
         pickle.dump(quality_models, f)

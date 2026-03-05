@@ -275,6 +275,16 @@ class MetricsCalculator:
         cost_mult_count = 0
         total_tokens_sum = 0
 
+        # Router acceptance / false-accept diagnostics (paper-facing).
+        accept_by_first_variant: Dict[str, int] = {"cheap": 0, "med": 0, "base": 0}
+        false_accept_by_first_variant: Dict[str, int] = {"cheap": 0, "med": 0, "base": 0}
+        final_variant_counts: Dict[str, int] = {"cheap": 0, "med": 0, "base": 0}
+        final_variant_correct: Dict[str, int] = {"cheap": 0, "med": 0, "base": 0}
+        final_variant_slo_ok: Dict[str, int] = {"cheap": 0, "med": 0, "base": 0}
+        final_variant_cost_sum: Dict[str, float] = {"cheap": 0.0, "med": 0.0, "base": 0.0}
+        router_attempts_sum = 0
+        router_attempts_n = 0
+
         # SLO compliance
         slo_ok = 0
         slo_viol = 0
@@ -361,6 +371,46 @@ class MetricsCalculator:
                 except Exception:
                     pass
 
+                # ------------------------------------------------------
+                # Router acceptance diagnostics (success-only)
+                # ------------------------------------------------------
+                try:
+                    final_v = str(inf.get("variant_effective") or inf.get("variant") or "base").lower().strip()
+                except Exception:
+                    final_v = "base"
+                if final_v in final_variant_counts:
+                    final_variant_counts[final_v] += 1
+
+                # First attempt variant (if available)
+                attempts = inf.get("router_attempts")
+                first_v: Optional[str] = None
+                n_attempts = 0
+                if isinstance(attempts, list) and attempts:
+                    n_attempts = len(attempts)
+                    try:
+                        first_v = str((attempts[0] or {}).get("variant") or "").lower().strip()
+                    except Exception:
+                        first_v = None
+                else:
+                    # Single-variant service or older logs.
+                    first_v = final_v
+                    n_attempts = 1
+
+                try:
+                    escalated = bool(inf.get("router_escalated", False))
+                except Exception:
+                    escalated = False
+
+                # Count average attempts.
+                router_attempts_sum += int(max(1, n_attempts))
+                router_attempts_n += 1
+
+                # Define "accepted" as: first attempt returned final answer (no escalation).
+                if first_v in accept_by_first_variant and not escalated and int(max(1, n_attempts)) <= 1:
+                    accept_by_first_variant[first_v] += 1
+                    if int(c) == 0:
+                        false_accept_by_first_variant[first_v] += 1
+
             # SLO compliance + goodput
             if not is_success:
                 slo_viol += 1
@@ -398,6 +448,19 @@ class MetricsCalculator:
 
             total_ok = total_ms <= float(total_budget_ms or 0.0)
             slo_pass = bool(ttft_ok and total_ok)
+
+            # Per-final-variant stats that depend on SLO compliance.
+            if is_success:
+                try:
+                    final_v2 = str(inf.get("variant_effective") or inf.get("variant") or "base").lower().strip()
+                except Exception:
+                    final_v2 = "base"
+                if final_v2 in final_variant_counts:
+                    final_variant_cost_sum[final_v2] += float(cu)
+                    if int(c) == 1:
+                        final_variant_correct[final_v2] += 1
+                    if bool(slo_pass):
+                        final_variant_slo_ok[final_v2] += 1
 
             out_toks = int(inf.get("output_length", inf.get("output_tokens", 0)) or 0)
             if slo_pass:
@@ -462,6 +525,37 @@ class MetricsCalculator:
         cost_units_per_sec = float(total_cost_units) / max(float(total_duration), 1e-9)
         cost_per_goodput_token = float(total_cost_units) / max(float(goodput_out_tokens), 1.0)
         cost_per_qa_goodput_token = float(total_cost_units) / max(float(qa_goodput_out_tokens), 1.0)
+
+        # Per-request cost summaries (paper-friendly)
+        cost_per_request = float(total_cost_units) / max(float(successful), 1.0)
+        cost_per_goodput_request = float(total_cost_units) / max(float(slo_ok), 1.0)
+        cost_per_qa_goodput_request = float(total_cost_units) / max(float(qa_goodput_req), 1.0)
+
+        # False-accept rates (variant accepted with no escalation, but incorrect)
+        def _far(v: str) -> float:
+            denom = float(accept_by_first_variant.get(v, 0) or 0)
+            if denom <= 0:
+                return 0.0
+            return float(false_accept_by_first_variant.get(v, 0) or 0) / denom
+
+        false_accept_rate_cheap = _far("cheap")
+        false_accept_rate_med = _far("med")
+
+        # Average router attempts (success-only)
+        avg_router_attempts = float(router_attempts_sum) / max(float(router_attempts_n), 1.0)
+
+        # Per-final-variant summary (useful for paper breakdowns)
+        per_final_variant: Dict[str, Dict[str, float]] = {}
+        for v in ["cheap", "med", "base"]:
+            n_v = int(final_variant_counts.get(v, 0) or 0)
+            if n_v <= 0:
+                continue
+            per_final_variant[v] = {
+                "count": float(n_v),
+                "accuracy": float(final_variant_correct.get(v, 0) or 0) / float(n_v),
+                "slo_compliance": float(final_variant_slo_ok.get(v, 0) or 0) / float(n_v),
+                "avg_cost_units": float(final_variant_cost_sum.get(v, 0.0) or 0.0) / float(n_v),
+            }
 
         # Bandit diagnostics (useful for E6 label-budget + delayed-label experiments)
         bandit_update_events = 0
@@ -544,6 +638,19 @@ class MetricsCalculator:
                 "total_cost_units_quality_adjusted": float(total_cost_units_qa_ok),
                 "cost_per_goodput_token": float(cost_per_goodput_token),
                 "cost_per_quality_adjusted_goodput_token": float(cost_per_qa_goodput_token),
+
+                # Paper-friendly per-request cost metrics
+                "cost_per_request": float(cost_per_request),
+                "cost_per_goodput_request": float(cost_per_goodput_request),
+                "cost_per_quality_adjusted_goodput_request": float(cost_per_qa_goodput_request),
+
+                # Router acceptance diagnostics
+                "avg_router_attempts": float(avg_router_attempts),
+                "accept_no_escalation_counts": {k: int(v) for k, v in accept_by_first_variant.items()},
+                "final_variant_counts": {k: int(v) for k, v in final_variant_counts.items()},
+                "per_final_variant": per_final_variant,
+                "false_accept_rate_cheap": float(false_accept_rate_cheap),
+                "false_accept_rate_med": float(false_accept_rate_med),
             },
             "ttft": {
                 "p50": ttft_p.p50,
@@ -616,8 +723,17 @@ class MetricsCalculator:
             print(f"  Avg Cost Multiplier:   {s.get('avg_cost_multiplier', 0.0):6.3f}  (req-avg)")
             print(f"  Token-Wt Cost Mult:    {s.get('token_weighted_cost_multiplier', 0.0):6.3f}  (token-avg)")
             print(f"  Cost Units / sec:      {s.get('cost_units_per_sec', 0.0):6.1f}")
+            print(f"  Cost / request:        {s.get('cost_per_request', 0.0):6.3f}")
+            print(f"  Cost / goodput req:    {s.get('cost_per_goodput_request', 0.0):6.3f}")
+            print(f"  Cost / QA good req:    {s.get('cost_per_quality_adjusted_goodput_request', 0.0):6.3f}")
             print(f"  Cost / Goodput token:  {s.get('cost_per_goodput_token', 0.0):6.3f}")
             print(f"  Cost / QA token:       {s.get('cost_per_quality_adjusted_goodput_token', 0.0):6.3f}")
+
+        # Router diagnostics
+        if 'false_accept_rate_cheap' in s:
+            print(f"  False-accept (cheap):  {s.get('false_accept_rate_cheap', 0.0)*100:6.2f}%")
+            print(f"  False-accept (med):    {s.get('false_accept_rate_med', 0.0)*100:6.2f}%")
+            print(f"  Avg router attempts:   {s.get('avg_router_attempts', 0.0):6.3f}")
 
         print("\nTTFT (Time-to-First-Token) in milliseconds:")
         for k in ("p50", "p75", "p90", "p95", "p99"):

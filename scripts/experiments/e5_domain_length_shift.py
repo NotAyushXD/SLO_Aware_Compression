@@ -39,7 +39,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from scripts.experiments.utils import load_config_command, run_baseline_eval
+from scripts.experiments.utils import extract_frontier_point, load_config_command, run_baseline_eval
 
 
 def _mean_ci(xs: List[float]) -> Tuple[float, float, float]:
@@ -195,11 +195,10 @@ def main() -> None:
                 phase_idx = int(m.get("phase", 0) or 0)
                 if phase_idx <= 0:
                     continue
-                summ = m.get("summary", {}) or {}
-                slo = float(summ.get("slo_compliance", 0.0) or 0.0)
-                viol = max(0.0, min(1.0, 1.0 - slo))
-                acc = float(summ.get("accuracy", 0.0) or 0.0)
-                cost = float(summ.get("cost_per_request", 0.0) or 0.0)
+                pt = extract_frontier_point(m)
+                viol = float(pt.get("violation_rate", 0.0) or 0.0)
+                acc = float(pt.get("accuracy", 0.0) or 0.0)
+                cost = float(pt.get("cost_per_request", 0.0) or 0.0)
 
                 per_cond_phase[cond].setdefault(phase_idx, {}).setdefault("violation_rate", []).append(viol)
                 per_cond_phase[cond].setdefault(phase_idx, {}).setdefault("accuracy", []).append(acc)

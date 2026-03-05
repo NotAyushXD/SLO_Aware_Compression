@@ -44,6 +44,7 @@ from evaluation import EvaluationMetrics
 from learned_router import LearnedRouter
 from prompt_templates import build_llama_formatted_prompt
 from server import MultiVariantService
+from reproducibility import collect_env_info, set_global_seed
 from transformers import AutoTokenizer
 
 
@@ -735,6 +736,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    # Reproducibility: seed Python/NumPy/Torch (best-effort).
+    set_global_seed(int(args.seed))
+
     # Tokenizer for prompt length features (CPU-side)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
 
@@ -770,6 +774,12 @@ def main() -> None:
 
     out_root = Path(args.output_root)
     out_root.mkdir(parents=True, exist_ok=True)
+
+    # Save minimal environment metadata for provenance.
+    try:
+        (out_root / "env.json").write_text(json.dumps(collect_env_info(), indent=2), encoding="utf-8")
+    except Exception:
+        pass
     trace_path = out_root / "trainval_traces.jsonl"
 
     slo_dict = _load_slo_dict(args.slo_thresholds_path, profile_key=args.slo_profile)

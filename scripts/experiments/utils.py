@@ -77,9 +77,22 @@ def extract_frontier_point(metrics: Dict[str, Any]) -> Dict[str, float]:
     total_cost = float(summ.get("total_cost_units", 0.0) or 0.0)
     cost_per_req = total_cost / succ if succ > 0 else 0.0
 
+    def _f(x: Any) -> float:
+        try:
+            return float(x)
+        except Exception:
+            return 0.0
+
+    ttft = metrics.get("ttft", {}) or {}
+    e2e = metrics.get("e2e_latency", {}) or {}
+
     return {
         "accuracy": float(summ.get("accuracy_success", 0.0) or 0.0),
         "slo_compliance": float(summ.get("slo_compliance", 0.0) or 0.0),
         "violation_rate": 1.0 - float(summ.get("slo_compliance", 0.0) or 0.0),
         "cost_per_request": float(cost_per_req),
+
+        # Diagnostics (useful for E3 load sweeps and debugging)
+        "p99_ttft_ms": _f(ttft.get("p99")),
+        "p99_e2e_ms": _f(e2e.get("p99")),
     }
